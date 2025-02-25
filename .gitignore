@@ -10,6 +10,8 @@
 *.sqlite
 *.onnx
 *.eggs
+*.xlsx
+test_results*
 build/
 *.so
 *.egg-info

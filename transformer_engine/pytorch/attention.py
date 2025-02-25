@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -72,6 +72,11 @@ from transformer_engine.pytorch.export import is_in_onnx_export_mode
 from transformer_engine.pytorch.jit import jit_fuser, no_torch_dynamo
 from transformer_engine.pytorch.graph import is_graph_capturing
 
+from transformer_engine.pytorch.triton.Sage_attn import forward as sageattn_triton
+from transformer_engine.pytorch.triton.Sage_attn_causal import forward as sageattn_causal_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_int8 import per_block_int8 as per_block_int8_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_e4m3 import per_block_e4m3 as per_block_e4m3_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_e5m2 import per_block_e5m2 as per_block_e5m2_triton
 
 _flash_attn_version = PkgVersion(get_pkg_version("flash-attn"))
 _flash_attn_version_required = PkgVersion("2.0.6")
@@ -120,6 +125,7 @@ _attention_backends = {
     "use_fused_attention": None,
     "fused_attention_backend": None,
     "use_unfused_attention": None,
+    "use_sage_attention": None,
     "backend_selection_requires_update": False,
 }
 
@@ -241,9 +247,11 @@ def get_attention_backend(
         If `use_fused_attention = True`, one of `FusedAttention` three sub-backends, else `None`.
     use_unfused_attention: bool
         Whether the `UnfusedDotProductAttention` backend has been selected.
+    use_sage_attention: bool
+        Whether the `SageAttention` backend has been selected.
     available_backends: List[bool]
         All available backends that could support the provided input. A list of Booleans
-        in the form of [use_flash_attention, use_fused_attention, use_unfused_attention].
+        in the form of [use_flash_attention, use_fused_attention, use_unfused_attention, use_sage_attention].
     """
     qkv_type = attention_params.qkv_type
     qkv_dtype = attention_params.qkv_dtype
@@ -722,10 +730,11 @@ def get_attention_backend(
             use_fused_attention = False
 
     # All available backends
-    available_backends = [use_flash_attention, use_fused_attention, use_unfused_attention]
+    available_backends = [use_flash_attention, use_fused_attention, use_unfused_attention, use_sage_attention]
+
     logger.debug(
         "Available backends = {FlashAttention=%s, FusedAttention=%s%s,"
-        " UnfusedDotProductAttention=%s}",
+        " UnfusedDotProductAttention=%s, SageAttention=%s}",
         bool(available_backends[0]),
         bool(available_backends[1]),
         (
@@ -749,12 +758,14 @@ def get_attention_backend(
             )
             use_flash_attention = False
 
-    # Selected backend
+    #! Backend priority: FlashAttention > FusedAttention > UnfusedDotProductAttention > SageAttention
     if use_flash_attention:
         use_fused_attention = False
         use_unfused_attention = False
+        use_sage_attention = False
     elif use_fused_attention:
         use_unfused_attention = False
+        use_sage_attention = False
     selected_backend = "NoBackend"
     if use_flash_attention:
         selected_backend = "FlashAttention"
@@ -762,11 +773,14 @@ def get_attention_backend(
         selected_backend = f"FusedAttention (sub-backend {int(fused_attention_backend)})"
     elif use_unfused_attention:
         selected_backend = "UnfusedDotProductAttention"
+    elif use_sage_attention:
+        selected_backend = "SageAttention"
     logger.debug("Selected backend = %s", selected_backend)
 
     global _attention_backends
     _attention_backends["use_flash_attention"] = use_flash_attention
     _attention_backends["use_fused_attention"] = use_fused_attention
+    _attention_backends["use_sage_attention"] = use_sage_attention
     _attention_backends["fused_attention_backend"] = fused_attention_backend
     _attention_backends["use_unfused_attention"] = use_unfused_attention
     _attention_backends["backend_selection_requires_update"] = False
@@ -776,6 +790,7 @@ def get_attention_backend(
         use_fused_attention,
         fused_attention_backend,
         use_unfused_attention,
+        use_sage_attention,
         available_backends,
     )
 
@@ -4034,6 +4049,15 @@ def get_qkv_layout(
        `sbhd`: {`sb3hd`, `sbh3d`, `sbhd_sb2hd`, `sbhd_sbh2d`, `sbhd_sbhd_sbhd`}
        `bshd`: {`bs3hd`, `bsh3d`, `bshd_bs2hd`, `bshd_bsh2d`, `bshd_bshd_bshd`}
        `thd` : {`t3hd`, `th3d`, `thd_t2hd`, `thd_th2d`, `thd_thd_thd`}
+    q: torch.Tensor
+        Query tensor. It may be different from input `q` as we try to fit tensors to
+        a supported layout.
+    k: torch.Tensor
+        Key tensor. It may be different from input `k` as we try to fit tensors to
+        a supported layout.
+    v: torch.Tensor
+        Value tensor. It may be different from input `v` as we try to fit tensors to
+        a supported layout.
     """
 
     check_last_dim_contiguous = all(x.stride(-1) == 1 for x in [q, k, v])
@@ -6304,6 +6328,13 @@ class DotProductAttention(TransformerEngineBaseModule):
             layer_number=layer_number,
         )
 
+        self.sage_attention = SageAttention(
+            softmax_scale,
+            attention_type=attention_type,
+            **attn_kwargs,
+            layer_number=layer_number,
+        )
+
         def remove_extra_states_check(self, incompatible_keys):  # pylint: disable=unused-argument
             """
             Temporarily remove core_attention._extra_state as a missing key
@@ -6826,6 +6857,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     use_fused_attention,
                     fused_attention_backend,
                     use_unfused_attention,
+                    use_sage_attention,
                     _,
                 ) = get_attention_backend(attention_params)
                 if use_flash_attention:
@@ -6837,11 +6869,14 @@ class DotProductAttention(TransformerEngineBaseModule):
                     )
                 elif use_unfused_attention:
                     self.logger.info("Running with UnfusedDotProductAttention backend")
+                elif use_sage_attention:
+                    self.logger.info("Running with SageAttention backend")
             else:
                 use_flash_attention = _attention_backends["use_flash_attention"]
                 use_fused_attention = _attention_backends["use_fused_attention"]
                 fused_attention_backend = _attention_backends["fused_attention_backend"]
                 use_unfused_attention = _attention_backends["use_unfused_attention"]
+                use_sage_attention = _attention_backends["use_sage_attention"]
 
             if use_flash_attention:
                 if core_attention_bias_type == "alibi":
@@ -6981,8 +7016,17 @@ class DotProductAttention(TransformerEngineBaseModule):
                     core_attention_bias=core_attention_bias,
                     alibi_slopes=alibi_slopes,
                 )
-
-            raise Exception("No dot product attention support for the provided inputs!")
+            # TODO(cx)
+            if use_sage_attention:
+                return self.sage_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    qkv_layout=qkv_layout,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                )
+            raise ValueError("No dot product attention support for the provided inputs!")
 
 
 class MultiheadAttention(torch.nn.Module):
@@ -7071,7 +7115,7 @@ class MultiheadAttention(torch.nn.Module):
     bias : bool, default = `True`
           if set to `False`, the transformer layer will not learn any additive biases.
     device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will allocated. It is the user's
+          The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
     qkv_format: str, default = `sbhd`
@@ -7753,3 +7797,136 @@ class MultiheadAttention(torch.nn.Module):
         if self.input_layernorm and self.return_layernorm_output:
             outputs += (layernorm_output,)
         return outputs if len(outputs) > 1 else outputs[0]
+
+class SageAttention(torch.nn.Module):
+    """
+        SageAttention with per-block INT8 quantization for Q and K, FP16 PV with FP16 accumulation.
+        https://github.com/thu-ml/SageAttention
+    """
+    def __init__(
+        self,
+        softmax_scale: float,
+        attention_type: str = "self",
+        quantization_backend: str = "triton",
+        quantization_type: str = "e4m3",
+        smooth_k: bool = True,
+        return_lse: bool = False,
+        attention_dropout: float = 0.0,
+        attention_dropout_ctx: Optional[Callable] = nullcontext,
+        layer_number: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.softmax_scale = softmax_scale
+        self.attention_type = attention_type
+        self.quantization_backend = quantization_backend
+        self.quantization_type = quantization_type
+        self.smooth_k = smooth_k
+        self.return_lse = return_lse
+        self.layer_number = layer_number
+        self.attention_dropout = torch.nn.Dropout(attention_dropout)
+
+    def forward(
+        self,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        qkv_layout: str = "sbh3d", 
+        attn_mask_type: str = "causal",
+        attention_mask: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # assert query_layer.device == key_layer.device == value_layer.device, "All tensors must be on the same device."
+        assert all(x.is_cuda for x in [query_layer, key_layer, value_layer]), "All tensors must be on the GPU."
+        assert query_layer.dtype in [torch.float16, torch.bfloat16], "All tensors must be in dtype of torch.float16 or torch.bfloat16."
+        assert query_layer.dtype == key_layer.dtype == value_layer.dtype, "All tensors must have the same dtype."
+        
+        torch.cuda.set_device(value_layer.device)
+        qkv_layout = qkv_layout.lower()
+        qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
+
+        if qkv_format == "sbhd":  #! -> BHSD(HND)
+            query_layer, key_layer, value_layer = [
+                x.transpose(0, 1).transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
+            ]
+        elif qkv_format == "bshd": 
+            query_layer, key_layer, value_layer = [
+                x.transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
+            ]
+        elif qkv_format == "thd":
+            assert cu_seqlens_q is not None and cu_seqlens_kv is not None, \
+                "cu_seqlens required for thd format"
+        assert qkv_format == "bhsd" or qkv_format == "sbhd" or qkv_format == "bshd", "qkv_format must be bhsd, sbhd, or bshd"
+        assert query_layer.shape[-1] == key_layer.shape[-1], "Head dim mismatch"
+
+        # if head_dim < 64:
+        #     query_layer = F.pad(query_layer, (0, 64 - head_dim))
+        #     key_layer = F.pad(key_layer, (0, 64 - head_dim))
+        #     value_layer = F.pad(value_layer, (0, 64 - head_dim))
+        # elif head_dim > 64 and head_dim < 128:
+        #     query_layer = F.pad(query_layer, (0, 128 - head_dim))
+        #     key_layer = F.pad(key_layer, (0, 128 - head_dim))
+        #     value_layer = F.pad(value_layer, (0, 128 - head_dim))
+        # elif head_dim > 128:
+        #     raise ValueError(f"Unsupported head_dim: {head_dim}")
+
+        assert query_layer.stride(-1) == 1 and key_layer.stride(-1) == 1 and value_layer.stride(-1) == 1, "Last dim of qkv must be contiguous."
+        
+        seq_dim = 1 if qkv_layout == "bshd" else 2
+        head_dim = query_layer.size(-1)
+
+        if self.smooth_k:
+            km = key_layer.mean(dim=seq_dim, keepdim=True)
+            key_layer = key_layer - km
+            if self.return_lse:
+                if qkv_layout == "bshd":
+                    lse_correction = torch.matmul(query_layer.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
+                else:
+                    lse_correction = torch.matmul(query_layer, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+        else:
+            km = None
+
+        if self.softmax_scale is None:
+            self.softmax_scale = 1.0 / (head_dim ** 0.5)
+
+        if self.quantization_backend == "triton":
+            if self.quantization_type == "e4m3":
+                q_quant, q_scale, k_quant, k_scale, v_quant, v_scale  = per_block_e4m3_triton(
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                )
+            elif self.quantization_type == "e5m2":
+                q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_e5m2_triton(
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                )
+            elif self.quantization_type == "int8":
+                q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_int8_triton(
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                )
+                # num_heads_q = query_layer.shape[1] if qkv_format == "bhsd" else query_layer.shape[2]
+                # num_heads_kv = key_layer.shape[1] if qkv_format == "bhsd" else key_layer.shape[2]
+                # num_kv_groups = num_heads_q // num_heads_kv
+
+                # v_scale = v_scale.repeat(1, num_kv_groups, 1, 1)  # [batch, num_heads_q, seq_blocks, 1]
+                # v_scale = v_scale[:, :, :k_scale.shape[2], :]      # 对齐序列块数
+            else:
+                raise NotImplementedError(f"Unsupported quantization type: {self.quantization_type}")
+            
+        else:
+            raise NotImplementedError("Please use quantization_backend='triton'.")
+
+        if attn_mask_type == "causal":
+            print("causal")
+            output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse)
+        else:
+            print("no MASK")
+            output, lse = sageattn_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse)
+
+        output = output[..., :head_dim]
+
+        if qkv_format == "sbhd":  
+            output = output.transpose(0, 1).transpose(1, 2)
+        elif qkv_format == "bshd": 
+            output = output.transpose(1, 2)
+        
+        if self.return_lse:
+            return output, lse / 1.44269504 + lse_correction * self.softmax_scale if self.smooth_k else lse / 1.44269504
+        else:
+            return output
