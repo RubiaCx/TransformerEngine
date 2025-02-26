@@ -7847,10 +7847,10 @@ class SageAttention(torch.nn.Module):
             query_layer, key_layer, value_layer = [
                 x.transpose(0, 1).transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
             ]
-        elif qkv_format == "bshd": 
-            query_layer, key_layer, value_layer = [
-                x.transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
-            ]
+        # elif qkv_format == "bshd": 
+        #     query_layer, key_layer, value_layer = [
+        #         x.transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
+        #     ]
         elif qkv_format == "thd":
             assert cu_seqlens_q is not None and cu_seqlens_kv is not None, \
                 "cu_seqlens required for thd format"
@@ -7890,15 +7890,15 @@ class SageAttention(torch.nn.Module):
         if self.quantization_backend == "triton":
             if self.quantization_type == "e4m3":
                 q_quant, q_scale, k_quant, k_scale, v_quant, v_scale  = per_block_e4m3_triton(
-                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout=qkv_format
                 )
             elif self.quantization_type == "e5m2":
                 q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_e5m2_triton(
-                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout=qkv_format
                 )
             elif self.quantization_type == "int8":
                 q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_int8_triton(
-                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
+                    query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout=qkv_format
                 )
                 # num_heads_q = query_layer.shape[1] if qkv_format == "bhsd" else query_layer.shape[2]
                 # num_heads_kv = key_layer.shape[1] if qkv_format == "bhsd" else key_layer.shape[2]
@@ -7913,18 +7913,16 @@ class SageAttention(torch.nn.Module):
             raise NotImplementedError("Please use quantization_backend='triton'.")
 
         if attn_mask_type == "causal":
-            print("causal")
-            output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse)
+            output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse, tensor_layout=qkv_format)
         else:
-            print("no MASK")
-            output, lse = sageattn_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse)
+            output, lse = sageattn_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout=qkv_format)
 
         output = output[..., :head_dim]
 
-        if qkv_format == "sbhd":  
-            output = output.transpose(0, 1).transpose(1, 2)
-        elif qkv_format == "bshd": 
-            output = output.transpose(1, 2)
+        # if qkv_format == "sbhd":  
+        #     output = output.transpose(0, 1).transpose(1, 2)
+        # elif qkv_format == "bshd": 
+        #     output = output.transpose(1, 2)
         
         if self.return_lse:
             return output, lse / 1.44269504 + lse_correction * self.softmax_scale if self.smooth_k else lse / 1.44269504

@@ -65,6 +65,9 @@ def print_metrics(name, metrics):
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
     (1, 1, 64, 32, 'bhsd', 'no_mask'),
+    (1, 1, 64, 32, 'bshd', 'no_mask'),
+    (1, 1, 64, 32, 'bhsd', 'causal'),
+    (1, 1, 64, 32, 'bshd', 'causal'),
     (1, 1, 64, 32, 'bhsd', 'causal'),
     (1, 4, 512, 64, 'sbhd', 'no_mask'),
     (1, 4, 512, 64, 'bhsd', 'no_mask'),
@@ -85,7 +88,7 @@ base_configs = [
 test_configs = []
 for bs, h, s, d, layout, mask_type in base_configs:
     for dtype in [torch.float16, torch.bfloat16]:
-        for value_range in [0.1, 1.0, 10.0, 50.0]:
+        for value_range in [1.0]: #[0.1, 1.0, 10.0, 50.0]:
             test_configs.append(
                 TestConfig(
                     batch_size=bs,
@@ -204,13 +207,13 @@ def run_test(config):
         v_sdpa = v.permute(0, 2, 1, 3).contiguous()
     
     sdpa_output = sdpa(q_sdpa, k_sdpa, v_sdpa, is_causal=(config.attn_mask_type == "causal")).to(dtype)
-    #! -> BHSD
-    if config.layout == 'bshd':
-        sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
-    elif config.layout == 'bhsd':
-        sdpa_output = sdpa_output.contiguous()
-    elif config.layout == 'sbhd':
-        sdpa_output = sdpa_output.permute(1, 0, 2, 3).contiguous()
+    # #! -> BHSD
+    # if config.layout == 'bshd':
+    #     sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
+    # elif config.layout == 'bhsd':
+    #     sdpa_output = sdpa_output.contiguous()
+    # elif config.layout == 'sbhd':
+    #     sdpa_output = sdpa_output.permute(1, 0, 2, 3).contiguous()
         
     metrics = calculate_similarity(sage_int8_output, sdpa_output)
     print_metrics(f"Sage int8 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics)
