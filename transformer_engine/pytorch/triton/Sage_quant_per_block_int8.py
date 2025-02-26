@@ -29,8 +29,8 @@ def quant_per_block_int8_kernel(Input, Output, Scale,
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
     x *= sm_scale
-    scale = tl.max(tl.abs(x)) / 127.
-    x_int8 = x / (scale+1e-8)
+    scale = tl.max(tl.abs(x)) / 127. + 1e-8
+    x_int8 = x / scale
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)

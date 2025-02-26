@@ -29,8 +29,8 @@ def quant_per_block_e5m2_kernel(Input, Output, Scale,
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
     x *= sm_scale #!
-    scale = tl.max(tl.abs(x)) / 57344.
-    x_e5m2 = x / (scale+1e-8)
+    scale = tl.max(tl.abs(x)) / 57344. + 1e-8
+    x_e5m2 = x / scale
     # x_e5m2 += 0.5 * tl.where(x_e5m2 >= 0, 1, -1)
     x_e5m2 = x_e5m2.to(tl.float8e5)
     tl.store(output_ptrs, x_e5m2, mask=offs_n[:, None] < L)

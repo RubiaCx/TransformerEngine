@@ -107,27 +107,29 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, v_scale, output_dtype=torch.float16, return_lse=False, tensor_layout="bhsd"):
+def forward(q, k, v, 
+            q_scale, k_scale, v_scale, 
+            output_dtype=torch.float16, return_lse=False, tensor_layout="bhsd"):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
 
     #! bhsd == HND；bshd == NHD 
-    output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
     if tensor_layout == "bhsd":
         batch_size, num_heads_q, seq_len_q,  head_dim = q.shape
         _, num_heads_kv, seq_len_kv, _ = k.shape
         stride_batch_q, stride_heads_q, stride_seq_q, stride_dim_q = q.stride()
         stride_batch_k, stride_heads_k, stride_seq_k, stride_dim_k = k.stride()
         stride_batch_v, stride_heads_v, stride_seq_v, stride_dim_v = v.stride()
-        stride_batch_o, stride_heads_o, stride_seq_o, stride_dim_o = output.stride()
+        stride_batch_o, stride_heads_o, stride_seq_o, stride_dim_o = o.stride()
     elif tensor_layout == "bshd":
         batch_size, seq_len_q, num_heads_q, head_dim = q.shape
         _, seq_len_kv, num_heads_kv, _ = k.shape
         stride_batch_q, stride_seq_q, stride_heads_q, stride_dim_q = q.stride()
         stride_batch_k, stride_seq_k, stride_heads_k, stride_dim_k = k.stride()
         stride_batch_v, stride_seq_v, stride_heads_v, stride_dim_v = v.stride()
-        stride_batch_o, stride_seq_o, stride_heads_o, stride_dim_o = output.stride()
+        stride_batch_o, stride_seq_o, stride_heads_o, stride_dim_o = o.stride()
     else:
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
@@ -144,7 +146,7 @@ def forward(q, k, v, q_scale, k_scale, v_scale, output_dtype=torch.float16, retu
 
     grid = (triton.cdiv(seq_len_q, BLOCK_M), num_heads_q, batch_size)
     _attn_fwd[grid](
-        q, k, v, q_scale, k_scale, output, lse,
+        q, k, v, q_scale, k_scale, o, lse,
         stride_batch_q, stride_heads_q, stride_seq_q, 
         stride_batch_k, stride_heads_k, stride_seq_k, 
         stride_batch_v, stride_heads_v, stride_seq_v, 
@@ -158,4 +160,4 @@ def forward(q, k, v, q_scale, k_scale, v_scale, output_dtype=torch.float16, retu
         num_stages=3 if head_dim == 64 else 4
     )
 
-    return output, lse
+    return o, lse

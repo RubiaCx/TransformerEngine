@@ -36,8 +36,8 @@ def quant_per_block_e4m3_kernel(Input, Output, Scale, scale_stride,
 
     x = tl.load(input_ptrs, mask=offs_m[:, None] < L)
     x *= sm_scale
-    scale = tl.max(tl.abs(x)) / 448.
-    x_e4m3 = x / (scale + 1e-8)
+    scale = tl.max(tl.abs(x)) / 448. + 1e-8
+    x_e4m3 = x / scale
     x_e4m3 = x_e4m3.to(tl.float8e4nv)
     tl.store(output_ptrs, x_e4m3, mask=offs_m[:, None] < L)
     tl.store(scale_ptrs, scale)
