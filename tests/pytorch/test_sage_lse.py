@@ -158,7 +158,7 @@ def run_test(config):
         quantization_backend="triton",
         quantization_type="int8",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
@@ -167,7 +167,7 @@ def run_test(config):
         quantization_backend="triton",
         quantization_type="e4m3",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
@@ -176,65 +176,37 @@ def run_test(config):
         quantization_backend="triton",
         quantization_type="e5m2",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
     q, k, v = create_tensors(config)
     
-    sage_int8_output = sage_int8(
+    sage_int8_output, lse_int8 = sage_int8(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
     
-    sage_e4m3_output = sage_e4m3(
+    sage_e4m3_output, lse_e4m3 = sage_e4m3(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
 
-    sage_e5m2_output = sage_e5m2(
+    sage_e5m2_output, lse_e5m2 = sage_e5m2(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
 
-     #! -> BHSD
-    if config.layout == 'bhsd':
-        q_sdpa = q.contiguous()
-        k_sdpa = k.contiguous()
-        v_sdpa = v.contiguous()
-    elif config.layout == 'sbhd':
-        q_sdpa = q.permute(1, 2, 0, 3).contiguous()
-        k_sdpa = k.permute(1, 2, 0, 3).contiguous()
-        v_sdpa = v.permute(1, 2, 0, 3).contiguous()
-    elif config.layout == 'bshd':
-        q_sdpa = q.permute(0, 2, 1, 3).contiguous()
-        k_sdpa = k.permute(0, 2, 1, 3).contiguous()
-        v_sdpa = v.permute(0, 2, 1, 3).contiguous()
-    
-    sdpa_output = sdpa(q_sdpa, k_sdpa, v_sdpa, is_causal=(config.attn_mask_type == "causal")).to(dtype)
-    # #! -> BHSD
-    if config.layout == 'bshd':
-        sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
-    elif config.layout == 'bhsd':
-        sdpa_output = sdpa_output.contiguous()
-    elif config.layout == 'sbhd':
-        sdpa_output = sdpa_output.permute(1, 0, 2, 3).contiguous()
         
-    metrics = calculate_similarity(sage_int8_output, sdpa_output)
-    print_metrics(f"Sage int8 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics)
+    metrics1 = calculate_similarity(lse_int8, lse_e4m3)
+    metrics2 = calculate_similarity(lse_int8, lse_e5m2)
 
-    metrics_e4m3 = calculate_similarity(sage_e4m3_output, sdpa_output)
-    print_metrics(f"Sage e4m3 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e4m3)
 
-    metrics_e5m2 = calculate_similarity(sage_e5m2_output, sdpa_output)
-    print_metrics(f"Sage e5m2 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
-
-    logger.add_result(config, 'int8', metrics)
-    logger.add_result(config, 'e4m3', metrics_e4m3)
-    logger.add_result(config, 'e5m2', metrics_e5m2)
+    logger.add_result(config, 'int8 vs e4m3', metrics1)
+    logger.add_result(config, 'int8 vs e5m2', metrics2)
     
 
 for config in test_configs:

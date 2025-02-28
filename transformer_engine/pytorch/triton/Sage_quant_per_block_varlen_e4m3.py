@@ -65,12 +65,12 @@ def per_block_int8(q, k, v,
                    sm_scale=None):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
-    #! BHSD
+    #! THD
+    batch_size = cu_seqlens_q.shape[0] - 1
     num_heads_q = q.shape[1]
     num_heads_kv = k.shape[1]
     head_dim = q.shape[-1]
-
-    batch_size = cu_seqlens_q.shape[0] - 1
+    # batch_size + 1 = total_lens
     q_batch_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     k_batch_len = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
 

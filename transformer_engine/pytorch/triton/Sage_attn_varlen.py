@@ -128,7 +128,7 @@ def forward(q, k, v,
     stage = 1
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
-    #! BHSD
+    #! THD
     batch_size = cu_seqlens_q.shape[0] - 1
     _, num_heads_q, head_dim = q.shape
     _, num_heads_kv, _ = k.shape
