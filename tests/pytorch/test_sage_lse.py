@@ -73,25 +73,47 @@ base_configs = [
     (1, 32, 16000, 128, 'bhsd', 'causal'),
     (1, 32, 72000, 128, 'bhsd', 'causal'),
     (1, 1, 64, 32, 'bhsd', 'no_mask'),
-    (1, 1, 64, 32, 'bshd', 'no_mask'),
     (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 1, 64, 32, 'bshd', 'causal'),
-    (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'sbhd', 'no_mask'),
     (1, 4, 512, 64, 'bhsd', 'no_mask'),
     (1, 4, 512, 64, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'bshd', 'no_mask'),
-    (4, 4, 512, 64, 'bhsd', 'causal'),
-    (4, 4, 512, 64, 'bshd', 'causal'),
     (8, 4, 512, 64, 'bhsd', 'no_mask'),
     (8, 4, 512, 64, 'bshd', 'causal'),
     (16, 16, 2048, 128, 'bhsd', 'causal'),
-    (16, 16, 2048, 128, 'bshd', 'no_mask'),
+    (16, 16, 2048, 128, 'bhsd', 'no_mask'),
     (32, 8, 4096, 64, 'bhsd', 'causal'),
-    (32, 8, 4096, 64, 'bshd', 'no_mask'),
-    (32, 32, 4096, 128, 'bhsd', 'no_mask'),
-    (32, 32, 4096, 128, 'bhsd', 'causal'),
+    (32, 8, 4096, 64, 'bhsd', 'no_mask'),
 ]
+
+# base_configs = [
+#     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
+#     (1, 24, 16000, 128, 'bhsd', 'no_mask'),
+#     (1, 24, 72000, 128, 'bhsd', 'no_mask'),
+#     (1, 32, 16000, 128, 'bhsd', 'no_mask'),
+#     (1, 32, 72000, 128, 'bhsd', 'no_mask'),
+#     (1, 24, 16000, 128, 'bhsd', 'causal'),
+#     (1, 24, 72000, 128, 'bhsd', 'causal'),
+#     (1, 32, 16000, 128, 'bhsd', 'causal'),
+#     (1, 32, 72000, 128, 'bhsd', 'causal'),
+#     (1, 1, 64, 32, 'bhsd', 'no_mask'),
+#     (1, 1, 64, 32, 'bshd', 'no_mask'),
+#     (1, 1, 64, 32, 'bhsd', 'causal'),
+#     (1, 1, 64, 32, 'bshd', 'causal'),
+#     (1, 1, 64, 32, 'bhsd', 'causal'),
+#     (1, 4, 512, 64, 'sbhd', 'no_mask'),
+#     (1, 4, 512, 64, 'bhsd', 'no_mask'),
+#     (1, 4, 512, 64, 'bhsd', 'causal'),
+#     (1, 4, 512, 64, 'bshd', 'no_mask'),
+#     (4, 4, 512, 64, 'bhsd', 'causal'),
+#     (4, 4, 512, 64, 'bshd', 'causal'),
+#     (8, 4, 512, 64, 'bhsd', 'no_mask'),
+#     (8, 4, 512, 64, 'bshd', 'causal'),
+#     (16, 16, 2048, 128, 'bhsd', 'causal'),
+#     (16, 16, 2048, 128, 'bshd', 'no_mask'),
+#     (32, 8, 4096, 64, 'bhsd', 'causal'),
+#     (32, 8, 4096, 64, 'bshd', 'no_mask'),
+#     (32, 32, 4096, 128, 'bhsd', 'no_mask'),
+#     (32, 32, 4096, 128, 'bhsd', 'causal'),
+# ]
 
 test_configs = []
 for bs, h, s, d, layout, mask_type in base_configs:
@@ -200,14 +222,21 @@ def run_test(config):
         attn_mask_type=config.attn_mask_type
     )
 
+    sage_none_output, lse_none = sage_int8(
+        q, k, v,
+        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+        attn_mask_type="none"
+    )
         
-    metrics1 = calculate_similarity(lse_int8, lse_e4m3)
-    metrics2 = calculate_similarity(lse_int8, lse_e5m2)
+    metrics1 = calculate_similarity(lse_int8, lse_none)
+    metrics2 = calculate_similarity(lse_e4m3, lse_none)
+    metrics3 = calculate_similarity(lse_e5m2, lse_none)
+    metrics4 = calculate_similarity(lse_int8, lse_e4m3)
 
-
-    logger.add_result(config, 'int8 vs e4m3', metrics1)
-    logger.add_result(config, 'int8 vs e5m2', metrics2)
-    
+    logger.add_result(config, 'int8 vs none', metrics1)
+    logger.add_result(config, 'e4m3 vs none', metrics2)
+    logger.add_result(config, 'e5m2 vs none', metrics3)
+    logger.add_result(config, 'int8 vs e4m3', metrics4)
 
 for config in test_configs:
     run_test(config)

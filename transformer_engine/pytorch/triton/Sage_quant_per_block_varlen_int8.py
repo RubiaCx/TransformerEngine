@@ -59,12 +59,13 @@ def quant_per_block_int8_kernel(Input, Output, Scale,
     tl.store(scale_ptrs, scale)
 
 def per_block_int8(q, k, v, 
-                   cu_seqlens_q, cu_seqlens_k, 
-                   max_seqlen_q, max_seqlen_k, 
+                   cu_seqlens_q, cu_seqlens_kv, 
+                   max_seqlen_q, max_seqlen_kv, 
                    BLKQ=128, BLKK=64, BLKV=64, 
                    sm_scale=None):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    v_int8 = torch.empty(v.shape, dtype=torch.int8, device=v.device)
     #! THD
     batch_size = cu_seqlens_q.shape[0] - 1
     num_heads_q = q.shape[1]
@@ -72,16 +73,19 @@ def per_block_int8(q, k, v,
     head_dim = q.shape[-1]
     # batch_size + 1 = total_lens
     q_batch_len = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    k_batch_len = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    kv_batch_len = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
 
     q_scale_len = (q_batch_len + BLKQ - 1) // BLKQ
-    k_scale_len = (k_batch_len + BLKK - 1) // BLKK
+    k_scale_len = (kv_batch_len + BLKK - 1) // BLKK
+    v_scale_len = (kv_batch_len + BLKV - 1) // BLKV
 
     cu_seqlens_q_scale = torch.nn.functional.pad(torch.cumsum(q_scale_len, dim=0), (1, 0), value=0)
     cu_seqlens_k_scale = torch.nn.functional.pad(torch.cumsum(k_scale_len, dim=0), (1, 0), value=0)
+    cu_seqlens_v_scale = torch.nn.functional.pad(torch.cumsum(v_scale_len, dim=0), (1, 0), value=0)
 
     q_scale = torch.empty((cu_seqlens_q_scale[-1], num_heads_q), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((cu_seqlens_k_scale[-1], num_heads_kv), device=k.device, dtype=torch.float32)
+    v_scale = torch.empty((cu_seqlens_v_scale[-1], num_heads_kv), device=v.device, dtype=torch.float32)
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -97,10 +101,10 @@ def per_block_int8(q, k, v,
         C=head_dim, BLK=BLKQ
     )
 
-    grid = ((max_seqlen_k + BLKK - 1) // BLKK, num_heads_kv, batch_size)
+    grid = ((max_seqlen_kv + BLKK - 1) // BLKK, num_heads_kv, batch_size)
     quant_per_block_int8_kernel[grid](
         k, k_int8, k_scale,
-        cu_seqlens_k, cu_seqlens_k_scale,
+        cu_seqlens_kv, cu_seqlens_k_scale,
         k.stride(1), k.stride(0),
         k_int8.stride(1), k_int8.stride(0),
         sm_scale=1.0, 
@@ -108,4 +112,14 @@ def per_block_int8(q, k, v,
         C=head_dim, BLK=BLKK
     )
 
-    return q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale
+    grid = ((max_seqlen_kv + BLKV - 1) // BLKV, num_heads_kv, batch_size)
+    quant_per_block_int8_kernel[grid](
+        v, v_int8, v_scale,
+        cu_seqlens_kv, cu_seqlens_v_scale,
+        v.stride(1), v.stride(0),
+        v_int8.stride(1), v_int8.stride(0),
+        sm_scale=1.0, 
+        H=num_heads_kv,
+        C=head_dim, BLK=BLKV
+    )
+    return q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale

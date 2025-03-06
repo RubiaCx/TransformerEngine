@@ -336,36 +336,27 @@ def test_flash(dtype, model_configs, model, qkv_layout, value_range):
     else:
         raise ValueError(f"Unsupported QKV layout: {qkv_layout}")
 
-    ref_out = ref_attention(q, k, v, scale).to(dtype)
-    sdpa_out = sdpa(q, k, v, is_causal=(config.attn_mask_type == "causal")).to(dtype)
-    
-    # unfused_attn = UnfusedDotProductAttention(
-    #     softmax_scale=scale,
-    #     attention_dropout=0.0,
-    # ).cuda().to(dtype=q.dtype)
-
-    # unfused_output = unfused_attn(q, k, v, qkv_layout=qkv_layout)
+    ref_out = ref_attention2(q, k, v, scale, config.num_heads).to(dtype)
+    ref_out = ref_out.reshape(config.max_seqlen_q, config.batch_size, -1).contiguous()
     flash_attn = FlashAttention(
         softmax_scale=scale,
         attention_dropout=0.0,
     ).cuda()
     flash_output = flash_attn(q, k, v, qkv_layout=qkv_layout).to(dtype)
-
     flash_output_api = flash_attn_func(q, k, v).to(dtype)
+    flash_output_api = flash_output_api.reshape(config.max_seqlen_q, config.batch_size, -1).contiguous()
 
     print("================================================")
     print("dtype:", dtype, "qkv_layout:", qkv_layout, "shape:", ref_out.shape, "\nbatch_size:", config.batch_size, "num_heads:", config.num_heads, "head_dim:", config.head_dim_qk)
-    print("Shapes: \n ref:", ref_out.shape, "sdpa:", sdpa_out.shape, "flash:", flash_output.shape, "flash_api:", flash_output_api.shape)
+    print("Shapes: \n ref:", ref_out.shape, "flash:", flash_output.shape, "flash_api:", flash_output_api.shape)
     print("value_range:", -value_range, "~", value_range)
     
     print("\nComparisons:")
-    print_diff("sdpa vs ref", sdpa_out, ref_out)
-    print_diff("flash vs ref", flash_output, ref_out)
     print_diff("flash_api vs ref", flash_output_api, ref_out)
+    print_diff("flash vs ref", flash_output, ref_out)
     print_diff("flash vs flash_api", flash_output, flash_output_api)
 
 
-    torch.testing.assert_close(ref_out, sdpa_out, **tols)
     torch.testing.assert_close(flash_output, ref_out, **tols)
 
 

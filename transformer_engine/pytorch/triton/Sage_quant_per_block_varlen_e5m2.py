@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def quant_per_block_e4m3_kernel(Input, Output, Scale,
+def quant_per_block_e5m2_kernel(Input, Output, Scale,
                                 cu_seqlens_input, cu_seqlens_scale,
                                 stride_ih, stride_in,
                                 stride_oh, stride_on,
@@ -51,19 +51,20 @@ def quant_per_block_e4m3_kernel(Input, Output, Scale,
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
     x = x.to(tl.float32)
     x *= sm_scale
-    scale = tl.max(tl.abs(x)) / 448. + 1e-8
-    x_e4m3 = (x / scale).to(tl.float8e4nv)
-    tl.store(output_ptrs, x_e4m3, mask=offs_n[:, None] < L)
+    scale = tl.max(tl.abs(x)) / 57344. + 1e-8
+    x_e5m2 = (x / scale).to(tl.float8e5)
+
+    tl.store(output_ptrs, x_e5m2, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
-def per_block_e4m3(q, k, v, 
+def per_block_e5m2(q, k, v, 
                    cu_seqlens_q, cu_seqlens_kv, 
                    max_seqlen_q, max_seqlen_kv, 
                    BLKQ=128, BLKK=64, BLKV=64, 
                    sm_scale=None):
-    q_e4m3 = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
-    k_e4m3 = torch.empty(k.shape, dtype=torch.float8_e4m3fn, device=k.device)
-    v_e4m3 = torch.empty(v.shape, dtype=torch.float8_e4m3fn, device=v.device)
+    q_e5m2 = torch.empty(q.shape, dtype=torch.float8_e5m2, device=q.device)
+    k_e5m2 = torch.empty(k.shape, dtype=torch.float8_e5m2, device=k.device)
+    v_e5m2 = torch.empty(v.shape, dtype=torch.float8_e5m2, device=v.device)
     #! THD
     batch_size = cu_seqlens_q.shape[0] - 1
     num_heads_q = q.shape[1]
@@ -89,35 +90,35 @@ def per_block_e4m3(q, k, v,
         sm_scale = head_dim**-0.5
 
     grid = ((max_seqlen_q + BLKQ - 1) // BLKQ, num_heads_q, batch_size)
-    quant_per_block_e4m3_kernel[grid](
-        q, q_e4m3, q_scale,
+    quant_per_block_e5m2_kernel[grid](
+        q, q_e5m2, q_scale,
         cu_seqlens_q, cu_seqlens_q_scale,
         q.stride(1), q.stride(0),
-        q_e4m3.stride(1), q_e4m3.stride(0),
+        q_e5m2.stride(1), q_e5m2.stride(0),
         sm_scale=(sm_scale * 1.44269504), 
         H=num_heads_q,
         C=head_dim, BLK=BLKQ
     )
 
     grid = ((max_seqlen_kv + BLKK - 1) // BLKK, num_heads_kv, batch_size)
-    quant_per_block_e4m3_kernel[grid](
-        k, k_e4m3, k_scale,
+    quant_per_block_e5m2_kernel[grid](
+        k, k_e5m2, k_scale,
         cu_seqlens_kv, cu_seqlens_k_scale,
         k.stride(1), k.stride(0),
-        k_e4m3.stride(1), k_e4m3.stride(0),
+        k_e5m2.stride(1), k_e5m2.stride(0),
         sm_scale=1.0, 
         H=num_heads_kv,
         C=head_dim, BLK=BLKK
     )
 
     grid = ((max_seqlen_kv + BLKV - 1) // BLKV, num_heads_kv, batch_size)
-    quant_per_block_e4m3_kernel[grid](
-        v, v_e4m3, v_scale,
+    quant_per_block_e5m2_kernel[grid](
+        v, v_e5m2, v_scale,
         cu_seqlens_kv, cu_seqlens_v_scale,
         v.stride(1), v.stride(0),
-        v_e4m3.stride(1), v_e4m3.stride(0),
+        v_e5m2.stride(1), v_e5m2.stride(0),
         sm_scale=1.0, 
         H=num_heads_kv,
         C=head_dim, BLK=BLKV
     )
-    return q_e4m3, q_scale, k_e4m3, k_scale, v_e4m3, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale
+    return q_e5m2, q_scale, k_e5m2, k_scale, v_e5m2, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale

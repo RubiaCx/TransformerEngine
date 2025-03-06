@@ -73,6 +73,8 @@ from transformer_engine.pytorch.jit import jit_fuser, no_torch_dynamo
 from transformer_engine.pytorch.graph import is_graph_capturing
 
 from transformer_engine.pytorch.triton.Sage_attn import forward as sageattn_triton
+from transformer_engine.pytorch.triton.Sage_attn_none import forward as sageattn_none_triton
+from transformer_engine.pytorch.triton.Sage_attn_quant import forward as sageattn_quant_triton
 from transformer_engine.pytorch.triton.Sage_attn_all_int8 import forward as sageattn_all_int8_triton
 from transformer_engine.pytorch.triton.Sage_attn_all_e4m3 import forward as sageattn_all_e4m3_triton
 from transformer_engine.pytorch.triton.Sage_attn_all_e5m2 import forward as sageattn_all_e5m2_triton
@@ -81,11 +83,16 @@ from transformer_engine.pytorch.triton.Sage_attn_causal_all_int8 import forward 
 from transformer_engine.pytorch.triton.Sage_attn_causal_all_e4m3 import forward as sageattn_causal_all_e4m3_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_all_e5m2 import forward as sageattn_causal_all_e5m2_triton
 from transformer_engine.pytorch.triton.Sage_attn_varlen import forward as sageattn_varlen_triton
+from transformer_engine.pytorch.triton.Sage_attn_varlen_all_int8 import forward as sageattn_varlen_all_int8_triton
+from transformer_engine.pytorch.triton.Sage_attn_varlen_all_e4m3 import forward as sageattn_varlen_all_e4m3_triton
+from transformer_engine.pytorch.triton.Sage_attn_varlen_all_e5m2 import forward as sageattn_varlen_all_e5m2_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_varlen import forward as sageattn_causal_varlen_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_block_int8 import per_block_int8 as per_block_int8_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_block_e4m3 import per_block_e4m3 as per_block_e4m3_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_block_e5m2 import per_block_e5m2 as per_block_e5m2_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_int8 import per_block_int8 as per_block_int8_varlen_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_e4m3 import per_block_e4m3 as per_block_e4m3_varlen_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_e5m2 import per_block_e5m2 as per_block_e5m2_varlen_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_thread_int8 import per_thread_int8 as per_thread_int8_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_thread_int4 import per_thread_int4 as per_thread_int4_triton
 
@@ -129,6 +136,7 @@ _stream_handler.setFormatter(_formatter)
 _NVTE_FLASH_ATTN = int(os.getenv("NVTE_FLASH_ATTN", "1"))
 _NVTE_FUSED_ATTN = int(os.getenv("NVTE_FUSED_ATTN", "1"))
 _NVTE_UNFUSED_ATTN = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+_NVTE_SAGE_ATTN = int(os.getenv("NVTE_SAGE_ATTN", "1"))
 
 _attention_backends = {
     "attention_params": None,
@@ -312,22 +320,26 @@ def get_attention_backend(
         run_config["NVTE_FP8_DPA_BWD"] = int(os.getenv("NVTE_FP8_DPA_BWD", "1"))
     logger.debug("Running with config=%s", run_config)
 
-    # Filter: Environment variables
-    global _NVTE_FLASH_ATTN, _NVTE_FUSED_ATTN, _NVTE_UNFUSED_ATTN
+    # Filter: Environment variables # * 通过环境变量初始化后端启动状态
+    global _NVTE_FLASH_ATTN, _NVTE_FUSED_ATTN, _NVTE_UNFUSED_ATTN, _NVTE_SAGE_ATTN
     _NVTE_FLASH_ATTN = int(os.getenv("NVTE_FLASH_ATTN", "1"))
     _NVTE_FUSED_ATTN = int(os.getenv("NVTE_FUSED_ATTN", "1"))
     _NVTE_UNFUSED_ATTN = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+    _NVTE_SAGE_ATTN = int(os.getenv("NVTE_SAGE_ATTN", "1"))
     use_flash_attention = _NVTE_FLASH_ATTN
     use_fused_attention = _NVTE_FUSED_ATTN
     use_unfused_attention = _NVTE_UNFUSED_ATTN
+    use_sage_attention = _NVTE_SAGE_ATTN
     if not use_flash_attention:
         logger.debug("Disabling FlashAttention due to NVTE_FLASH_ATTN=0")
     if not use_fused_attention:
         logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0")
     if not use_unfused_attention:
         logger.debug("Disabling UnfusedDotProductAttention due to NVTE_UNFUSED_ATTN=0")
+    if not use_sage_attention:
+        logger.debug("Disabling SageAttention due to NVTE_SAGE_ATTN=0")
 
-    # Filter: ONNX mode
+    # Filter: ONNX mode # * ONNX禁用FlashAttention、FusedAttention、SageAttention
     if is_in_onnx_export_mode():
         if use_flash_attention:
             logger.debug("Disabling FlashAttention due to ONNX mode")
@@ -335,8 +347,11 @@ def get_attention_backend(
         if use_fused_attention:
             logger.debug("Disabling FusedAttention due to ONNX mode")
         use_fused_attention = False
+        if use_sage_attention:
+            logger.debug("Disabling SageAttention due to ONNX mode")
+        use_sage_attention = False
 
-    # Filter: Compute capability
+    # Filter: Compute capability # * SM80- 禁用FlashAttention、FusedAttention、SageAttention
     if device_compute_capability < (8, 0):
         if use_flash_attention:
             logger.debug("Disabling FlashAttention as it requires compute capability sm80+")
@@ -344,8 +359,11 @@ def get_attention_backend(
         if use_fused_attention:
             logger.debug("Disabling FusedAttention as it requires compute capability sm80+")
             use_fused_attention = False
+        if use_sage_attention:
+            logger.debug("Disabling SageAttention as it requires compute capability sm80+")
+            use_sage_attention = False
 
-    # Filter: Data type
+    # Filter: Data type # * FlashAttention 支持bfloat16、float16、Float8Tensor；FusedAttention 支持bfloat16、float16
     if use_flash_attention and (
         qkv_dtype not in [torch.bfloat16, torch.float16] or qkv_type == Float8Tensor
     ):
@@ -366,7 +384,7 @@ def get_attention_backend(
         )
         use_fused_attention = False
 
-    # Filter: Execution type
+    # Filter: Execution type # * FP8 禁用FlashAttention、UnfusedDotProductAttention
     if fp8 and fp8_meta["recipe"].fp8_dpa:
         if use_flash_attention:
             logger.debug("Disabling FlashAttention as it does not support FP8")
@@ -375,7 +393,7 @@ def get_attention_backend(
             logger.debug("Disabling UnfusedDotProductAttention as it does not support FP8")
             use_unfused_attention = False
 
-    # Filter: Head dimension
+    # Filter: Head dimension # * FlashAttention 要求 head_dim_qk = head_dim_v (不支持MLA)，head_dim_qk % 8 = 0，head_dim_qk <= 256 (>192 requires sm80/90)
     if use_flash_attention and head_dim_qk != head_dim_v:
         logger.debug("Disabling FlashAttention as it does not support MLA.")
         use_flash_attention = False
@@ -394,7 +412,8 @@ def get_attention_backend(
             ".".join([str(i) for i in device_compute_capability]),
         )
         use_flash_attention = False
-    qkv_layout_group = qkv_layout.replace("b", "").replace("s", "").replace("t", "")
+    qkv_layout_group = qkv_layout.replace("b", "").replace("s", "").replace("t", "") 
+    # * FusedAttention 要求 head_dim_qk = head_dim_v (不支持MLA)，qkv_layout = xxhd_xxhd_xxhd 格式
     if use_fused_attention and head_dim_qk != head_dim_v and qkv_layout_group != "hd_hd_hd":
         logger.debug(
             "Disabling FusedAttention as MLA is not supported with qkv_layout = %s",
@@ -402,7 +421,7 @@ def get_attention_backend(
         )
         use_fused_attention = False
 
-    # Filter: QKV layout
+    # Filter: QKV layout # * UnfusedDotProductAttention 不支持 thd，FlashAttention 不支持 thd + padding
     qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
     if qkv_format == "thd":
         if use_unfused_attention:
@@ -426,7 +445,7 @@ def get_attention_backend(
     #            |     padding, padding_causal |                          | if no padding between sequences,
     #            | cross-attention:            |                          | FusedAttention
     #            |     padding                 |                          | if there is padding between sequences
-    # Note: context parallelism requires seq_len % (cp_size * 2) == 0 for each sequence in q, k, v.
+    # Note: context parallelism requires seq_len % (cp_size * 2) == 0 for each sequence in q, k, v. # * 上下文并行要求
     if context_parallel and use_unfused_attention:
         logger.debug(
             "Disabling UnfusedDotProductAttention as it does not support context parallelism"
@@ -489,7 +508,11 @@ def get_attention_backend(
                 "Disabling FusedAttention as it does not support context parallelism with MLA"
             )
             use_fused_attention = False
-
+    # if context_parallel and use_sage_attention:
+    #     logger.debug(
+    #         "Disabling SageAttention as it does not support context parallelism"
+    #     )
+    #     use_sage_attention = False
     # Filter: Attention mask
     # attn_mask_type              | attention_mask                       | supported backends
     # ----------------------------------------------------------------------------------------
@@ -510,13 +533,17 @@ def get_attention_backend(
     #     cross-attention         |                                      | FlashAttention, UnfusedDotProductAttention
     # arbitrary                   | One tensor in shape broadcastable to | UnfusedDotProductAttention
     #                             | [b, h, sq, skv]                      |
-    if attn_mask_type == "arbitrary":
+    if attn_mask_type == "arbitrary": # * arbitrary mask 仅支持 UnfusedDotProductAttention
         if use_flash_attention:
             logger.debug("Disabling FlashAttention for arbitrary mask")
         use_flash_attention = False
         if use_fused_attention:
             logger.debug("Disabling FusedAttention for arbitrary mask")
         use_fused_attention = False
+        # if use_sage_attention:
+        #     logger.debug("Disabling SageAttention for arbitrary mask")
+        # use_sage_attention = False
+    # * FlashAttention ≥2.1 仅支持右下角因果掩码
     if (
         use_flash_attention
         and _flash_attn_2_1_plus
@@ -549,7 +576,7 @@ def get_attention_backend(
     # FusedAttention             | (-1,  0) or (>=0, 0)   | top left
     # UnfusedDotProductAttention | (-1, -1) or (>=0, >=0) | both;
     #                            |                        | converts window_size to an 'arbitrary' mask
-    if window_size is None:
+    if window_size is None: 
         window_size = check_set_window_size(attn_mask_type, window_size)
     else:
         if use_fused_attention and (window_size[0] != -1 or window_size[1] not in [-1, 0]):
@@ -599,6 +626,9 @@ def get_attention_backend(
                 "Disabling FlashAttention as sliding window attention requires flash-attn 2.3+"
             )
             use_flash_attention = False
+        # if use_sage_attention:
+        #     logger.debug("Disabling SageAttention for sliding window attention")
+        #     use_sage_attention = False
 
     # Filter: Attention bias
     #    backend                 |      bias types              | ALiBi diagonal alignment
@@ -609,6 +639,7 @@ def get_attention_backend(
     #                            |                              | bottom_right (converts to a 'post_scale_bias' bias)
     # UnfusedDotProductAttention | no_bias, pre/post_scale_bias |
     #                            | alibi/alibi_slopes           | both; converts to a 'post_scale_bias' bias
+    # * FlashAttention 支持 no_bias、alibi/alibi_slopes；FusedAttention 支持 no_bias、post_scale_bias
     if use_flash_attention and (
         core_attention_bias_type not in ["no_bias", "alibi"]
         or core_attention_bias_shape is not None
@@ -705,7 +736,7 @@ def get_attention_backend(
             use_fused_attention = False
             fused_attention_backend = None
 
-    # Filter: Determinism
+    # Filter: Determinism # * 确定性执行
     # backend                      | deterministic
     # ---------------------------------------------
     # FlashAttention               |
@@ -717,6 +748,7 @@ def get_attention_backend(
     #                              | otherwise: no
     #     sub-backend 2            | no
     # UnfusedDotProductAttention   | yes
+    # SageAttention                | no
     if use_flash_attention and deterministic and not _flash_attn_2_4_1_plus:
         logger.warning(
             "Disabling FlashAttention as version <2.4.1 does not support deterministic "
@@ -739,7 +771,16 @@ def get_attention_backend(
         ):
             logger.debug("Disabling FusedAttention for determinism reasons")
             use_fused_attention = False
-
+    # * SageAttention 可选量化后端（目前仅有Triton），仅支持 SM90+
+    # if (
+    #     hasattr(attention_params, 'quantization_backend') and
+    #     attention_params.quantization_backend == "triton" and
+    #     get_device_compute_capability() >= (9, 0) 
+    # ):
+    #     use_sage_attention = True
+    #     use_unfused_attention = False
+    #     use_flash_attention = False
+    #     use_fused_attention = False
     # All available backends
     available_backends = [use_flash_attention, use_fused_attention, use_unfused_attention, use_sage_attention]
 
@@ -769,14 +810,16 @@ def get_attention_backend(
             )
             use_flash_attention = False
 
-    #! Backend priority: FlashAttention > FusedAttention > UnfusedDotProductAttention > SageAttention
-    if use_flash_attention:
+    #! Backend priority: SageAttention > FlashAttention > FusedAttention > UnfusedDotProductAttention
+    if use_sage_attention:
+        use_flash_attention = False
         use_fused_attention = False
         use_unfused_attention = False
-        use_sage_attention = False
+    elif use_flash_attention:
+        use_fused_attention = False
+        use_unfused_attention = False
     elif use_fused_attention:
         use_unfused_attention = False
-        use_sage_attention = False
     selected_backend = "NoBackend"
     if use_flash_attention:
         selected_backend = "FlashAttention"
@@ -6341,6 +6384,10 @@ class DotProductAttention(TransformerEngineBaseModule):
 
         self.sage_attention = SageAttention(
             softmax_scale,
+            quantization_backend="triton",
+            quantization_type="e4m3",
+            smooth_k=True,
+            return_lse=False,
             attention_type=attention_type,
             **attn_kwargs,
             layer_number=layer_number,
@@ -6641,7 +6688,6 @@ class DotProductAttention(TransformerEngineBaseModule):
                 if qkv_format == "bshd":
                     key_layer = key_layer.transpose(0, 1)
                     value_layer = value_layer.transpose(0, 1)
-
                 (
                     inference_key_memory,
                     inference_value_memory,
@@ -7027,9 +7073,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     core_attention_bias=core_attention_bias,
                     alibi_slopes=alibi_slopes,
                 )
-            # TODO(cx)
+            # TODO SageAttention 参考 cuDNN 的调用逻辑
             if use_sage_attention:
-                return self.sage_attention(
+                output = self.sage_attention(
                     query_layer,
                     key_layer,
                     value_layer,
@@ -7037,6 +7083,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_kv=cu_seqlens_kv,
                 )
+                if isinstance(output, tuple) and self.return_lse == False:
+                    output = output[0]
+                return output
             raise ValueError("No dot product attention support for the provided inputs!")
 
 
@@ -7847,7 +7896,6 @@ class SageAttention(torch.nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         attn_mask_type: str = "causal",
-        attention_mask: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # assert query_layer.device == key_layer.device == value_layer.device, "All tensors must be on the same device."
         assert all(x.is_cuda for x in [query_layer, key_layer, value_layer]), "All tensors must be on the GPU."
@@ -7864,6 +7912,20 @@ class SageAttention(torch.nn.Module):
         qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
         
         head_dim = query_layer.size(-1)
+        if head_dim < 64:
+            query_layer = F.pad(query_layer, (0, 64 - head_dim))
+            key_layer = F.pad(key_layer, (0, 64 - head_dim))
+            value_layer = F.pad(value_layer, (0, 64 - head_dim))
+        elif head_dim > 64 and head_dim < 128:
+            query_layer = F.pad(query_layer, (0, 128 - head_dim))
+            key_layer = F.pad(key_layer, (0, 128 - head_dim))
+            value_layer = F.pad(value_layer, (0, 128 - head_dim))
+        elif head_dim > 128 and head_dim < 256:
+            query_layer = F.pad(query_layer, (0, 256 - head_dim))
+            key_layer = F.pad(key_layer, (0, 256 - head_dim))
+            value_layer = F.pad(value_layer, (0, 256 - head_dim))
+        elif head_dim > 256:
+            raise ValueError(f"Unsupported head_dim: {head_dim}")
         
         if self.softmax_scale is None:
             self.softmax_scale = 1.0 / (head_dim ** 0.5)
@@ -7884,7 +7946,15 @@ class SageAttention(torch.nn.Module):
                 km = None
             if self.quantization_backend == "triton":
                 if self.quantization_type == "int8":
-                    q_quant, q_scale, k_quant, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
+                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_int8_varlen_triton(
+                        query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
+                    )
+                elif self.quantization_type == "e4m3":
+                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_e4m3_varlen_triton(
+                        query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
+                    )
+                elif self.quantization_type == "e5m2":
+                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_e5m2_varlen_triton(
                         query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
                     )
                 else:
@@ -7896,10 +7966,19 @@ class SageAttention(torch.nn.Module):
                 output =  sageattn_causal_varlen_triton(q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
                                                         q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale)
             else:
-                output =  sageattn_varlen_triton(q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                 q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale)
+                if self.quantization_type == "int8":
+                    output = sageattn_varlen_all_int8_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
+                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
+                elif self.quantization_type == "e4m3":
+                    output = sageattn_varlen_all_e4m3_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
+                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
+                elif self.quantization_type == "e5m2":
+                    output = sageattn_varlen_all_e5m2_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
+                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
+                else:
+                    output = sageattn_varlen_triton(q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
+                                                    q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale)
             output = output[..., :head_dim]
-
             return output
 
         else:
@@ -7912,17 +7991,6 @@ class SageAttention(torch.nn.Module):
                     x.transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
                 ]
 
-            # if head_dim < 64:
-            #     query_layer = F.pad(query_layer, (0, 64 - head_dim))
-            #     key_layer = F.pad(key_layer, (0, 64 - head_dim))
-            #     value_layer = F.pad(value_layer, (0, 64 - head_dim))
-            # elif head_dim > 64 and head_dim < 128:
-            #     query_layer = F.pad(query_layer, (0, 128 - head_dim))
-            #     key_layer = F.pad(key_layer, (0, 128 - head_dim))
-            #     value_layer = F.pad(value_layer, (0, 128 - head_dim))
-            # elif head_dim > 128:
-            #     raise ValueError(f"Unsupported head_dim: {head_dim}")
-
             # seq_dim = 1 if qkv_layout == "bshd" else 2
             seq_dim = 2
             if self.smooth_k:
@@ -7931,10 +7999,7 @@ class SageAttention(torch.nn.Module):
             else:
                 km = None
             if self.return_lse:
-                if qkv_layout == "bshd":
-                    lse_correction = torch.matmul(query_layer.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-                else:
-                    lse_correction = torch.matmul(query_layer, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+                lse_correction = torch.matmul(query_layer, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
 
             if self.quantization_backend == "triton":
                 if self.quantization_type == "int8":
@@ -7963,28 +8028,37 @@ class SageAttention(torch.nn.Module):
                     output, lse = sageattn_causal_all_e4m3_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
                 elif self.quantization_type == "e5m2":
                     output, lse = sageattn_causal_all_e5m2_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                # output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+                output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+            elif attn_mask_type == "no_mask":
+                # if self.quantization_type == "int8":
+                #     output, lse = sageattn_all_int8_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+                # elif self.quantization_type == "e4m3":
+                #     output, lse = sageattn_all_e4m3_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+                # elif self.quantization_type == "e5m2":
+                #     output, lse = sageattn_all_e5m2_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+                if self.quantization_type == "int8" or self.quantization_type == "e4m3" or self.quantization_type == "e5m2":
+                    output, lse = sageattn_quant_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd", quant_type=self.quantization_type)
+                else:
+                    output, lse = sageattn_triton(q_quant, k_quant, value_layer, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
+            elif attn_mask_type == "none":
+                output, lse = sageattn_none_triton(query_layer, key_layer, value_layer, return_lse=self.return_lse, tensor_layout="bhsd")
             else:
-                if self.quantization_type == "int8":
-                    # output, lse = sageattn_triton(q_quant, k_quant, value_layer, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-
-                    output, lse = sageattn_all_int8_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                elif self.quantization_type == "e4m3":
-                    output, lse = sageattn_all_e4m3_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                elif self.quantization_type == "e5m2":
-                    output, lse = sageattn_all_e5m2_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                # output, lse = sageattn_triton(q_quant, k_quant, value_layer, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-            output = output[..., :head_dim]
-            
+                raise NotImplementedError(f"Unsupported attn_mask_type: {attn_mask_type}")
+            #! output: [b, h, s, d] or [t, h, d]
+            if qkv_format == "sbhd":   # -> [s, b, h*d]
+                output = output.permute(2, 0, 1, 3)
+                output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+            elif qkv_format == "bhsd":   # -> [b, s, h*d]
+                output = output.permute(0, 2, 1, 3)
+                output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+            elif qkv_format == "bshd": # -> [b, s, h*d]
+                output = output.permute(0, 2, 1, 3)
+                output = output.reshape(output.size(0), output.size(1), -1).contiguous() 
+            elif qkv_format == "thd":  # -> [t, h*d]
+                output = output.reshape(output.size(0), -1).contiguous() 
+                
             if self.return_lse:
                 return output, lse / 1.44269504 + lse_correction * self.softmax_scale if self.smooth_k else lse / 1.44269504
             else:
                 return output
-            # if qkv_format == "sbhd":  
-            #     output = output.transpose(0, 1).transpose(1, 2)
-            # elif qkv_format == "bshd": 
-            #     output = output.transpose(1, 2)
-
-
-        return output
 

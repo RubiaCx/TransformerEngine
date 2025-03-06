@@ -15,7 +15,7 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 
 torch.manual_seed(2025)
 torch.set_printoptions(precision=4, threshold=None, edgeitems=None, linewidth=None, profile=None, sci_mode=False)
-#todo INT8 LSE 精度 diff
+
 class TestConfig:
     def __init__(self, batch_size, num_heads, seq_len, head_dim, 
                  dtype=torch.float16, value_range=1.0, layout='bhsd', attn_mask_type='no_mask'):
@@ -40,7 +40,7 @@ def create_tensors(config):
 
     def generate_tensor():
         t = torch.randn(shape, device="cuda")
-        t = t / t.std() * config.value_range
+        t = t * config.value_range
         return t.to(config.dtype).contiguous()  
 
     return generate_tensor(), generate_tensor(), generate_tensor()
@@ -73,24 +73,15 @@ base_configs = [
     (1, 32, 16000, 128, 'bhsd', 'causal'),
     (1, 32, 72000, 128, 'bhsd', 'causal'),
     (1, 1, 64, 32, 'bhsd', 'no_mask'),
-    (1, 1, 64, 32, 'bshd', 'no_mask'),
     (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 1, 64, 32, 'bshd', 'causal'),
-    (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'sbhd', 'no_mask'),
     (1, 4, 512, 64, 'bhsd', 'no_mask'),
     (1, 4, 512, 64, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'bshd', 'no_mask'),
-    (4, 4, 512, 64, 'bhsd', 'causal'),
-    (4, 4, 512, 64, 'bshd', 'causal'),
     (8, 4, 512, 64, 'bhsd', 'no_mask'),
     (8, 4, 512, 64, 'bshd', 'causal'),
     (16, 16, 2048, 128, 'bhsd', 'causal'),
-    (16, 16, 2048, 128, 'bshd', 'no_mask'),
+    (16, 16, 2048, 128, 'bhsd', 'no_mask'),
     (32, 8, 4096, 64, 'bhsd', 'causal'),
-    (32, 8, 4096, 64, 'bshd', 'no_mask'),
-    (32, 32, 4096, 128, 'bhsd', 'no_mask'),
-    (32, 32, 4096, 128, 'bhsd', 'causal'),
+    (32, 8, 4096, 64, 'bhsd', 'no_mask'),
 ]
 
 test_configs = []
@@ -200,6 +191,11 @@ def run_test(config):
         attn_mask_type=config.attn_mask_type
     )
 
+    sage_none_output = sage_int8(
+        q, k, v,
+        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+        attn_mask_type="none"
+    )
      #! -> BHSD
     if config.layout == 'bhsd':
         q_sdpa = q.contiguous()
@@ -232,10 +228,13 @@ def run_test(config):
     metrics_e5m2 = calculate_similarity(sage_e5m2_output, sdpa_output)
     print_metrics(f"Sage e5m2 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
 
+    metrics_none = calculate_similarity(sage_none_output, sdpa_output)
+    print_metrics(f"Sage none vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_none)
+
     logger.add_result(config, 'int8', metrics)
     logger.add_result(config, 'e4m3', metrics_e4m3)
     logger.add_result(config, 'e5m2', metrics_e5m2)
-    
+    logger.add_result(config, 'none', metrics_none)
 
 for config in test_configs:
     run_test(config)

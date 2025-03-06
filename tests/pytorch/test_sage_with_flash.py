@@ -4,23 +4,24 @@ from transformer_engine.pytorch.attention import (
     FlashAttention,
     UnfusedDotProductAttention,
 )
-from sageattention import sageattn_qk_int8_pv_fp16_triton
 import torch.nn.functional as F
 from datetime import datetime
 import pandas as pd
 
 from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn import flash_attn_varlen_func
 
 torch.manual_seed(2025)
 torch.set_printoptions(precision=4, threshold=None, edgeitems=None, linewidth=None, profile=None, sci_mode=False)
 
 class TestConfig:
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, 
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, total_seq, 
                  dtype=torch.float16, value_range=1.0, layout='bhsd'):
         self.batch_size = batch_size
         self.num_heads = num_heads
         self.seq_len = seq_len
         self.head_dim = head_dim
+        self.total_seq = total_seq
         self.dtype = dtype
         self.value_range = value_range
         self.layout = layout  
@@ -30,6 +31,8 @@ def create_tensors(config):
         shape = (config.batch_size, config.num_heads, config.seq_len, config.head_dim)
     elif config.layout == 'bshd':
         shape = (config.batch_size, config.seq_len, config.num_heads, config.head_dim)
+    elif config.layout == 'thd':
+        shape = (config.total_seq, config.num_heads, config.head_dim)
     else:
         raise ValueError(f"Unsupported layout: {config.layout}")
 
@@ -57,17 +60,26 @@ def print_metrics(name, metrics):
     print(f"Mean Difference: {metrics['mean_diff'].item():.6f}")
     print(f"Cosine Similarity: {metrics['cos_sim'].item():.6f}")
 
+# base_configs = [
+#     # (batch_size, num_heads, seq_len, head_dim, layout)
+#     (1, 4, 512, 64, 'bhsd'),
+#     (1, 4, 512, 64, 'bshd'), 
+#     (4, 4, 512, 64, 'bhsd'),
+#     (4, 4, 512, 64, 'bshd'),
+#     (8, 4, 512, 64, 'bhsd'),
+#     (8, 4, 512, 64, 'bshd'),
+#     (16, 16, 2048, 128, 'bhsd'),
+#     (16, 16, 2048, 128, 'bshd'),
+#     (32, 8, 4096, 64, 'bhsd'),
+#     (32, 8, 4096, 64, 'bshd'),
+# ]
+
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout)
-    (1, 4, 512, 64, 'bhsd'),
     (1, 4, 512, 64, 'bshd'), 
-    (4, 4, 512, 64, 'bhsd'),
     (4, 4, 512, 64, 'bshd'),
-    (8, 4, 512, 64, 'bhsd'),
     (8, 4, 512, 64, 'bshd'),
-    (16, 16, 2048, 128, 'bhsd'),
     (16, 16, 2048, 128, 'bshd'),
-    (32, 8, 4096, 64, 'bhsd'),
     (32, 8, 4096, 64, 'bshd'),
 ]
 
@@ -81,6 +93,31 @@ for bs, h, s, d, layout in base_configs:
                     num_heads=h,
                     seq_len=s,
                     head_dim=d,
+                    total_seq=bs * s,
+                    dtype=dtype,
+                    value_range=value_range,
+                    layout=layout
+                )
+            )
+
+var_configs = [
+    # total_seq, num_heads, head_dim, layout
+    (2048, 4, 16, 'thd'),
+    (2048, 4, 64, 'thd'),
+    (2048, 4, 128, 'thd'),
+    (2048, 4, 256, 'thd'),
+]
+test_var_configs = []
+for t, h, d, layout in var_configs:
+    for dtype in [torch.float16, torch.bfloat16]:
+        for value_range in [0.1, 1.0, 10.0]:
+            test_var_configs.append(
+                TestConfig(
+                    batch_size=0,
+                    num_heads=h,
+                    seq_len=0,
+                    head_dim=d,
+                    total_seq=t,
                     dtype=dtype,
                     value_range=value_range,
                     layout=layout
@@ -91,8 +128,8 @@ class ResultLogger:
     def __init__(self):
         self.columns = [
             'Quant Type', 
-            'Batch Size', 'Num Heads', 'Seq Len', 'Head Dim', 
-            'Data Type', 'Value Range', 'Layout',  
+            'Batch Size', 'Num Heads', 'Seq Len', 'Head Dim', 'Total Seq',  
+            'Data Type', 'Value Range', 'Layout', 
             'Max Diff', 'Mean Diff', 'Cos Sim'
         ]
         self.results = []
@@ -104,6 +141,7 @@ class ResultLogger:
             config.num_heads,
             config.seq_len,
             config.head_dim,
+            config.total_seq,
             str(config.dtype).split('.')[-1],
             config.value_range,
             config.layout.upper(),  
@@ -116,7 +154,7 @@ class ResultLogger:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{filename}_{timestamp}"
         df = pd.DataFrame(self.results, columns=self.columns)
-        # df.to_excel(f"{filename}.xlsx", index=False)
+        df.to_excel(f"{filename}.xlsx", index=False)
         with open(f"{filename}.txt", "w") as f:
             f.write(df.to_string(index=False))
         print(f"Results saved to {filename}.[xlsx|txt]")
@@ -153,6 +191,11 @@ def run_test(config):
         attention_dropout=0.0,
     ).cuda()
 
+    flash = FlashAttention(
+        softmax_scale=scale,
+        attention_dropout=0.0,
+    ).cuda()
+
     q, k, v = create_tensors(config)
     
     sage_int8_output = sage_int8(
@@ -173,7 +216,11 @@ def run_test(config):
         attn_mask_type="no_mask"
     )
 
-    sage_output = sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout="HND", is_causal=False)
+    flash_ans = flash(
+        q, k, v,
+        qkv_layout= "bshd_bshd_bshd",
+        attn_mask_type="no_mask"
+    )
 
     # -> bshd
     if config.layout == 'bhsd': # [b,h,s,d] -> [b,s,h,d]
@@ -189,28 +236,141 @@ def run_test(config):
         q_flash, k_flash, v_flash
     )
     
-    if config.layout == 'bhsd':
-        flash_output = flash_output.transpose(1, 2)  # [b,s,h,d] -> [b,h,s,d]
+    flash_output = flash_output.reshape(flash_output.size(0), flash_output.size(1), -1).contiguous()
 
     metrics = calculate_similarity(sage_int8_output, flash_output)
-    print_metrics(f"Sage int8 vs Flash (BS={config.batch_size}, Heads={config.num_heads})", metrics)
+    print_metrics(f"Sage int8 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics)
 
     metrics_e4m3 = calculate_similarity(sage_e4m3_output, flash_output)
-    print_metrics(f"Sage e4m3 vs Flash (BS={config.batch_size}, Heads={config.num_heads})", metrics_e4m3)
+    print_metrics(f"Sage e4m3 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics_e4m3)
 
     metrics_e5m2 = calculate_similarity(sage_e5m2_output, flash_output)
-    print_metrics(f"Sage e5m2 vs Flash (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
+    print_metrics(f"Sage e5m2 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics_e5m2)
 
-    # metrics_fp8 = calculate_similarity(sage_output, flash_output)
-    # print_metrics(f"Sage fp8v1 vs Flash (BS={config.batch_size}, Heads={config.num_heads})", metrics_fp8)
+    metrics_2 = calculate_similarity(flash_ans, flash_output)
+    print_metrics(f"Flash vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics)
 
     logger.add_result(config, 'int8', metrics)
     logger.add_result(config, 'e4m3', metrics_e4m3)
     logger.add_result(config, 'e5m2', metrics_e5m2)
-    # logger.add_result(config, 'fp8v1', metrics_fp8)
+    logger.add_result(config, 'flash', metrics_2)
+
+def run_var_test(config):
+    tols = {"atol": 1e-2, "rtol": 1e-2}
+    scale = 1.0 / (config.head_dim ** 0.5)
+    cu_seqlens_q = cu_seqlens_kv = torch.tensor([0, 300, 1100, 2048], device="cuda", dtype=torch.int32)
+
+    sage_int8 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="int8",
+        smooth_k=True,
+        return_lse=False,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_e4m3 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e4m3",
+        smooth_k=True,
+        return_lse=False,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_e5m2 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e5m2",
+        smooth_k=True,
+        return_lse=False,
+        attention_dropout=0.0,
+    ).cuda()
+
+    flash = FlashAttention(
+        softmax_scale=scale,
+        attention_dropout=0.0,
+    ).cuda()
+
+    q, k, v = create_tensors(config)
     
+    sage_int8_output = sage_int8(
+        q, k, v,
+        qkv_layout="thd",
+        attn_mask_type="no_mask",
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=config.total_seq,
+        max_seqlen_kv=config.total_seq,
+    )
+    
+    sage_e4m3_output = sage_e4m3(
+        q, k, v,
+        qkv_layout="thd",
+        attn_mask_type="no_mask",
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=config.total_seq,
+        max_seqlen_kv=config.total_seq,
+    )
+
+    sage_e5m2_output = sage_e5m2(
+        q, k, v,
+        qkv_layout="thd",
+        attn_mask_type="no_mask",
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=config.total_seq,
+        max_seqlen_kv=config.total_seq,
+    )
+
+    flash_ans = flash(
+        q, k, v,
+        qkv_layout="thd_thd_thd",
+        attn_mask_type='padding', 
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=config.total_seq,
+        max_seqlen_kv=config.total_seq,
+    )
+    
+    flash_output = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=config.total_seq,
+        max_seqlen_k=config.total_seq,
+        causal=False,
+        dropout_p=0.0,
+        softmax_scale=scale,
+        return_attn_probs=False,
+    )
+    
+    # flash_output = flash_output.reshape(flash_output.size(0), flash_output.size(1), -1).contiguous()
+
+    metrics = calculate_similarity(sage_int8_output, flash_output)
+    print_metrics(f"Sage int8 vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics)
+
+    metrics_e4m3 = calculate_similarity(sage_e4m3_output, flash_output)
+    print_metrics(f"Sage e4m3 vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_e4m3)
+
+    metrics_e5m2 = calculate_similarity(sage_e5m2_output, flash_output)
+    print_metrics(f"Sage e5m2 vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_e5m2)
+
+    metrics_2 = calculate_similarity(flash_ans, flash_output)
+    print_metrics(f"Flash vs FlashAPI (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics)
+
+    logger.add_result(config, 'int8', metrics)
+    logger.add_result(config, 'e4m3', metrics_e4m3)
+    logger.add_result(config, 'e5m2', metrics_e5m2)
+    logger.add_result(config, 'flash', metrics_2)
+
+# for config in test_var_configs:
+#     print(f"Running var test for config: {config}")
+#     run_var_test(config)
 
 for config in test_configs:
+    print(f"Running fixlen test for config: {config}")
     run_test(config)
 
 logger.save()

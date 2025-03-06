@@ -185,7 +185,7 @@ def _get_attention_backends(
             fp8=fp8,
             fp8_meta=fp8_meta,
         )
-        _, _, fused_attention_backend, _, available_backends = get_attention_backend(
+        _, _, fused_attention_backend, _, _, available_backends = get_attention_backend(
             attention_params
         )
         return available_backends, fused_attention_backend
@@ -258,7 +258,7 @@ def test_dot_product_attention(
         window_size=config.window_size,
         pad_between_seqs=pad_between_seqs,
     )
-    flash_attn_supported, fused_attn_supported, unfused_attn_supported = available_backends
+    flash_attn_supported, fused_attn_supported, unfused_attn_supported, sage_attn_supported = available_backends
     # FlashAttention does not support pad_between_seqs, but _run_dot_product_attention
     # mannually pads and unpads the input and output of FlashAttention for testing purposes
     if pad_between_seqs and not (
@@ -268,7 +268,7 @@ def test_dot_product_attention(
         flash_attn_supported = True
 
     # Skip if only unfused backend is supported
-    if (len(fused_attn_backends) + flash_attn_supported + unfused_attn_supported) < 2:
+    if (len(fused_attn_backends) + flash_attn_supported + unfused_attn_supported + sage_attn_supported) < 2:
         pytest.skip("Less than two backends to compare.")
 
     is_training = config.head_dim_qk <= 128 and config.head_dim_v <= 128
@@ -334,7 +334,17 @@ def test_dot_product_attention(
             pad_between_seqs,
             is_training,
         )
-
+    if sage_attn_supported:
+        sage_attn_fwd = _run_dot_product_attention(
+            dtype,
+            config,
+            "SageAttention",
+            ckpt_attn,
+            qkv_layout,
+            workspace_opt,
+            pad_between_seqs,
+            is_training,
+        )
     if unfused_attn_supported and fused_attn_supported:
         logging.info("[test_dot_product_attention]: unfused attn vs fused attn")
         torch.testing.assert_close(fused_attn_fwd, unfused_attn_fwd, **tols)
@@ -674,6 +684,8 @@ def _run_dot_product_attention(
     if backend == "FusedAttention":
         os.environ["NVTE_FUSED_ATTN"] = "1"
         os.environ["NVTE_FUSED_ATTN_FORCE_WORKSPACE_OPT"] = "1" if workspace_opt else "0"
+    if backend == "SageAttention":
+        os.environ["NVTE_SAGE_ATTN"] = "1"
     global _attention_backends
     _attention_backends["backend_selection_requires_update"] = True
 
@@ -928,7 +940,7 @@ def _run_dot_product_attention(
     ).to(dtype=dtype, device="cuda")
 
     # Run a forward and backward pass
-    if backend in ["FlashAttention", "UnfusedDotProductAttention"]:
+    if backend in ["FlashAttention", "UnfusedDotProductAttention", "SageAttention"]:
         q = inp_orig[0]
         k = inp_orig[1]
         v = inp_orig[2]
@@ -957,6 +969,11 @@ def _run_dot_product_attention(
         core_attention_bias=bias,
         alibi_slopes=alibi_slopes,
         fast_zero_fill=True,
+        quantization_backend="triton",
+        quantization_type="e4m3",
+        smooth_k=True,
+        return_lse=False,
+        attention_dropout=config.dropout_p,
     )
     if is_training:
         out.backward(d_out)
@@ -1041,11 +1058,11 @@ def test_transformer_layer(
         qkv_dtype=dtype,
         qkv_layout="sbh3d" if fused_qkv_params else "sb3hd",
     )
-    flash_attn_supported, fused_attn_supported, unfused_attn_supported = available_backends
+    flash_attn_supported, fused_attn_supported, unfused_attn_supported, sage_attn_supported = available_backends
 
     # Skip if only unfused backend is supported
-    if (len(fused_attn_backends) + flash_attn_supported + unfused_attn_supported) < 2:
-        pytest.skip("Less than two backends to compare.")
+    if (len(fused_attn_backends) + flash_attn_supported + unfused_attn_supported + sage_attn_supported) < 3:
+        pytest.skip("Less than three backends to compare.")
 
     # UnfusedDotProductAttention backend
     if unfused_attn_supported:
