@@ -18,9 +18,6 @@ import torch
 import triton
 import triton.language as tl
 # 为什么不需要x *= sm_scale
-#TODO(cx)
-# dot2 fp8
-# 不同精度lse
 
 @triton.jit
 def quant_query_per_thread_int4_kernel(Input, Output, Scale, 

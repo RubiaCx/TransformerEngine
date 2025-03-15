@@ -72,29 +72,18 @@ from transformer_engine.pytorch.export import is_in_onnx_export_mode
 from transformer_engine.pytorch.jit import jit_fuser, no_torch_dynamo
 from transformer_engine.pytorch.graph import is_graph_capturing
 
+
+from transformer_engine.pytorch.triton.Sage_quant_per_block import per_block_quant as quant_per_block_triton
 from transformer_engine.pytorch.triton.Sage_attn import forward as sageattn_triton
-from transformer_engine.pytorch.triton.Sage_attn_none import forward as sageattn_none_triton
 from transformer_engine.pytorch.triton.Sage_attn_quant import forward as sageattn_quant_triton
-from transformer_engine.pytorch.triton.Sage_attn_all_int8 import forward as sageattn_all_int8_triton
-from transformer_engine.pytorch.triton.Sage_attn_all_e4m3 import forward as sageattn_all_e4m3_triton
-from transformer_engine.pytorch.triton.Sage_attn_all_e5m2 import forward as sageattn_all_e5m2_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal import forward as sageattn_causal_triton
-from transformer_engine.pytorch.triton.Sage_attn_causal_all_int8 import forward as sageattn_causal_all_int8_triton
-from transformer_engine.pytorch.triton.Sage_attn_causal_all_e4m3 import forward as sageattn_causal_all_e4m3_triton
-from transformer_engine.pytorch.triton.Sage_attn_causal_all_e5m2 import forward as sageattn_causal_all_e5m2_triton
+from transformer_engine.pytorch.triton.Sage_attn_causal_quant import forward as sageattn_causal_quant_triton
+
+from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen import per_block_varlen_quant as quant_per_block_varlen_triton
 from transformer_engine.pytorch.triton.Sage_attn_varlen import forward as sageattn_varlen_triton
-from transformer_engine.pytorch.triton.Sage_attn_varlen_all_int8 import forward as sageattn_varlen_all_int8_triton
-from transformer_engine.pytorch.triton.Sage_attn_varlen_all_e4m3 import forward as sageattn_varlen_all_e4m3_triton
-from transformer_engine.pytorch.triton.Sage_attn_varlen_all_e5m2 import forward as sageattn_varlen_all_e5m2_triton
+from transformer_engine.pytorch.triton.Sage_attn_varlen_quant import forward as sageattn_varlen_quant_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_varlen import forward as sageattn_causal_varlen_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_int8 import per_block_int8 as per_block_int8_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_e4m3 import per_block_e4m3 as per_block_e4m3_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_e5m2 import per_block_e5m2 as per_block_e5m2_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_int8 import per_block_int8 as per_block_int8_varlen_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_e4m3 import per_block_e4m3 as per_block_e4m3_varlen_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen_e5m2 import per_block_e5m2 as per_block_e5m2_varlen_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_thread_int8 import per_thread_int8 as per_thread_int8_triton
-from transformer_engine.pytorch.triton.Sage_quant_per_thread_int4 import per_thread_int4 as per_thread_int4_triton
+from transformer_engine.pytorch.triton.Sage_attn_causal_varlen_quant import forward as sageattn_causal_varlen_quant_triton
 
 _flash_attn_version = PkgVersion(get_pkg_version("flash-attn"))
 _flash_attn_version_required = PkgVersion("2.0.6")
@@ -111,6 +100,7 @@ if _flash_attn_version >= _flash_attn_version_required:
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward as _flash_attn_forward
     from flash_attn.flash_attn_interface import _flash_attn_varlen_backward as _flash_attn_backward
     from flash_attn_2_cuda import varlen_bwd as flash_attn_cuda_bwd
+    # import flash_attn_2_cuda as flash_attn_cuda
 
 META_QKV = tex.FP8FwdTensors.GEMM1_OUTPUT
 META_DQKV = tex.FP8BwdTensors.GRAD_OUTPUT1
@@ -412,6 +402,28 @@ def get_attention_backend(
             ".".join([str(i) for i in device_compute_capability]),
         )
         use_flash_attention = False
+    if use_sage_attention and head_dim_qk != head_dim_v:
+        logger.debug(
+            "Disabling SageAttention as it does not support MLA."
+        )
+        use_sage_attention = False
+    if use_sage_attention and is_training and (
+        head_dim_qk > 256
+        or head_dim_qk % 8 != 0
+    ):
+        logger.debug(
+            "Disabling SageAttention due to training in unsupported head_dim = %s.",
+            head_dim_qk,
+        )
+        use_sage_attention = False
+    if use_sage_attention and is_training and (qkv_layout not in ["t3hd", "th3d", "thd_t2hd", "thd_th2d", "thd_thd_thd"]
+    ):
+        logger.debug(
+            "Disabling SageAttention due to training in unsupported qkv_layout = %s.",
+            qkv_layout,
+        )
+        use_sage_attention = False
+
     qkv_layout_group = qkv_layout.replace("b", "").replace("s", "").replace("t", "") 
     # * FusedAttention 要求 head_dim_qk = head_dim_v (不支持MLA)，qkv_layout = xxhd_xxhd_xxhd 格式
     if use_fused_attention and head_dim_qk != head_dim_v and qkv_layout_group != "hd_hd_hd":
@@ -433,6 +445,12 @@ def get_attention_backend(
                 "padding between sequences, i.e. [a, a, PAD, b, b, b, PAD, c, PAD]"
             )
             use_flash_attention = False
+        if use_sage_attention and pad_between_seqs:
+            logger.debug(
+                "Disabling SageAttention for qkv_format = thd when there is "
+                "padding between sequences, i.e. [a, a, PAD, b, b, b, PAD, c, PAD]"
+            )
+            use_sage_attention = False
 
     # Filter: Context parallelism
     # qkv_format | attn_mask_type              | attn_bias_type           | supported backends
@@ -508,11 +526,11 @@ def get_attention_backend(
                 "Disabling FusedAttention as it does not support context parallelism with MLA"
             )
             use_fused_attention = False
-    # if context_parallel and use_sage_attention:
-    #     logger.debug(
-    #         "Disabling SageAttention as it does not support context parallelism"
-    #     )
-    #     use_sage_attention = False
+    if context_parallel and use_sage_attention:
+        logger.debug(
+            "Disabling SageAttention as it does not support context parallelism"
+        )
+        use_sage_attention = False
     # Filter: Attention mask
     # attn_mask_type              | attention_mask                       | supported backends
     # ----------------------------------------------------------------------------------------
@@ -540,9 +558,9 @@ def get_attention_backend(
         if use_fused_attention:
             logger.debug("Disabling FusedAttention for arbitrary mask")
         use_fused_attention = False
-        # if use_sage_attention:
-        #     logger.debug("Disabling SageAttention for arbitrary mask")
-        # use_sage_attention = False
+        if use_sage_attention:
+            logger.debug("Disabling SageAttention for arbitrary mask")
+        use_sage_attention = False
     # * FlashAttention ≥2.1 仅支持右下角因果掩码
     if (
         use_flash_attention
@@ -771,16 +789,6 @@ def get_attention_backend(
         ):
             logger.debug("Disabling FusedAttention for determinism reasons")
             use_fused_attention = False
-    # * SageAttention 可选量化后端（目前仅有Triton），仅支持 SM90+
-    # if (
-    #     hasattr(attention_params, 'quantization_backend') and
-    #     attention_params.quantization_backend == "triton" and
-    #     get_device_compute_capability() >= (9, 0) 
-    # ):
-    #     use_sage_attention = True
-    #     use_unfused_attention = False
-    #     use_flash_attention = False
-    #     use_fused_attention = False
     # All available backends
     available_backends = [use_flash_attention, use_fused_attention, use_unfused_attention, use_sage_attention]
 
@@ -820,6 +828,7 @@ def get_attention_backend(
         use_unfused_attention = False
     elif use_fused_attention:
         use_unfused_attention = False
+
     selected_backend = "NoBackend"
     if use_flash_attention:
         selected_backend = "FlashAttention"
@@ -830,7 +839,6 @@ def get_attention_backend(
     elif use_sage_attention:
         selected_backend = "SageAttention"
     logger.debug("Selected backend = %s", selected_backend)
-
     global _attention_backends
     _attention_backends["use_flash_attention"] = use_flash_attention
     _attention_backends["use_fused_attention"] = use_fused_attention
@@ -4293,7 +4301,6 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
     ) -> torch.Tensor:
         """flash-attn fprop"""
-
         assert (
             query_layer.dtype in [torch.float16, torch.bfloat16]
             and key_layer.dtype in [torch.float16, torch.bfloat16]
@@ -6657,10 +6664,10 @@ class DotProductAttention(TransformerEngineBaseModule):
             assert (
                 attn_mask_type in AttnMaskTypes
             ), f"Attention mask type {attn_mask_type} is not supported!"
-            if qkv_format == "thd":
-                assert (
-                    "padding" in attn_mask_type
-                ), "Attention mask type must be padding or padding_causal for qkv_format=thd!"
+            # if qkv_format == "thd":
+            #     assert (
+            #         "padding" in attn_mask_type
+            #     ), "Attention mask type must be padding or padding_causal for qkv_format=thd!"
 
             if window_size is None:
                 window_size = self.window_size
@@ -7082,6 +7089,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     qkv_layout=qkv_layout,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_kv=cu_seqlens_kv,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                    attn_mask_type=attn_mask_type,
                 )
                 if isinstance(output, tuple) and self.return_lse == False:
                     output = output[0]
@@ -7858,11 +7868,309 @@ class MultiheadAttention(torch.nn.Module):
             outputs += (layernorm_output,)
         return outputs if len(outputs) > 1 else outputs[0]
 
+def print_param_info(name, param):
+    if param is None:
+        print(f"{name}: None")
+    else:
+        print(f"{name}: {type(param)}, shape={getattr(param, 'shape', 'N/A')}, dtype={getattr(param, 'dtype', 'N/A')}")
+
+def sage_attn_forward(
+    query_layer, 
+    key_layer, 
+    value_layer,
+    softmax_scale,
+    quantization_backend,
+    quantization_type,
+    smooth_k,
+    qkv_format,
+    cu_seqlens_q,
+    cu_seqlens_kv,
+    max_seqlen_q,
+    max_seqlen_kv,
+    attn_mask_type,
+    return_lse):
+    head_dim = query_layer.size(-1)
+    original_head_dim = head_dim
+
+    if head_dim < 64:
+        pad_to = 64
+    elif 64 <= head_dim < 128:
+        pad_to = 128
+    elif 128 <= head_dim < 256:
+        pad_to = 256
+    else:
+        raise ValueError(f"Unsupported head_dim: {head_dim}")
+    if head_dim != pad_to:
+        query_layer = F.pad(query_layer, (0, pad_to - head_dim))
+        key_layer = F.pad(key_layer, (0, pad_to - head_dim))
+        value_layer = F.pad(value_layer, (0, pad_to - head_dim))
+        head_dim = pad_to
+    
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (original_head_dim ** 0.5)
+    
+    if qkv_format == "thd":
+        if max_seqlen_q is None and cu_seqlens_q is not None:
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            max_seqlen_q = seqlens_q.max().item()
+        if max_seqlen_kv is None and cu_seqlens_kv is not None:
+            seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
+            max_seqlen_kv = seqlens_kv.max().item()
+    
+    km = None
+    lse_correction = None
+    if smooth_k:
+        if qkv_format == "thd":
+            km = key_layer.mean(dim=0, keepdim=True) # [1, H, D]
+        else: # bhsd
+            km = key_layer.mean(dim=2, keepdim=True)
+        key_layer = key_layer - km
+    if return_lse:
+        if qkv_format == "thd":
+            '''
+            query_layer: [T, H, D]
+            km: [1, H, D]
+            lse: [B, H, T]
+            '''
+            lse_correction = (query_layer * km).sum(dim=-1).to(torch.float32)
+            batch_size = len(cu_seqlens_q) - 1
+            max_seqlen = max_seqlen_q
+            lse_correction = torch.zeros(
+                (batch_size, km.size(1), max_seqlen), 
+                dtype=torch.float32, device=query_layer.device
+            )
+            for b in range(batch_size):
+                start = cu_seqlens_q[b]
+                end = cu_seqlens_q[b + 1]
+                seq_correction = (query_layer[start:end] * km.squeeze(0)).sum(dim=-1)
+                lse_correction[b, :, :end - start] = seq_correction.T
+        elif qkv_format == "bhsd":
+            '''
+            query_layer: [B, Hq, S, D]
+            km: [B, Hk, 1, D] -> [B, Hk, D, 1]
+            lse: [B, Hq, S]
+            '''
+            lse_correction = torch.matmul(query_layer, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+        else:
+            raise NotImplementedError(f"Unsupported qkv_format for lse_correction: {qkv_format}")
+
+    if qkv_format == "sbhd":  # -> BHSD
+        query_layer = query_layer.transpose(0, 1).transpose(1, 2).contiguous()
+        key_layer = key_layer.transpose(0, 1).transpose(1,2).contiguous()
+        value_layer = value_layer.transpose(0, 1).transpose(1,2).contiguous()
+    elif qkv_format == "bshd":  # -> BHSD
+        query_layer = query_layer.transpose(1, 2).contiguous()
+        key_layer = key_layer.transpose(1, 2).contiguous()
+        value_layer = value_layer.transpose(1, 2).contiguous()
+    elif qkv_format == "thd" or qkv_format == "bhsd":
+        query_layer = query_layer.contiguous()
+        key_layer = key_layer.contiguous()
+        value_layer = value_layer.contiguous()
+    
+    if quantization_backend == "triton":
+        if quantization_type in ["int8", "e4m3", "e5m2"]:
+            if qkv_format == "thd":
+                q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = quant_per_block_varlen_triton(
+                    query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, 
+                    sm_scale=softmax_scale, quant_type=quantization_type
+                )
+            else:
+                q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = quant_per_block_triton(
+                    query_layer, key_layer, value_layer,
+                    sm_scale=softmax_scale, tensor_layout="bhsd", quant_type=quantization_type
+                )
+                cu_seqlens_q_scale = cu_seqlens_k_scale = cu_seqlens_v_scale = None
+
+    if qkv_format == "thd":
+        if attn_mask_type == "causal":
+            if quantization_type in ["int8", "e4m3", "e5m2"]:
+                output, lse = sageattn_causal_varlen_quant_triton(
+                    q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q,
+                    q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,
+                    return_lse=return_lse,
+                    quant_type=quantization_type, 
+                    output_dtype=query_layer.dtype
+                )
+            else:
+                output, lse = sageattn_causal_varlen_triton(
+                    q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q,
+                    q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+                    return_lse=return_lse,
+                    output_dtype=query_layer.dtype
+                )
+        else:
+            if quantization_type in ["int8", "e4m3", "e5m2"]:
+                output, lse = sageattn_varlen_quant_triton(
+                    q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q,
+                    q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,
+                    return_lse=return_lse,
+                    quant_type=quantization_type, 
+                    output_dtype=query_layer.dtype
+                )
+            else:
+                output = sageattn_varlen_triton(
+                    q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q,
+                    q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+                    output_dtype=query_layer.dtype
+                )
+    else:
+        if attn_mask_type == "causal":
+            if quantization_type in ["int8", "e4m3", "e5m2"]:
+                output, lse = sageattn_causal_quant_triton(
+                    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale,
+                    return_lse=return_lse, tensor_layout="bhsd", 
+                    quant_type=quantization_type, 
+                    output_dtype=query_layer.dtype
+                )
+            else:
+                output, lse = sageattn_causal_triton(
+                    q_quant, k_quant, value_layer, q_scale, k_scale,
+                    return_lse=return_lse, tensor_layout="bhsd", 
+                    output_dtype=query_layer.dtype
+                )
+        elif attn_mask_type == "no_mask":
+            if quantization_type in ["int8", "e4m3", "e5m2"]:
+                output, lse = sageattn_quant_triton(
+                    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale,
+                    return_lse=return_lse, tensor_layout="bhsd", 
+                    quant_type=quantization_type, 
+                    output_dtype=query_layer.dtype
+                )
+            else:
+                output, lse = sageattn_triton(
+                    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale,
+                    return_lse=return_lse, tensor_layout="bhsd"
+                )
+        else:
+            raise NotImplementedError(f"Unsupported attn_mask_type: {attn_mask_type}")
+    lse = lse / 1.44269504
+
+    if smooth_k:
+        lse = lse + lse_correction * softmax_scale
+
+    if output.shape[-1] > original_head_dim:
+        output = output[..., :original_head_dim]
+    return output, lse
+
+
+class SageAttentionFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        query_layer,
+        key_layer,
+        value_layer,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max_seqlen_q,
+        max_seqlen_kv,
+        dropout_p,
+        softmax_scale,
+        causal,
+        quantization_backend,
+        quantization_type,
+        smooth_k,
+        qkv_format,
+        attn_mask_type,
+        return_lse,
+    ):        
+
+        head_size_og = query_layer.size(-1)
+
+        if head_size_og % 8 != 0:
+            query_layer = torch.nn.functional.pad(query_layer, [0, 8 - head_size_og % 8])
+            key_layer = torch.nn.functional.pad(key_layer, [0, 8 - head_size_og % 8])
+            value_layer = torch.nn.functional.pad(value_layer, [0, 8 - head_size_og % 8])
+        
+        output, lse = sage_attn_forward(
+            query_layer,
+            key_layer,
+            value_layer,
+            softmax_scale,
+            quantization_backend,
+            quantization_type,
+            smooth_k,
+            qkv_format,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+            attn_mask_type,
+            return_lse=True,
+        )
+        
+        rng_state = torch.cuda.get_rng_state() if dropout_p.p > 0 else None
+        ctx.save_for_backward(query_layer, key_layer, value_layer, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.max_seqlen_q = max_seqlen_q if max_seqlen_q is not None else 0
+        ctx.max_seqlen_kv = max_seqlen_kv if max_seqlen_kv is not None else 0
+        ctx.qkv_format = qkv_format
+        ctx.attn_mask_type = attn_mask_type
+        output = output[..., :head_size_og]
+        if qkv_format == "sbhd":   # -> [s, b, h*d]
+            output = output.permute(2, 0, 1, 3)
+            output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+        elif qkv_format == "bhsd":   # -> [b, s, h*d]
+            output = output.permute(0, 2, 1, 3)
+            output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+        elif qkv_format == "bshd": # -> [b, s, h*d]
+            output = output.permute(0, 2, 1, 3)
+            output = output.reshape(output.size(0), output.size(1), -1).contiguous() 
+        elif qkv_format == "thd":  # -> [t, h*d]
+            output = output.reshape(output.size(0), -1).contiguous() 
+        return output
+        
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state = ctx.saved_tensors
+        if rng_state is not None:
+            cur_rng_state = torch.cuda.get_rng_state()
+            torch.cuda.set_rng_state(rng_state)
+        dout = dout.view(-1, output.size(1), output.size(2))
+        head_size_og = output.size(2)
+        padded_head_dim = ((head_size_og + 7) // 8) * 8 
+ 
+        if dout.size(-1) != padded_head_dim:
+            dout = torch.nn.functional.pad(dout, [0, padded_head_dim - dout.size(-1)])
+
+        maybe_contiguous = lambda x: x.contiguous()  if x.stride(-1) != 1 else x
+        dout, q, k, v, output = [maybe_contiguous(x) for x in (dout, q, k, v, output)]
+        
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_backward(
+            dout,
+            q, k, v,
+            output,
+            lse, # * 0.6931, #修复 ln2 误差
+            dq, dk, dv,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            int(ctx.max_seqlen_q), 
+            int(ctx.max_seqlen_kv),
+            float(ctx.dropout_p.p), 
+            float(ctx.softmax_scale), 
+            bool("causal" in ctx.attn_mask_type), 
+            [-1, -1], # window_size
+            None, # alibi_slopes
+            False, # deterministic
+            rng_state,
+        )
+        if rng_state is not None:
+            torch.cuda.set_rng_state(cur_rng_state)
+  
+        dq = dq[..., : head_size_og]
+        dk = dk[..., : head_size_og]
+        dv = dv[..., : head_size_og]
+
+        return (
+            dq, dk, dv, 
+            None, None, None, None, None, None, None, 
+            None, None, None, None, None, None
+        )
+
 class SageAttention(torch.nn.Module):
-    """
-        SageAttention with per-block INT8 quantization for Q and K, FP16 PV with FP16 accumulation.
-        https://github.com/thu-ml/SageAttention
-    """
     def __init__(
         self,
         softmax_scale: float,
@@ -7870,7 +8178,7 @@ class SageAttention(torch.nn.Module):
         quantization_backend: str = "triton",
         quantization_type: str = "e4m3",
         smooth_k: bool = True,
-        return_lse: bool = False,
+        return_lse: bool = True,
         attention_dropout: float = 0.0,
         attention_dropout_ctx: Optional[Callable] = nullcontext,
         layer_number: Optional[int] = None,
@@ -7890,175 +8198,72 @@ class SageAttention(torch.nn.Module):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
-        qkv_layout: str = "sbh3d", 
+        qkv_layout: str = "thd_thd_thd", 
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         attn_mask_type: str = "causal",
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # assert query_layer.device == key_layer.device == value_layer.device, "All tensors must be on the same device."
+    ) -> torch.Tensor:
         assert all(x.is_cuda for x in [query_layer, key_layer, value_layer]), "All tensors must be on the GPU."
-        assert query_layer.dtype in [torch.float16, torch.bfloat16], "All tensors must be in dtype of torch.float16 or torch.bfloat16."
+        assert query_layer.dtype in [torch.float16, torch.bfloat16], "Tensors must be in FP16 or BF16."
         assert query_layer.dtype == key_layer.dtype == value_layer.dtype, "All tensors must have the same dtype."
-        # assert (
-        #     qkv_layout in QKVLayouts
-        # ), f"SageAttention does not support qkv_layout = {qkv_layout}!"
         assert query_layer.shape[-1] == key_layer.shape[-1], "Head dim mismatch"
-        assert query_layer.stride(-1) == 1 and key_layer.stride(-1) == 1 and value_layer.stride(-1) == 1, "Last dim of qkv must be contiguous."
-
         torch.cuda.set_device(value_layer.device)
-        qkv_layout = qkv_layout.lower()
+
         qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
         
-        head_dim = query_layer.size(-1)
-        if head_dim < 64:
-            query_layer = F.pad(query_layer, (0, 64 - head_dim))
-            key_layer = F.pad(key_layer, (0, 64 - head_dim))
-            value_layer = F.pad(value_layer, (0, 64 - head_dim))
-        elif head_dim > 64 and head_dim < 128:
-            query_layer = F.pad(query_layer, (0, 128 - head_dim))
-            key_layer = F.pad(key_layer, (0, 128 - head_dim))
-            value_layer = F.pad(value_layer, (0, 128 - head_dim))
-        elif head_dim > 128 and head_dim < 256:
-            query_layer = F.pad(query_layer, (0, 256 - head_dim))
-            key_layer = F.pad(key_layer, (0, 256 - head_dim))
-            value_layer = F.pad(value_layer, (0, 256 - head_dim))
-        elif head_dim > 256:
-            raise ValueError(f"Unsupported head_dim: {head_dim}")
-        
-        if self.softmax_scale is None:
-            self.softmax_scale = 1.0 / (head_dim ** 0.5)
-
-        if qkv_format == "thd":
-            assert cu_seqlens_q is not None and cu_seqlens_kv is not None, "cu_seqlens required for thd format"
-            # assert cu_seqlens_q.is_contiguous() and cu_seqlens_kv.is_contiguous(), "cu_seqlens_q and cu_seqlens_kv must be contiguous."
-            if max_seqlen_q is None:
-                seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-                max_seqlen_q = seqlens_q.max().item()
-            if max_seqlen_kv is None:
-                seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-                max_seqlen_kv = seqlens_kv.max().item()
-            if self.smooth_k:
-                km = key_layer.mean(dim=0, keepdim=True) # ! km is calculated on the all the batches. Calculate over each individual sequence requires dedicated kernel.
-                key_layer = key_layer - km
-            else:
-                km = None
-            if self.quantization_backend == "triton":
-                if self.quantization_type == "int8":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_int8_varlen_triton(
-                        query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
-                    )
-                elif self.quantization_type == "e4m3":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_e4m3_varlen_triton(
-                        query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
-                    )
-                elif self.quantization_type == "e5m2":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale = per_block_e5m2_varlen_triton(
-                        query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, sm_scale=self.softmax_scale
-                    )
-                else:
-                    raise NotImplementedError(f"Unsupported quantization type: {self.quantization_type}")
-            else:
-                raise NotImplementedError("Please use quantization_backend='triton'.")
-
-            if attn_mask_type == "causal":
-                output =  sageattn_causal_varlen_triton(q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                        q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale)
-            else:
-                if self.quantization_type == "int8":
-                    output = sageattn_varlen_all_int8_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
-                elif self.quantization_type == "e4m3":
-                    output = sageattn_varlen_all_e4m3_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
-                elif self.quantization_type == "e5m2":
-                    output = sageattn_varlen_all_e5m2_triton(q_quant, k_quant, v_quant, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale)
-                else:
-                    output = sageattn_varlen_triton(q_quant, k_quant, value_layer, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, 
-                                                    q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale)
-            output = output[..., :head_dim]
-            return output
-
+        causal = "causal" in attn_mask_type
+        if self.training:
+            return SageAttentionFunc.apply(
+                query_layer,
+                key_layer,
+                value_layer,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+                self.attention_dropout,
+                self.softmax_scale,
+                causal,
+                self.quantization_backend,
+                self.quantization_type,
+                self.smooth_k,
+                qkv_format,
+                attn_mask_type,
+                self.return_lse)
         else:
-            if qkv_format == "sbhd":  #! -> BHSD(HND)
-                query_layer, key_layer, value_layer = [
-                    x.transpose(0, 1).transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
-                ]
-            elif qkv_format == "bshd": 
-                query_layer, key_layer, value_layer = [
-                    x.transpose(1, 2).contiguous() for x in [query_layer, key_layer, value_layer]
-                ]
-
-            # seq_dim = 1 if qkv_layout == "bshd" else 2
-            seq_dim = 2
-            if self.smooth_k:
-                km = key_layer.mean(dim=seq_dim, keepdim=True) 
-                key_layer = key_layer - km
-            else:
-                km = None
+            with torch.no_grad():
+                output, lse = sage_attn_forward(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    self.softmax_scale,
+                    self.quantization_backend,
+                    self.quantization_type,
+                    self.smooth_k,
+                    qkv_format,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    attn_mask_type,
+                    self.return_lse 
+                )
+                #! output: [b, h, s, d] or [t, h, d]
+                if qkv_format == "sbhd":   # -> [s, b, h*d]
+                    output = output.permute(2, 0, 1, 3)
+                    output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+                elif qkv_format == "bhsd":   # -> [b, s, h*d]
+                    output = output.permute(0, 2, 1, 3)
+                    output = output.reshape(output.size(0), output.size(1), -1).contiguous()
+                elif qkv_format == "bshd": # -> [b, s, h*d]
+                    output = output.permute(0, 2, 1, 3)
+                    output = output.reshape(output.size(0), output.size(1), -1).contiguous() 
+                elif qkv_format == "thd":  # -> [t, h*d]
+                    output = output.reshape(output.size(0), -1).contiguous() 
+                    
             if self.return_lse:
-                lse_correction = torch.matmul(query_layer, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
-
-            if self.quantization_backend == "triton":
-                if self.quantization_type == "int8":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_int8_triton(
-                        query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
-                    )
-                elif self.quantization_type == "e4m3":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale  = per_block_e4m3_triton(
-                        query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
-                    )
-                elif self.quantization_type == "e5m2":
-                    q_quant, q_scale, k_quant, k_scale, v_quant, v_scale = per_block_e5m2_triton(
-                        query_layer, key_layer, value_layer, sm_scale=self.softmax_scale, tensor_layout="bhsd"
-                    )
-                else:
-                    raise NotImplementedError(f"Unsupported quantization type: {self.quantization_type}")
-                
-            else:
-                raise NotImplementedError("Please use quantization_backend='triton'.")
-
-            if attn_mask_type == "causal":
-                if self.quantization_type == "int8":
-                    # output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                    output, lse = sageattn_causal_all_int8_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                elif self.quantization_type == "e4m3":
-                    output, lse = sageattn_causal_all_e4m3_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                elif self.quantization_type == "e5m2":
-                    output, lse = sageattn_causal_all_e5m2_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                output, lse = sageattn_causal_triton(q_quant, k_quant, value_layer, q_scale, k_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-            elif attn_mask_type == "no_mask":
-                # if self.quantization_type == "int8":
-                #     output, lse = sageattn_all_int8_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                # elif self.quantization_type == "e4m3":
-                #     output, lse = sageattn_all_e4m3_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                # elif self.quantization_type == "e5m2":
-                #     output, lse = sageattn_all_e5m2_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-                if self.quantization_type == "int8" or self.quantization_type == "e4m3" or self.quantization_type == "e5m2":
-                    output, lse = sageattn_quant_triton(q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd", quant_type=self.quantization_type)
-                else:
-                    output, lse = sageattn_triton(q_quant, k_quant, value_layer, q_scale, k_scale, v_scale, return_lse=self.return_lse, tensor_layout="bhsd")
-            elif attn_mask_type == "none":
-                output, lse = sageattn_none_triton(query_layer, key_layer, value_layer, return_lse=self.return_lse, tensor_layout="bhsd")
-            else:
-                raise NotImplementedError(f"Unsupported attn_mask_type: {attn_mask_type}")
-            #! output: [b, h, s, d] or [t, h, d]
-            if qkv_format == "sbhd":   # -> [s, b, h*d]
-                output = output.permute(2, 0, 1, 3)
-                output = output.reshape(output.size(0), output.size(1), -1).contiguous()
-            elif qkv_format == "bhsd":   # -> [b, s, h*d]
-                output = output.permute(0, 2, 1, 3)
-                output = output.reshape(output.size(0), output.size(1), -1).contiguous()
-            elif qkv_format == "bshd": # -> [b, s, h*d]
-                output = output.permute(0, 2, 1, 3)
-                output = output.reshape(output.size(0), output.size(1), -1).contiguous() 
-            elif qkv_format == "thd":  # -> [t, h*d]
-                output = output.reshape(output.size(0), -1).contiguous() 
-                
-            if self.return_lse:
-                return output, lse / 1.44269504 + lse_correction * self.softmax_scale if self.smooth_k else lse / 1.44269504
+                return output, lse
             else:
                 return output
-

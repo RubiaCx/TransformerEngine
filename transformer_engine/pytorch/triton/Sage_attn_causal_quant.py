@@ -24,6 +24,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+                    QUANT_TYPE: tl.constexpr,  
                     ):
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -36,7 +37,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k_mask = offs_n[None, :] < (kv_len - start_n)   
-        k = tl.load(K_ptrs, mask = k_mask)
+        k = tl.load(K_ptrs, mask=k_mask)
         k_scale = tl.load(K_scale_ptr)
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
 
@@ -55,15 +56,29 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
-        
-        p_scale = tl.max(tl.abs(p)) / 448. + 1e-8
-        p_e4m3 = (p / p_scale).to(tl.float8e4nv)
 
-        v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+        if QUANT_TYPE == 0:  # int8
+            p_scale = tl.max(tl.abs(p)) / 127. + 1e-8
+            p_quant = (p / p_scale + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
+        elif QUANT_TYPE == 1:  # e4m3
+            p_scale = tl.max(tl.abs(p)) / 448. + 1e-8
+            p_quant = (p / p_scale).to(tl.float8e4nv)
+        elif QUANT_TYPE == 2:  # e5m2
+            p_scale = tl.max(tl.abs(p)) / 57344. + 1e-8
+            p_quant = (p / p_scale).to(tl.float8e5)
+        else:
+            tl.static_assert(False, "Unsupported quant type")
+
+        v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n))
         v_scale = tl.load(V_scale_ptr)
 
-        accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-        middle = tl.dot(p_e4m3, v, accumulator).to(tl.float32) * v_scale * p_scale
+        if QUANT_TYPE == 0:
+            accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.int32)
+            middle = tl.dot(p_quant, v, accumulator, out_dtype=tl.float32) * v_scale * p_scale
+        else:
+            accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+            middle = tl.dot(p_quant, v, accumulator).to(tl.float32) * v_scale * p_scale
+        
         acc = acc + middle
          
         m_i = m_ij
@@ -86,9 +101,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, Out, Lse,
               BLOCK_K: tl.constexpr,
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
+              QUANT_TYPE: tl.constexpr,  
               ):
     start_m = tl.program_id(0)
-
     off_z = tl.program_id(2).to(tl.int64)
     off_h = tl.program_id(1).to(tl.int64)
 
@@ -110,38 +125,43 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, Out, Lse,
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     
-    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn,
-                                    start_m,  
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
-                                    )
-
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn,
-                                    start_m,  
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    2, offs_m, offs_n 
-                                    )
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, 
+                                    stride_kn, stride_vn, start_m, BLOCK_M, HEAD_DIM, BLOCK_N,  
+                                    4 - STAGE, offs_m, offs_n, QUANT_TYPE)
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, 
+                                    stride_kn, stride_vn, start_m, BLOCK_M, HEAD_DIM, BLOCK_N,  
+                                    2, offs_m, offs_n, QUANT_TYPE)
     acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask=(offs_m[:, None] < qo_len))
 
     if RETURN_LSE:
         lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
         l_i = tl.log2(l_i) + m_i
-        tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
+        tl.store(lse_ptrs, l_i, mask=(offs_m < qo_len))
 
 def forward(q, k, v, 
             q_scale, k_scale, v_scale,
-            output_dtype=torch.float16, return_lse=False, tensor_layout="bhsd"):
+            output_dtype=torch.float16, 
+            return_lse=False, 
+            tensor_layout="bhsd",
+            quant_type="int8"):  
     BLOCK_M = 128
     BLOCK_N = 64
     BLOCK_K = 64
     stage = 3
 
+    quant_type_map = {
+        "int8": 0,
+        "e4m3": 1,
+        "e5m2": 2
+    }
+    assert quant_type in quant_type_map, f"Unsupported quant type: {quant_type}"
+
     output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
     if tensor_layout == "bhsd":
-        batch_size, num_heads_q, seq_len_q,  head_dim = q.shape
+        batch_size, num_heads_q, seq_len_q, head_dim = q.shape
         _, num_heads_kv, seq_len_kv, _ = k.shape
         stride_batch_q, stride_heads_q, stride_seq_q, stride_dim_q = q.stride()
         stride_batch_k, stride_heads_k, stride_seq_k, stride_dim_k = k.stride()
@@ -157,13 +177,10 @@ def forward(q, k, v,
     else:
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
-    # assert seq_len_q == seq_len_kv, "seq_len_q and seq_len_kv must be equal for causal attention"
     num_kv_groups = max(num_heads_q // num_heads_kv, 1)
+    assert num_heads_kv > 0 and num_kv_groups > 0
 
-    if return_lse:
-        lse = torch.empty([batch_size, num_heads_q, seq_len_q], dtype=torch.float32, device=q.device)
-    else:
-        lse = torch.empty([0], dtype=torch.float32, device='cpu')
+    lse = torch.empty([batch_size, num_heads_q, seq_len_q], dtype=torch.float32, device=q.device) if return_lse else torch.empty([0])
 
     grid = (triton.cdiv(seq_len_q, BLOCK_M), num_heads_q, batch_size)
     _attn_fwd[grid](
@@ -176,9 +193,11 @@ def forward(q, k, v,
         H=num_heads_q, num_kv_groups=num_kv_groups,
         HEAD_DIM=head_dim,  
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        STAGE=stage, RETURN_LSE=return_lse,
+        STAGE=stage, 
+        RETURN_LSE=return_lse,
+        QUANT_TYPE=quant_type_map[quant_type],  
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4
     )
 
-    return output, lse
+    return output, lse 

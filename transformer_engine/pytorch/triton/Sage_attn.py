@@ -1,7 +1,18 @@
-# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# See LICENSE for license information.
+"""
+Copyright (c) 2024 by SageAttention team.
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 import torch
 import triton
 import triton.language as tl
@@ -38,7 +49,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         # acc += tl.dot(p, v, out_dtype=tl.float16)  
         #! cast fp8
         p = p.to(v.dtype) 
-        # scale
         acc += tl.dot(p, v)
          
         m_i = m_ij
@@ -61,7 +71,6 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               RETURN_LSE: tl.constexpr,
               ):
     start_m = tl.program_id(0)
-
     off_z = tl.program_id(2).to(tl.int64)
     off_h = tl.program_id(1).to(tl.int64)
 
@@ -71,6 +80,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
+    
     Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
     Q_scale_ptr = Q_scale + q_scale_offset + start_m
     K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None] 

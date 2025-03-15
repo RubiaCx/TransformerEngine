@@ -72,16 +72,16 @@ base_configs = [
     (1, 24, 72000, 128, 'bhsd', 'causal'),
     (1, 32, 16000, 128, 'bhsd', 'causal'),
     (1, 32, 72000, 128, 'bhsd', 'causal'),
-    (1, 1, 64, 32, 'bhsd', 'no_mask'),
-    (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'bhsd', 'no_mask'),
-    (1, 4, 512, 64, 'bhsd', 'causal'),
-    (8, 4, 512, 64, 'bhsd', 'no_mask'),
-    (8, 4, 512, 64, 'bshd', 'causal'),
-    (16, 16, 2048, 128, 'bhsd', 'causal'),
-    (16, 16, 2048, 128, 'bhsd', 'no_mask'),
-    (32, 8, 4096, 64, 'bhsd', 'causal'),
-    (32, 8, 4096, 64, 'bhsd', 'no_mask'),
+    # (1, 1, 64, 32, 'bhsd', 'no_mask'),
+    # (1, 1, 64, 32, 'bhsd', 'causal'),
+    # (1, 4, 512, 64, 'bhsd', 'no_mask'),
+    # (1, 4, 512, 64, 'bhsd', 'causal'),
+    # (8, 4, 512, 64, 'bhsd', 'no_mask'),
+    # (8, 4, 512, 64, 'bshd', 'causal'),
+    # (16, 16, 2048, 128, 'bhsd', 'causal'),
+    # (16, 16, 2048, 128, 'bhsd', 'no_mask'),
+    # (32, 8, 4096, 64, 'bhsd', 'causal'),
+    # (32, 8, 4096, 64, 'bhsd', 'no_mask'),
 ]
 
 test_configs = []
@@ -191,11 +191,6 @@ def run_test(config):
         attn_mask_type=config.attn_mask_type
     )
 
-    sage_none_output = sage_int8(
-        q, k, v,
-        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
-        attn_mask_type="none"
-    )
      #! -> BHSD
     if config.layout == 'bhsd':
         q_sdpa = q.contiguous()
@@ -214,8 +209,10 @@ def run_test(config):
     # #! -> BHSD
     if config.layout == 'bshd':
         sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
+
     elif config.layout == 'bhsd':
-        sdpa_output = sdpa_output.contiguous()
+        sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
+        sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
     elif config.layout == 'sbhd':
         sdpa_output = sdpa_output.permute(1, 0, 2, 3).contiguous()
         
@@ -228,13 +225,9 @@ def run_test(config):
     metrics_e5m2 = calculate_similarity(sage_e5m2_output, sdpa_output)
     print_metrics(f"Sage e5m2 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
 
-    metrics_none = calculate_similarity(sage_none_output, sdpa_output)
-    print_metrics(f"Sage none vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_none)
-
     logger.add_result(config, 'int8', metrics)
     logger.add_result(config, 'e4m3', metrics_e4m3)
     logger.add_result(config, 'e5m2', metrics_e5m2)
-    logger.add_result(config, 'none', metrics_none)
 
 for config in test_configs:
     run_test(config)

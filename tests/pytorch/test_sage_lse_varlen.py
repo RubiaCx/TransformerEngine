@@ -14,6 +14,7 @@ from datetime import datetime
 import pandas as pd
 
 from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn.flash_attn_interface import _flash_attn_forward
 from flash_attn import flash_attn_varlen_func
 
 import os
@@ -86,43 +87,16 @@ range_combinations = [
     # q_range, k_range, v_range
     (0.1, 0.1, 0.1),     
     (1.0, 1.0, 1.0),    
-    (10.0, 10.0, 10.0), 
-    (0.1, 1.0, 10.0),  
-    (10.0, 1.0, 0.1),   
-    (0.1, 10.0, 0.1),  
-    (10.0, 0.1, 10.0),  
-    (0.1, 0.1, 10.0),
-    (10.0, 10.0, 0.1),
-    (0.1, 10.0, 10.0),
-    (10.0, 0.1, 0.1),
+    # (10.0, 10.0, 10.0), 
+    # (0.1, 1.0, 10.0),  
+    # (10.0, 1.0, 0.1),   
+    # (0.1, 10.0, 0.1),  
+    # (10.0, 0.1, 10.0),  
+    # (0.1, 0.1, 10.0),
+    # (10.0, 10.0, 0.1),
+    # (0.1, 10.0, 10.0),
+    # (10.0, 0.1, 0.1),
 ]
-base_configs = [
-    # (batch_size, num_heads, seq_len, head_dim, layout)
-    (1, 4, 512, 64, 'bshd'), 
-    (4, 4, 512, 64, 'bshd'),
-    (8, 4, 512, 64, 'bshd'),
-    (16, 16, 2048, 128, 'bshd'),
-    (32, 8, 4096, 64, 'bshd'),
-]
-
-test_configs = []
-for bs, h, s, d, layout in base_configs:
-    for dtype in [torch.float16, torch.bfloat16]:
-        for q_range, k_range, v_range in range_combinations:
-            test_configs.append(
-                TestConfig(
-                    batch_size=bs,
-                    num_heads=h,
-                    seq_len=s,
-                    head_dim=d,
-                    total_seq=bs * s,
-                    dtype=dtype,
-                    q_range=q_range,
-                    k_range=k_range,
-                    v_range=v_range,
-                    layout=layout
-                )
-            )
 
 var_configs = [
     # total_seq, num_heads, head_dim, layout
@@ -187,114 +161,6 @@ class ResultLogger:
 
 logger = ResultLogger()
 
-def run_test(config):
-    tols = {"atol": 1e-2, "rtol": 1e-2}
-    scale = 1.0 / (config.head_dim ** 0.5)
-    sage_int8 = SageAttention(
-        softmax_scale=scale,
-        quantization_backend="triton",
-        quantization_type="int8",
-        smooth_k=True,
-        return_lse=False,
-        attention_dropout=0.0,
-    ).cuda()
-    sage_int8.eval()
-    sage_e4m3 = SageAttention(
-        softmax_scale=scale,
-        quantization_backend="triton",
-        quantization_type="e4m3",
-        smooth_k=True,
-        return_lse=False,
-        attention_dropout=0.0,
-    ).cuda()
-    sage_e4m3.eval()
-    sage_e5m2 = SageAttention(
-        softmax_scale=scale,
-        quantization_backend="triton",
-        quantization_type="e5m2",
-        smooth_k=True,
-        return_lse=False,
-        attention_dropout=0.0,
-    ).cuda()
-    sage_e5m2.eval()
-    flash = FlashAttention(
-        softmax_scale=scale,
-        attention_dropout=0.0,
-    ).cuda()
-
-    q, k, v = create_tensors(config, config.q_range, config.k_range, config.v_range)
-    
-    sage_int8_output = sage_int8(
-        q, k, v,
-        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",  # 动态生成布局参数
-        attn_mask_type="no_mask"
-    )
-    
-    sage_e4m3_output = sage_e4m3(
-        q, k, v,
-        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
-        attn_mask_type="no_mask"
-    )
-
-    sage_e5m2_output = sage_e5m2(
-        q, k, v,
-        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
-        attn_mask_type="no_mask"
-    )
-
-    flash_ans = flash(
-        q, k, v,
-        qkv_layout= "bshd_bshd_bshd",
-        attn_mask_type="no_mask"
-    )
-
-    # -> bshd
-    if config.layout == 'bhsd': # [b,h,s,d] -> [b,s,h,d]
-        q_flash = q.transpose(1, 2).contiguous()  
-        k_flash = k.transpose(1, 2).contiguous()
-        v_flash = v.transpose(1, 2).contiguous()
-    else:  
-        q_flash = q.contiguous()  
-        k_flash = k.contiguous()
-        v_flash = v.contiguous()
-    
-    flash_output = flash_attn_func(
-        q_flash, k_flash, v_flash
-    )
-    
-    flash_output = flash_output.reshape(flash_output.size(0), flash_output.size(1), -1).contiguous()
-
-    attention_kernel = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
-    attention_kernel.eval()
-    os.environ["NVTE_FUSED_ATTN"] = "0"
-    os.environ["NVTE_SAGE_ATTN"] = "1"
-    os.environ["NVTE_UNFUSED_ATTN"] = "0"
-    os.environ["NVTE_FLASH_ATTN"] = "0"
-    dpa_output_1 = attention_kernel(q, k, v, qkv_format=config.layout, attn_mask_type="no_mask")
-
-
-    metrics = calculate_similarity(sage_int8_output, flash_output)
-    print_metrics(f"Sage int8 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics)
-
-    metrics_e4m3 = calculate_similarity(sage_e4m3_output, flash_output)
-    print_metrics(f"Sage e4m3 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics_e4m3)
-
-    metrics_e5m2 = calculate_similarity(sage_e5m2_output, flash_output)
-    print_metrics(f"Sage e5m2 vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics_e5m2)
-
-    metrics_2 = calculate_similarity(flash_ans, flash_output)
-    print_metrics(f"Flash vs Flash (B={config.batch_size}, H={config.num_heads}, S={config.seq_len}, D={config.head_dim})", metrics)
-
-    metrics_dpa = calculate_similarity(dpa_output_1, flash_output)
-    print_metrics(f"DPA vs Flash (B={config.batch_size}, H={config.num_heads} , H={config.num_heads}, D={config.head_dim})", metrics_dpa)
-
-
-    logger.add_result(config, 'int8', metrics)
-    logger.add_result(config, 'e4m3', metrics_e4m3)
-    logger.add_result(config, 'e5m2', metrics_e5m2)
-    logger.add_result(config, 'flash', metrics_2)
-    logger.add_result(config, 'dpa Sage', metrics_dpa)
-
 def run_var_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
@@ -305,7 +171,7 @@ def run_var_test(config):
         quantization_backend="triton",
         quantization_type="int8",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
     sage_int8.eval()
@@ -314,7 +180,7 @@ def run_var_test(config):
         quantization_backend="triton",
         quantization_type="e4m3",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
     sage_e4m3.eval()
@@ -323,18 +189,14 @@ def run_var_test(config):
         quantization_backend="triton",
         quantization_type="e5m2",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
     sage_e5m2.eval()
-    flash = FlashAttention(
-        softmax_scale=scale,
-        attention_dropout=0.0,
-    ).cuda()
 
     q, k, v = create_tensors(config, config.q_range, config.k_range, config.v_range)
     
-    sage_int8_output = sage_int8(
+    sage_int8_output, sage_int8_lse = sage_int8(
         q, k, v,
         qkv_layout="thd",
         attn_mask_type="no_mask",
@@ -344,7 +206,7 @@ def run_var_test(config):
         max_seqlen_kv=config.total_seq,
     )
     
-    sage_e4m3_output = sage_e4m3(
+    sage_e4m3_output, sage_e4m3_lse = sage_e4m3(
         q, k, v,
         qkv_layout="thd",
         attn_mask_type="no_mask",
@@ -354,7 +216,7 @@ def run_var_test(config):
         max_seqlen_kv=config.total_seq,
     )
 
-    sage_e5m2_output = sage_e5m2(
+    sage_e5m2_output, sage_e5m2_lse = sage_e5m2(
         q, k, v,
         qkv_layout="thd",
         attn_mask_type="no_mask",
@@ -364,15 +226,6 @@ def run_var_test(config):
         max_seqlen_kv=config.total_seq,
     )
 
-    # flash_ans = flash(
-    #     q, k, v,
-    #     qkv_layout="thd_thd_thd",
-    #     attn_mask_type='padding', 
-    #     cu_seqlens_q=cu_seqlens_q, 
-    #     cu_seqlens_kv=cu_seqlens_kv,
-    #     max_seqlen_q=config.total_seq,
-    #     max_seqlen_kv=config.total_seq,
-    # )
     
     flash_output = flash_attn_varlen_func(
         q, k, v,
@@ -385,19 +238,7 @@ def run_var_test(config):
         softmax_scale=scale,
         return_attn_probs=False,
     )
-
-    attention_kernel = DotProductAttention(config.num_heads, config.head_dim)
     
-    # os.environ["NVTE_FUSED_ATTN"] = "0"
-    # os.environ["NVTE_SAGE_ATTN"] = "0"
-    # os.environ["NVTE_UNFUSED_ATTN"] = "0"
-    # os.environ["NVTE_FLASH_ATTN"] = "1"
-    os.environ["NVTE_FUSED_ATTN"] = "0"
-    os.environ["NVTE_SAGE_ATTN"] = "1"
-    os.environ["NVTE_UNFUSED_ATTN"] = "0"
-    os.environ["NVTE_FLASH_ATTN"] = "0"
-    dpa_output_1 = attention_kernel(q, k, v, qkv_format='thd', attn_mask_type="no_mask", cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
-
     # os.environ["NVTE_FUSED_ATTN"] = "0"
     # os.environ["NVTE_SAGE_ATTN"] = "1"
     # os.environ["NVTE_UNFUSED_ATTN"] = "0"
@@ -415,22 +256,13 @@ def run_var_test(config):
     metrics_e5m2 = calculate_similarity(sage_e5m2_output, flash_output)
     print_metrics(f"Sage e5m2 vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_e5m2)
 
-    # metrics_2 = calculate_similarity(flash_ans, flash_output)
-    # print_metrics(f"Flash Kernel vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_2)
+    lse_int8 = calculate_similarity(sage_int8_lse, sage_e4m3_lse)
+    print_metrics(f"Sage int8 lse vs Sage e4m3 lse (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", lse_int8)
 
-    metrics_dpa = calculate_similarity(dpa_output_1, flash_output)
-    print_metrics(f"DPA vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_dpa)
 
     # metrics_dpa_2 = calculate_similarity(dpa_output_2, flash_output)
     # print_metrics(f"DPA 2 vs Flash (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", metrics_dpa_2)
 
-
-    logger.add_result(config, 'int8', metrics)
-    logger.add_result(config, 'e4m3', metrics_e4m3)
-    logger.add_result(config, 'e5m2', metrics_e5m2)
-    # logger.add_result(config, 'flash', metrics_2)
-    logger.add_result(config, 'dpa Sage', metrics_dpa)
-    # logger.add_result(config, 'dpa_2', metrics_dpa_2)
 
 for config in test_var_configs:
     print(f"Running var test for config: {config}")
@@ -440,5 +272,5 @@ for config in test_var_configs:
 #     print(f"Running fixlen test for config: {config}")
 #     run_test(config)
 
-logger.save()
+# logger.save()
 

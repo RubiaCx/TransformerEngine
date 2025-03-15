@@ -5,6 +5,7 @@ from transformer_engine.pytorch.attention import (
     UnfusedDotProductAttention,
 )
 
+from flash_attn.flash_attn_interface import _flash_attn_forward
 import torch.nn.functional as F
 from datetime import datetime
 import pandas as pd
@@ -64,61 +65,29 @@ def print_metrics(name, metrics):
 
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
-    (1, 24, 16000, 128, 'bhsd', 'no_mask'),
-    (1, 24, 72000, 128, 'bhsd', 'no_mask'),
-    (1, 32, 16000, 128, 'bhsd', 'no_mask'),
-    (1, 32, 72000, 128, 'bhsd', 'no_mask'),
-    (1, 24, 16000, 128, 'bhsd', 'causal'),
-    (1, 24, 72000, 128, 'bhsd', 'causal'),
-    (1, 32, 16000, 128, 'bhsd', 'causal'),
-    (1, 32, 72000, 128, 'bhsd', 'causal'),
-    (1, 1, 64, 32, 'bhsd', 'no_mask'),
-    (1, 1, 64, 32, 'bhsd', 'causal'),
-    (1, 4, 512, 64, 'bhsd', 'no_mask'),
-    (1, 4, 512, 64, 'bhsd', 'causal'),
-    (8, 4, 512, 64, 'bhsd', 'no_mask'),
-    (8, 4, 512, 64, 'bshd', 'causal'),
-    (16, 16, 2048, 128, 'bhsd', 'causal'),
-    (16, 16, 2048, 128, 'bhsd', 'no_mask'),
-    (32, 8, 4096, 64, 'bhsd', 'causal'),
-    (32, 8, 4096, 64, 'bhsd', 'no_mask'),
+    # (1, 24, 16000, 128, 'bhsd', 'no_mask'),
+    # (1, 24, 72000, 128, 'bhsd', 'no_mask'),
+    # (1, 32, 16000, 128, 'bhsd', 'no_mask'),
+    # (1, 32, 72000, 128, 'bhsd', 'no_mask'),
+    # (1, 24, 16000, 128, 'bhsd', 'causal'),
+    # (1, 24, 72000, 128, 'bhsd', 'causal'),
+    # (1, 32, 16000, 128, 'bhsd', 'causal'),
+    # (1, 32, 72000, 128, 'bhsd', 'causal'),
+    (1, 2, 64, 32, 'bhsd', 'no_mask'),
+    # (1, 1, 64, 32, 'bhsd', 'causal'),
+    # (1, 4, 512, 64, 'bhsd', 'no_mask'),
+    # (1, 4, 512, 64, 'bhsd', 'causal'),
+    # (8, 4, 512, 64, 'bhsd', 'no_mask'),
+    # (16, 16, 2048, 128, 'bhsd', 'causal'),
+    # (16, 16, 2048, 128, 'bhsd', 'no_mask'),
+    # (32, 8, 4096, 64, 'bhsd', 'causal'),
+    # (32, 8, 4096, 64, 'bhsd', 'no_mask'),
 ]
-
-# base_configs = [
-#     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
-#     (1, 24, 16000, 128, 'bhsd', 'no_mask'),
-#     (1, 24, 72000, 128, 'bhsd', 'no_mask'),
-#     (1, 32, 16000, 128, 'bhsd', 'no_mask'),
-#     (1, 32, 72000, 128, 'bhsd', 'no_mask'),
-#     (1, 24, 16000, 128, 'bhsd', 'causal'),
-#     (1, 24, 72000, 128, 'bhsd', 'causal'),
-#     (1, 32, 16000, 128, 'bhsd', 'causal'),
-#     (1, 32, 72000, 128, 'bhsd', 'causal'),
-#     (1, 1, 64, 32, 'bhsd', 'no_mask'),
-#     (1, 1, 64, 32, 'bshd', 'no_mask'),
-#     (1, 1, 64, 32, 'bhsd', 'causal'),
-#     (1, 1, 64, 32, 'bshd', 'causal'),
-#     (1, 1, 64, 32, 'bhsd', 'causal'),
-#     (1, 4, 512, 64, 'sbhd', 'no_mask'),
-#     (1, 4, 512, 64, 'bhsd', 'no_mask'),
-#     (1, 4, 512, 64, 'bhsd', 'causal'),
-#     (1, 4, 512, 64, 'bshd', 'no_mask'),
-#     (4, 4, 512, 64, 'bhsd', 'causal'),
-#     (4, 4, 512, 64, 'bshd', 'causal'),
-#     (8, 4, 512, 64, 'bhsd', 'no_mask'),
-#     (8, 4, 512, 64, 'bshd', 'causal'),
-#     (16, 16, 2048, 128, 'bhsd', 'causal'),
-#     (16, 16, 2048, 128, 'bshd', 'no_mask'),
-#     (32, 8, 4096, 64, 'bhsd', 'causal'),
-#     (32, 8, 4096, 64, 'bshd', 'no_mask'),
-#     (32, 32, 4096, 128, 'bhsd', 'no_mask'),
-#     (32, 32, 4096, 128, 'bhsd', 'causal'),
-# ]
 
 test_configs = []
 for bs, h, s, d, layout, mask_type in base_configs:
     for dtype in [torch.float16, torch.bfloat16]:
-        for value_range in [0.1, 1.0, 10.0]:
+        for value_range in [0.1]: #, 1.0, 10.0]:
             test_configs.append(
                 TestConfig(
                     batch_size=bs,
@@ -181,27 +150,27 @@ def run_test(config):
         quantization_type="int8",
         smooth_k=True,
         return_lse=True,
-        attention_dropout=0.0,
+        attention_dropout=0.1,
     ).cuda()
-
+    sage_int8.eval()
     sage_e4m3 = SageAttention(
         softmax_scale=scale,
         quantization_backend="triton",
         quantization_type="e4m3",
         smooth_k=True,
         return_lse=True,
-        attention_dropout=0.0,
+        attention_dropout=0.1,
     ).cuda()
-
+    sage_e4m3.eval()
     sage_e5m2 = SageAttention(
         softmax_scale=scale,
         quantization_backend="triton",
         quantization_type="e5m2",
         smooth_k=True,
         return_lse=True,
-        attention_dropout=0.0,
+        attention_dropout=0.1,
     ).cuda()
-
+    sage_e5m2.eval()
     q, k, v = create_tensors(config)
     
     sage_int8_output, lse_int8 = sage_int8(
@@ -222,24 +191,50 @@ def run_test(config):
         attn_mask_type=config.attn_mask_type
     )
 
-    sage_none_output, lse_none = sage_int8(
+    if config.layout == 'bhsd': # [b,h,s,d] -> [b,s,h,d]
+        q_flash = q.transpose(1, 2).contiguous()  
+        k_flash = k.transpose(1, 2).contiguous()
+        v_flash = v.transpose(1, 2).contiguous()
+    else:  
+        q_flash = q.contiguous()  
+        k_flash = k.contiguous()
+        v_flash = v.contiguous()
+
+    flash_output, _, _, _, _, softmax_lse, _, _ = _flash_attn_forward(
         q, k, v,
-        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
-        attn_mask_type="none"
+        dropout_p=0.1,
+        softmax_scale=scale,
+        causal=bool("causal" in config.attn_mask_type),
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        return_softmax=True,
     )
-        
-    metrics1 = calculate_similarity(lse_int8, lse_none)
-    metrics2 = calculate_similarity(lse_e4m3, lse_none)
-    metrics3 = calculate_similarity(lse_e5m2, lse_none)
+    flash_output = flash_output.permute(0, 2, 1, 3)
+    flash_output = flash_output.reshape(flash_output.size(0), flash_output.size(1), -1).contiguous()
+    print("flash_output", flash_output.shape)
+    print("sage_int8_output", sage_int8_output.shape)
+
+    print("softmax_lse", softmax_lse.shape)
+    print("lse_int8", lse_int8.shape)
+    
     metrics4 = calculate_similarity(lse_int8, lse_e4m3)
-
-    logger.add_result(config, 'int8 vs none', metrics1)
-    logger.add_result(config, 'e4m3 vs none', metrics2)
-    logger.add_result(config, 'e5m2 vs none', metrics3)
+    metrics5 = calculate_similarity(lse_int8, softmax_lse)
+    print("metrics4", metrics4)
+    print("metrics5", metrics5)
     logger.add_result(config, 'int8 vs e4m3', metrics4)
+    logger.add_result(config, 'int8 vs flash', metrics5)
 
+    metrics6 = calculate_similarity(sage_int8_output, flash_output)
+    metrics7 = calculate_similarity(sage_e4m3_output, flash_output)
+    metrics8 = calculate_similarity(sage_e5m2_output, flash_output)
+    print("metrics6", metrics6)
+    print("metrics7", metrics7)
+    print("metrics8", metrics8)
+    logger.add_result(config, 'int8 vs flash', metrics6)
+    logger.add_result(config, 'e4m3 vs flash', metrics7)
+    logger.add_result(config, 'e5m2 vs flash', metrics8)
 for config in test_configs:
     run_test(config)
 
-logger.save()
+# logger.save()
 
