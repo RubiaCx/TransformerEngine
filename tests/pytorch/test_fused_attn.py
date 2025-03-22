@@ -1020,7 +1020,7 @@ model_configs_te_layer = {
 @pytest.mark.parametrize("model_configs", [model_configs_te_layer])
 @pytest.mark.parametrize("model", model_configs_te_layer.keys())
 @pytest.mark.parametrize("ckpt_attn", [False])
-@pytest.mark.parametrize("qkv_format", ["sbhd"])
+@pytest.mark.parametrize("qkv_format", ["thd"])
 @pytest.mark.parametrize("fused_qkv_params", [False])
 @pytest.mark.parametrize("RoPE", [False])
 def test_transformer_layer(
@@ -1037,10 +1037,10 @@ def test_transformer_layer(
     available_backends, fused_attn_backends = _get_attention_backends(
         config,
         qkv_dtype=dtype,
-        qkv_layout="sbh3d" if fused_qkv_params else "sb3hd",
+        qkv_layout="thd_thd_thd"
+        # qkv_layout="sbh3d" if fused_qkv_params else "sb3hd",
     )
     flash_attn_supported, fused_attn_supported, unfused_attn_supported, sage_attn_supported  = available_backends
-
     # Skip if only unfused backend is supported
     if (len(fused_attn_backends) + flash_attn_supported + unfused_attn_supported) < 2:
         pytest.skip("Less than two backends to compare.")
@@ -1084,6 +1084,18 @@ def test_transformer_layer(
             RoPE,
         )
 
+    if sage_attn_supported:
+        sage_attn_fwd, sage_attn_bwd = _run_transformer_layer(
+            dtype,
+            config,
+            "SageAttention",
+            ckpt_attn,
+            qkv_format,
+            workspace_opt,
+            fused_qkv_params,
+            RoPE,
+        )
+
     if unfused_attn_supported and fused_attn_supported:
         logging.info("[test_transformer_layer]: unfused attn vs fused attn")
         torch.testing.assert_close(fused_attn_fwd, unfused_attn_fwd, **tols)
@@ -1096,6 +1108,10 @@ def test_transformer_layer(
         logging.info("[test_transformer_layer]: fused attn vs flash attn")
         torch.testing.assert_close(fused_attn_fwd, flash_attn_fwd, **tols)
         torch.testing.assert_close(fused_attn_bwd, flash_attn_bwd, **tols)
+    if sage_attn_supported and flash_attn_supported:
+        logging.info("[test_transformer_layer]: sage attn vs flash attn")
+        torch.testing.assert_close(flash_attn_fwd, sage_attn_fwd, **tols)
+        torch.testing.assert_close(flash_attn_bwd, sage_attn_bwd, **tols)
 
 
 @pytest.mark.skipif(get_cudnn_version() < (8, 9, 1), reason="cuDNN 8.9.1+ is required.")
