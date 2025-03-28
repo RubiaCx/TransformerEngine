@@ -64,14 +64,14 @@ def print_metrics(name, metrics):
 
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
-    (1, 24, 16000, 128, 'bhsd', 'no_mask'),
-    (1, 24, 72000, 128, 'bhsd', 'no_mask'),
-    (1, 32, 16000, 128, 'bhsd', 'no_mask'),
-    (1, 32, 72000, 128, 'bhsd', 'no_mask'),
-    (1, 24, 16000, 128, 'bhsd', 'causal'),
-    (1, 24, 72000, 128, 'bhsd', 'causal'),
-    (1, 32, 16000, 128, 'bhsd', 'causal'),
-    (1, 32, 72000, 128, 'bhsd', 'causal'),
+    (1, 24, 16000, 128, 'sbhd', 'no_mask'),
+    (1, 24, 72000, 128, 'sbhd', 'no_mask'),
+    (1, 32, 16000, 128, 'sbhd', 'no_mask'),
+    (1, 32, 72000, 128, 'sbhd', 'no_mask'),
+    (1, 24, 16000, 128, 'sbhd', 'causal'),
+    (1, 24, 72000, 128, 'sbhd', 'causal'),
+    (1, 32, 16000, 128, 'sbhd', 'causal'),
+    (1, 32, 72000, 128, 'sbhd', 'causal'),
     # (1, 1, 64, 32, 'bhsd', 'no_mask'),
     # (1, 1, 64, 32, 'bhsd', 'causal'),
     # (1, 4, 512, 64, 'bhsd', 'no_mask'),
@@ -206,15 +206,16 @@ def run_test(config):
         v_sdpa = v.permute(0, 2, 1, 3).contiguous()
     
     sdpa_output = sdpa(q_sdpa, k_sdpa, v_sdpa, is_causal=(config.attn_mask_type == "causal")).to(dtype)
-    # #! -> BHSD
+    #! BHSD -> 
     if config.layout == 'bshd':
         sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
-
     elif config.layout == 'bhsd':
         sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
         sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
     elif config.layout == 'sbhd':
-        sdpa_output = sdpa_output.permute(1, 0, 2, 3).contiguous()
+        sdpa_output = sdpa_output.permute(2, 0, 1, 3).contiguous()
+        sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
+
         
     metrics = calculate_similarity(sage_int8_output, sdpa_output)
     print_metrics(f"Sage int8 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics)
@@ -232,5 +233,5 @@ def run_test(config):
 for config in test_configs:
     run_test(config)
 
-logger.save()
+# logger.save()
 

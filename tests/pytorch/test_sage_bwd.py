@@ -169,7 +169,7 @@ torch.set_printoptions(precision=4, threshold=None, edgeitems=None, linewidth=No
 
 class TestConfig:
     def __init__(self, batch_size, num_heads, seq_len, head_dim, total_seq, 
-                 dtype=torch.float16, q_range = 1.0, k_range = 1.0, v_range = 1.0, layout='bhsd'):
+                 dtype=torch.float16, q_range = 1.0, k_range = 1.0, v_range = 1.0, layout='bshd'):
         self.batch_size = batch_size
         self.num_heads = num_heads
         self.seq_len = seq_len
@@ -180,25 +180,7 @@ class TestConfig:
         self.q_range = q_range
         self.k_range = k_range
         self.v_range = v_range
-
-def create_tensors(config, q_range, k_range, v_range, requires_grad=False):
-    if config.layout == 'bhsd':
-        shape = (config.batch_size, config.num_heads, config.seq_len, config.head_dim)
-    elif config.layout == 'bshd':
-        shape = (config.batch_size, config.seq_len, config.num_heads, config.head_dim)
-    elif config.layout == 'thd':
-        shape = (config.total_seq, config.num_heads, config.head_dim)
-    else:
-        raise ValueError(f"Unsupported layout: {config.layout}")
-
-    def generate_tensor(value_range):
-        t = torch.randn(shape, device="cuda")
-        t = t / t.std() * value_range
-        t = t.to(config.dtype).contiguous()
-        t.requires_grad = requires_grad
-        return t
-
-    return generate_tensor(q_range), generate_tensor(k_range), generate_tensor(v_range)
+        self.layout = layout
 
 def calculate_similarity(output1, output2):
     output1 = output1.flatten().float()
@@ -501,7 +483,12 @@ def run_var_backward_tests_for_selected_configs():
 def run_fix_backward_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
-    base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim,
+    if config.layout == "bshd":
+        base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim,
+                              device="cuda", dtype=torch.float16).normal_(0, 0.02)
+        
+    elif config.layout == "sbhd":
+        base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim,
                               device="cuda", dtype=torch.float16).normal_(0, 0.02)
     
     def clone_tensor(tensor):
@@ -529,7 +516,7 @@ def run_fix_backward_test(config):
         sage_output = sage_dpa(
             q_sage, k_sage, v_sage,
             # qkv_layout='thd_thd_thd',
-            qkv_format='bshd',
+            qkv_format=config.layout,
             attn_mask_type="no_mask",
             # cu_seqlens_q=cu_seqlens, 
             # cu_seqlens_kv=cu_seqlens,
@@ -544,10 +531,9 @@ def run_fix_backward_test(config):
 
         flash_output = flash_dpa(
             q_flash, k_flash, v_flash,
-            qkv_format='bshd',
+            qkv_format=config.layout,
             attn_mask_type="no_mask",
         )
-
 
     forward_metrics = calculate_similarity(sage_output, flash_output)
     print_metrics(f"前向传播 - Sage e4m3 vs Flash Varlen \
@@ -576,55 +562,54 @@ def run_fix_backward_test(config):
         'k': calculate_similarity(k_sage.grad, k_flash.grad),
         'v': calculate_similarity(v_sage.grad, v_flash.grad)
     }
-    # def scale_gradients(flash_grad, sage_grad):
-    #     flash_range = flash_grad.max() - flash_grad.min()
-    #     sage_range = sage_grad.max() - sage_grad.min()
-    #     if flash_range > 0:
-    #         scale_factor = sage_range / flash_range
-    #         return flash_grad * scale_factor
-    #     return flash_grad
+    # # def scale_gradients(flash_grad, sage_grad):
+    # #     flash_range = flash_grad.max() - flash_grad.min()
+    # #     sage_range = sage_grad.max() - sage_grad.min()
+    # #     if flash_range > 0:
+    # #         scale_factor = sage_range / flash_range
+    # #         return flash_grad * scale_factor
+    # #     return flash_grad
 
-    # q_flash_scaled = scale_gradients(q_flash.grad, q_sage.grad)
-    # k_flash_scaled = scale_gradients(k_flash.grad, k_sage.grad)
-    # v_flash_scaled = scale_gradients(v_flash.grad, v_sage.grad)
+    # # q_flash_scaled = scale_gradients(q_flash.grad, q_sage.grad)
+    # # k_flash_scaled = scale_gradients(k_flash.grad, k_sage.grad)
+    # # v_flash_scaled = scale_gradients(v_flash.grad, v_sage.grad)
 
-
-    visualize_comparison(q_sage, q_flash, f"Q Input Comparison (hd={config.head_dim})")
-    visualize_comparison(k_sage, k_flash, f"K Input Comparison (hd={config.head_dim})")
-    visualize_comparison(v_sage, v_flash, f"V Input Comparison (hd={config.head_dim})")
+    # # visualize_comparison(q_sage, q_flash, f"Q Input Comparison (hd={config.head_dim})")
+    # # visualize_comparison(k_sage, k_flash, f"K Input Comparison (hd={config.head_dim})")
+    # # visualize_comparison(v_sage, v_flash, f"V Input Comparison (hd={config.head_dim})")
     
-    visualize_comparison(sage_output, flash_output, f"Sage vs Flash Output (hd={config.head_dim})")
+    # visualize_comparison(sage_output, flash_output, f"Sage vs Flash Output (hd={config.head_dim})")
     
-    if q_sage.grad is not None and q_flash.grad is not None:
-        visualize_comparison(q_sage.grad, q_flash.grad, 
-                            f"Q Gradients Original Comparison (hd={config.head_dim})")
-        visualize_comparison(k_sage.grad, k_flash.grad, 
-                            f"K Gradients Original Comparison (hd={config.head_dim})")
-        visualize_comparison(v_sage.grad, v_flash.grad, 
-                            f"V Gradients Original Comparison (hd={config.head_dim})")
+    # if q_sage.grad is not None and q_flash.grad is not None:
+    #     visualize_comparison(q_sage.grad, q_flash.grad, 
+    #                         f"Q Gradients Original Comparison (hd={config.head_dim})")
+    #     visualize_comparison(k_sage.grad, k_flash.grad, 
+    #                         f"K Gradients Original Comparison (hd={config.head_dim})")
+    #     visualize_comparison(v_sage.grad, v_flash.grad, 
+    #                         f"V Gradients Original Comparison (hd={config.head_dim})")
         
-        # visualize_comparison(q_sage.grad, q_flash_scaled, 
-        #                     f"Q Gradients Scaled Comparison (hd={config.head_dim})")
-        # visualize_comparison(k_sage.grad, k_flash_scaled, 
-        #                     f"K Gradients Scaled Comparison (hd={config.head_dim})")
-        # visualize_comparison(v_sage.grad, v_flash_scaled, 
-        #                     f"V Gradients Scaled Comparison (hd={config.head_dim})")
+    #     # visualize_comparison(q_sage.grad, q_flash_scaled, 
+    #     #                     f"Q Gradients Scaled Comparison (hd={config.head_dim})")
+    #     # visualize_comparison(k_sage.grad, k_flash_scaled, 
+    #     #                     f"K Gradients Scaled Comparison (hd={config.head_dim})")
+    #     # visualize_comparison(v_sage.grad, v_flash_scaled, 
+    #     #                     f"V Gradients Scaled Comparison (hd={config.head_dim})")
     
-    # Heatmap visualizations
-    visualize_heatmap(q_sage, f"Q_Sage_Heatmap (hd={config.head_dim})")
-    visualize_heatmap(q_flash, f"Q_Flash_Heatmap (hd={config.head_dim})")
-    visualize_heatmap(sage_output, f"Sage_Output_Heatmap (hd={config.head_dim})")
-    visualize_heatmap(flash_output, f"Flash_Output_Heatmap (hd={config.head_dim})")
+    # # Heatmap visualizations
+    # visualize_heatmap(q_sage, f"Q_Sage_Heatmap (hd={config.head_dim})")
+    # visualize_heatmap(q_flash, f"Q_Flash_Heatmap (hd={config.head_dim})")
+    # visualize_heatmap(sage_output, f"Sage_Output_Heatmap (hd={config.head_dim})")
+    # visualize_heatmap(flash_output, f"Flash_Output_Heatmap (hd={config.head_dim})")
     
-    if q_sage.grad is not None:
-        visualize_heatmap(q_sage.grad, f"Q_Sage_Grad_Heatmap (hd={config.head_dim})")
-        visualize_heatmap(k_sage.grad, f"K_Sage_Grad_Heatmap (hd={config.head_dim})")
-        visualize_heatmap(v_sage.grad, f"V_Sage_Grad_Heatmap (hd={config.head_dim})")
+    # if q_sage.grad is not None:
+    #     visualize_heatmap(q_sage.grad, f"Q_Sage_Grad_Heatmap (hd={config.head_dim})")
+    #     visualize_heatmap(k_sage.grad, f"K_Sage_Grad_Heatmap (hd={config.head_dim})")
+    #     visualize_heatmap(v_sage.grad, f"V_Sage_Grad_Heatmap (hd={config.head_dim})")
     
-    if q_flash.grad is not None:
-        visualize_heatmap(q_flash.grad, f"Q_Flash_Grad_Heatmap (hd={config.head_dim})")
-        visualize_heatmap(k_flash.grad, f"K_Flash_Grad_Heatmap (hd={config.head_dim})")
-        visualize_heatmap(v_flash.grad, f"V_Flash_Grad_Heatmap (hd={config.head_dim})")
+    # if q_flash.grad is not None:
+    #     visualize_heatmap(q_flash.grad, f"Q_Flash_Grad_Heatmap (hd={config.head_dim})")
+    #     visualize_heatmap(k_flash.grad, f"K_Flash_Grad_Heatmap (hd={config.head_dim})")
+    #     visualize_heatmap(v_flash.grad, f"V_Flash_Grad_Heatmap (hd={config.head_dim})")
     
     
     # logger.add_result(config, 'e4m3', forward_metrics, grad_metrics, "Varlen Forward+Backward")
@@ -632,11 +617,14 @@ def run_fix_backward_test(config):
 
 def run_fix_backward_tests_for_selected_configs():
     fix_backward_configs = []
-    batch_sizes = [2]
-    head_dims = [64]
+    # batch_sizes = [2]
+    # head_dims = [64]
+    # num_heads = [16]
+    # seq_lens = [256, 512]
+    batch_sizes = [16]
+    head_dims = [64, 72]
     num_heads = [16]
-    seq_lens = [256, 512]
-
+    seq_lens = [1024]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
         # (1.0, 1.0, 1.0),  # 中等值范围
@@ -648,23 +636,24 @@ def run_fix_backward_tests_for_selected_configs():
             for head_dim in head_dims:
                     for num_head in num_heads:
                         for seq_len in seq_lens:
-                            fix_backward_configs.append(
-                                TestConfig(
-                                    batch_size=batch_size,
-                                    num_heads=num_head,
-                                    seq_len=seq_len, 
-                                    head_dim=head_dim,
-                                    total_seq=seq_len * batch_size,
-                                    dtype=torch.float16,
-                                    q_range=ranges[0],
-                                    k_range=ranges[1],
-                                    v_range=ranges[2],
-                                    layout='bshd'
+                            for layout in ['bshd', 'sbhd']:
+                                fix_backward_configs.append(
+                                    TestConfig(
+                                        batch_size=batch_size,
+                                        num_heads=num_head,
+                                        seq_len=seq_len, 
+                                        head_dim=head_dim,
+                                        total_seq=seq_len * batch_size,
+                                        dtype=torch.float16,
+                                        q_range=ranges[0],
+                                        k_range=ranges[1],
+                                        v_range=ranges[2],
+                                        layout=layout,
+                                    )
                                 )
-                            )
     
     for i, config in enumerate(fix_backward_configs):
-        print(f"\n===== 测试 {i+1}/{len(fix_backward_configs)}: 定长反向传播 (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
+        print(f"\n===== 测试 {i+1}/{len(fix_backward_configs)}: 定长反向传播 (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, layout={config.layout}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
         run_fix_backward_test(config)
 
 if __name__ == "__main__":

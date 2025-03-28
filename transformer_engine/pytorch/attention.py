@@ -4301,7 +4301,6 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
     ) -> torch.Tensor:
         """flash-attn fprop"""
-        print("!!! FlashAttention forward !!!")
         assert (
             query_layer.dtype in [torch.float16, torch.bfloat16]
             and key_layer.dtype in [torch.float16, torch.bfloat16]
@@ -7917,15 +7916,15 @@ def sage_attn_forward(
         if max_seqlen_kv is None and cu_seqlens_kv is not None:
             seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
             max_seqlen_kv = seqlens_kv.max().item()
-
-    if qkv_format == "sbhd":  # -> BHSD
-        query_layer = query_layer.transpose(0, 1).transpose(1, 2).contiguous()
-        key_layer = key_layer.transpose(0, 1).transpose(1,2).contiguous()
-        value_layer = value_layer.transpose(0, 1).transpose(1,2).contiguous()
-    elif qkv_format == "bshd":  # -> BHSD
-        query_layer = query_layer.transpose(1, 2).contiguous()
-        key_layer = key_layer.transpose(1, 2).contiguous()
-        value_layer = value_layer.transpose(1, 2).contiguous()
+    # -> BHSD
+    if qkv_format == "sbhd":  
+        query_layer = query_layer.permute(1, 2, 0, 3).contiguous()
+        key_layer = key_layer.permute(1, 2, 0, 3).contiguous()
+        value_layer = value_layer.permute(1, 2, 0, 3).contiguous()
+    elif qkv_format == "bshd":
+        query_layer = query_layer.permute(0, 2, 1, 3).contiguous()
+        key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
+        value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
     elif qkv_format == "thd" or qkv_format == "bhsd":
         query_layer = query_layer.contiguous()
         key_layer = key_layer.contiguous()
@@ -8045,7 +8044,7 @@ def sage_attn_forward(
         else:
             raise NotImplementedError(f"Unsupported attn_mask_type: {attn_mask_type}")
     lse = lse / 1.44269504
-    if smooth_k:
+    if smooth_k and return_lse:
         lse = lse + lse_correction * softmax_scale
     if output.shape[-1] > original_head_dim:
         output = output[..., :original_head_dim]
@@ -8073,8 +8072,6 @@ class SageAttentionFunc(torch.autograd.Function):
         attn_mask_type,
         return_lse,
     ):        
-        print("!!! SageAttentionFunc forward !!!")
-
         head_size_og = query_layer.size(-1)
 
         if head_size_og % 8 != 0:
@@ -8098,22 +8095,14 @@ class SageAttentionFunc(torch.autograd.Function):
             attn_mask_type,
             return_lse=True,
         )
-        if qkv_format == "sbhd":   # -> [s, b, h*d]
+        # BHSD -> 
+        if qkv_format == "sbhd": 
             output = output.permute(2, 0, 1, 3)
-        elif qkv_format == "bhsd":   # -> [b, s, h*d]
-            output = output.permute(0, 2, 1, 3)
-        elif qkv_format == "bshd": # -> [b, s, h*d]
+        elif qkv_format == "bshd": 
             output = output.permute(0, 2, 1, 3)
         rng_state = torch.cuda.get_rng_state() if dropout_p.p > 0 else None
-        if qkv_format == "thd":
-            ctx.save_for_backward(query_layer, key_layer, value_layer, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
-        else:
-            ctx.input_shape = query_layer.shape
-            q = query_layer.reshape(-1, query_layer.size(2), query_layer.size(3)).contiguous()
-            k = key_layer.reshape(-1, key_layer.size(2), key_layer.size(3)).contiguous()
-            v = value_layer.reshape(-1, value_layer.size(2), value_layer.size(3)).contiguous()
-            out = output.reshape(-1, output.size(2), output.size(3)).contiguous()
-            ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
+        ctx.save_for_backward(query_layer, key_layer, value_layer, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
+        ctx.input_shape = query_layer.shape
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -8131,18 +8120,35 @@ class SageAttentionFunc(torch.autograd.Function):
         
     @staticmethod
     def backward(ctx, dout):
-        print("!!! SageAttentionFunc backward !!!")
-        
         q, k, v, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state = ctx.saved_tensors
+        if ctx.qkv_format == "sbhd":
+            # [s,b,h,d] -> [b,s,h,d]
+            q = q.permute(1, 0, 2, 3)
+            k = k.permute(1, 0, 2, 3)
+            v = v.permute(1, 0, 2, 3)
+            output = output.permute(1, 0, 2, 3)
+            dout = dout.reshape(ctx.input_shape).permute(1, 0, 2, 3)
+            ctx.input_shape = (q.size(0), q.size(1), q.size(2), q.size(3))
+            q = q.reshape(-1, q.size(2), q.size(3))
+            k = k.reshape(-1, k.size(2), k.size(3))
+            v = v.reshape(-1, v.size(2), v.size(3))
+            output = output.reshape(-1, output.size(2), output.size(3))
+            dout = dout.reshape(-1, output.size(1), output.size(2))
+        elif ctx.qkv_format == "bshd":
+            q = q.reshape(-1, q.size(2), q.size(3))
+            k = k.reshape(-1, k.size(2), k.size(3))
+            v = v.reshape(-1, v.size(2), v.size(3))
+            output = output.reshape(-1, output.size(2), output.size(3))
+            dout = dout.view(-1, output.size(1), output.size(2))
+        elif ctx.qkv_format == "thd":
+            dout = dout.view(-1, output.size(1), output.size(2))
+
+            # dout = dout.reshape(-1, output.size(0), output.size(1))
         if rng_state is not None:
             cur_rng_state = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(rng_state)
         head_size_og = output.size(2)
         padded_head_dim = ((head_size_og + 7) // 8) * 8 
-        if ctx.qkv_format == "thd":
-            dout = dout.view(-1, output.size(1), output.size(2))
-        else:
-            dout = dout.view(-1, output.size(1), output.size(2))
 
         if dout.size(-1) != padded_head_dim:
             dout = torch.nn.functional.pad(dout, [0, padded_head_dim - dout.size(-1)])
@@ -8155,7 +8161,7 @@ class SageAttentionFunc(torch.autograd.Function):
             dout,
             q, k, v,
             output,
-            lse, # * 0.6931, #修复 ln2 误差
+            lse, 
             dq, dk, dv,
             cu_seqlens_q,
             cu_seqlens_kv,
@@ -8175,10 +8181,14 @@ class SageAttentionFunc(torch.autograd.Function):
         dq = dq[..., : head_size_og]
         dk = dk[..., : head_size_og]
         dv = dv[..., : head_size_og]
-        if ctx.qkv_format != "thd":
+        if ctx.qkv_format == "bshd":
             dq = dq.reshape(ctx.input_shape)
             dk = dk.reshape(ctx.input_shape)
             dv = dv.reshape(ctx.input_shape)
+        elif ctx.qkv_format == "sbhd":
+            dq = dq.reshape(ctx.input_shape).permute(1, 0, 2, 3)
+            dk = dk.reshape(ctx.input_shape).permute(1, 0, 2, 3)
+            dv = dv.reshape(ctx.input_shape).permute(1, 0, 2, 3)
         return (
             dq, dk, dv, 
             None, None, None, None, None, None, None, 
