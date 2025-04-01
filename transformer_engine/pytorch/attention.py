@@ -6393,7 +6393,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             softmax_scale,
             quantization_backend="triton",
             quantization_type="e4m3",
-            smooth_k=True,
+            smooth_k=False,
             return_lse=False,
             attention_type=attention_type,
             **attn_kwargs,
@@ -7932,13 +7932,14 @@ def sage_attn_forward(
 
     km = None
     lse_correction = None
+    # print(f"smooth_k: {smooth_k}")
     if smooth_k:
         if qkv_format == "thd":
             km = key_layer.mean(dim=0, keepdim=True) # [1, H, D]
         else: # bhsd
             km = key_layer.mean(dim=2, keepdim=True)
         key_layer = key_layer - km
-    if return_lse:
+    if return_lse and smooth_k:
         if qkv_format == "thd":
             '''
             query_layer: [T, H, D]
@@ -8075,9 +8076,9 @@ class SageAttentionFunc(torch.autograd.Function):
         head_size_og = query_layer.size(-1)
 
         if head_size_og % 8 != 0:
-            query_layer = torch.nn.functional.pad(query_layer, [0, 8 - head_size_og % 8])
-            key_layer = torch.nn.functional.pad(key_layer, [0, 8 - head_size_og % 8])
-            value_layer = torch.nn.functional.pad(value_layer, [0, 8 - head_size_og % 8])
+            query_layer = torch.nn.functional.pad(query_layer, (0, 8 - head_size_og % 8), value=0)
+            key_layer = torch.nn.functional.pad(key_layer, (0, 8 - head_size_og % 8), value=0)
+            value_layer = torch.nn.functional.pad(value_layer, (0, 8 - head_size_og % 8), value=0)
     
         output, lse = sage_attn_forward(
             query_layer,
@@ -8151,7 +8152,7 @@ class SageAttentionFunc(torch.autograd.Function):
         padded_head_dim = ((head_size_og + 7) // 8) * 8 
 
         if dout.size(-1) != padded_head_dim:
-            dout = torch.nn.functional.pad(dout, [0, padded_head_dim - dout.size(-1)])
+            dout = torch.nn.functional.pad(dout, (0, padded_head_dim - dout.size(-1)), value=0)
 
         maybe_contiguous = lambda x: x.contiguous()  if x.stride(-1) != 1 else x
         dout, q, k, v, output = [maybe_contiguous(x) for x in (dout, q, k, v, output)]
@@ -8202,7 +8203,7 @@ class SageAttention(torch.nn.Module):
         attention_type: str = "self",
         quantization_backend: str = "triton",
         quantization_type: str = "e4m3",
-        smooth_k: bool = True,
+        smooth_k: bool = False,
         return_lse: bool = True,
         attention_dropout: float = 0.0,
         attention_dropout_ctx: Optional[Callable] = nullcontext,

@@ -622,13 +622,13 @@ def run_fix_backward_tests_for_selected_configs():
     # num_heads = [16]
     # seq_lens = [256, 512]
     batch_sizes = [16]
-    head_dims = [64, 72]
+    head_dims = [72]
     num_heads = [16]
     seq_lens = [1024]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
         # (1.0, 1.0, 1.0),  # 中等值范围
-        # (10.0, 10.0, 10.0)  # 大值范围
+        (10.0, 10.0, 10.0)  # 大值范围
     ]
     
     for ranges in value_ranges:
