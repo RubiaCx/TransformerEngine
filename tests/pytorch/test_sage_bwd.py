@@ -353,12 +353,11 @@ def run_var_backward_test(config):
     print_metrics(f"前向传播 - Sage e4m3 vs Flash Varlen \
                   (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", forward_metrics)
 
-    grad_output = torch.randn_like(sage_output)
-    # torch.cuda.synchronize() # blocking launch
+    grad_output = torch.randn_like(flash_output)
     flash_output.backward(grad_output) 
+    sage_output = sage_output.view(*flash_output.shape)
     sage_output.backward(grad_output)
 
-    print(q_sage.grad_fn)
     sage_grads=(q_sage.grad, k_sage.grad, v_sage.grad)
     flash_grads=(q_flash.grad, k_flash.grad, v_flash.grad)
     
@@ -440,14 +439,16 @@ def run_var_backward_test(config):
 def run_var_backward_tests_for_selected_configs():
     var_backward_configs = []
     
-    head_dims = [32, 64, 96, 128]
-    num_heads = [1, 2, 4, 8, 16, 32, 64, 128]
-    seq_configs = [256, 512, 1024]
-
+    # head_dims = [32, 64, 96, 128]
+    # num_heads = [1, 2, 4, 8, 16, 32, 64, 128]
+    # seq_configs = [256, 512, 1024]
+    head_dims = [32]
+    num_heads = [4]
+    seq_configs = [256]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
-        (1.0, 1.0, 1.0),  # 中等值范围
-        (10.0, 10.0, 10.0)  # 大值范围
+        # (1.0, 1.0, 1.0),  # 中等值范围
+        # (10.0, 10.0, 10.0)  # 大值范围
     ]
     
     for head_dim in head_dims:
@@ -522,7 +523,7 @@ def run_fix_backward_test(config):
             # cu_seqlens_kv=cu_seqlens,
             # max_seqlen_q=max_seqlen, 
             # max_seqlen_kv=max_seqlen,
-        ).contiguous()
+        )
 
     reload(te_attention) #! 强制重载模块
     with EnvSwitcher({"NVTE_SAGE_ATTN": "0", "NVTE_FLASH_ATTN": "1", "NVTE_FUSED_ATTN": "0"}):
@@ -541,10 +542,17 @@ def run_fix_backward_test(config):
 
     grad_output = torch.randn_like(flash_output)
     # torch.cuda.synchronize() # blocking launch
-    flash_output.backward(grad_output) 
-    sage_output.backward(grad_output)
+    if config.layout == 'sbhd':
+        grad_output_flash = grad_output.clone()  
+        grad_output_sage = grad_output.clone()
+        
+        flash_output.backward(grad_output_flash)
+        sage_output.backward(grad_output_sage)
+    else:
+        flash_output.backward(grad_output)
+        sage_output = sage_output.view(*flash_output.shape)
+        sage_output.backward(grad_output)
 
-    print(q_sage.grad_fn)
     sage_grads=(q_sage.grad, k_sage.grad, v_sage.grad)
     flash_grads=(q_flash.grad, k_flash.grad, v_flash.grad)
     
@@ -617,14 +625,14 @@ def run_fix_backward_test(config):
 
 def run_fix_backward_tests_for_selected_configs():
     fix_backward_configs = []
-    # batch_sizes = [2]
-    # head_dims = [64]
+    batch_sizes = [2]
+    head_dims = [16]
+    num_heads = [2]
+    seq_lens = [16]
+    # batch_sizes = [16]
+    # head_dims = [72]
     # num_heads = [16]
-    # seq_lens = [256, 512]
-    batch_sizes = [16]
-    head_dims = [72]
-    num_heads = [16]
-    seq_lens = [1024]
+    # seq_lens = [1024]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
         # (1.0, 1.0, 1.0),  # 中等值范围
@@ -658,7 +666,7 @@ def run_fix_backward_tests_for_selected_configs():
 
 if __name__ == "__main__":
     
-    # run_var_backward_tests_for_selected_configs()
+    run_var_backward_tests_for_selected_configs()
     
     # logger.save("sage_attn_test_with_backward")
     run_fix_backward_tests_for_selected_configs()

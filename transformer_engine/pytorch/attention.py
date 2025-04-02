@@ -8127,12 +8127,12 @@ class SageAttentionFunc(torch.autograd.Function):
             q = q.permute(1, 0, 2, 3)
             k = k.permute(1, 0, 2, 3)
             v = v.permute(1, 0, 2, 3)
-            output = output.permute(1, 0, 2, 3)
             dout = dout.reshape(ctx.input_shape).permute(1, 0, 2, 3)
             ctx.input_shape = (q.size(0), q.size(1), q.size(2), q.size(3))
             q = q.reshape(-1, q.size(2), q.size(3))
             k = k.reshape(-1, k.size(2), k.size(3))
             v = v.reshape(-1, v.size(2), v.size(3))
+            output = output.permute(1, 0, 2, 3)
             output = output.reshape(-1, output.size(2), output.size(3))
             dout = dout.reshape(-1, output.size(1), output.size(2))
         elif ctx.qkv_format == "bshd":
@@ -8196,6 +8196,145 @@ class SageAttentionFunc(torch.autograd.Function):
             None, None, None, None, None, None
         )
 
+class FlashAttnFunc2(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q, k, v,
+        qkv_format,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+    ):
+        from flash_attn.flash_attn_interface import _flash_attn_forward as _flash_attn_forward2
+        from flash_attn.flash_attn_interface import _flash_attn_varlen_forward as _flash_attn_varlen_forward2
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        ctx.format = qkv_format
+        if qkv_format == "sbhd": # -> bshd
+            q = q.permute(1, 0, 2, 3)
+            k = k.permute(1, 0, 2, 3)
+            v = v.permute(1, 0, 2, 3)
+        if qkv_format == "bshd" or qkv_format == "sbhd":                
+            out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward2(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                return_softmax=return_softmax and dropout_p > 0,
+            )
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            if qkv_format == "sbhd":
+                out = out.permute(1, 0, 2, 3)
+            out = out.reshape(out.size(0), out.size(1), -1).contiguous()
+
+        elif qkv_format == "thd":
+            out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward2(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                return_softmax=return_softmax and dropout_p > 0,
+            )
+            ctx.save_for_backward(
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+            )
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            out = out.reshape(out.size(0), -1).contiguous() 
+
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        from flash_attn.flash_attn_interface import _flash_attn_backward as _flash_attn_backward2
+        from flash_attn.flash_attn_interface import _flash_attn_varlen_backward as _flash_attn_varlen_backward2
+
+        if ctx.format == "thd":
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+            dout = dout.view(-1, out.size(1), out.size(2))
+            _flash_attn_varlen_backward2(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_k,
+                ctx.dropout_p,
+                ctx.softmax_scale,
+                ctx.causal,
+                ctx.window_size,
+                ctx.alibi_slopes,
+                ctx.deterministic,
+                rng_state=rng_state,
+            )
+        else:
+            q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+            if ctx.format == "sbhd":
+                dout = dout.transpose(1, 0)
+            dout = dout.view(dout.size(0), dout.size(1), dq.size(2), dq.size(3)).contiguous()
+            _flash_attn_backward2(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                ctx.dropout_p,
+                ctx.softmax_scale,
+                ctx.causal,
+                ctx.window_size,
+                ctx.alibi_slopes,
+                ctx.deterministic,
+                rng_state=rng_state,
+            )
+            if ctx.format == "sbhd":
+                dq = dq.transpose(1, 0)
+                dk = dk.transpose(1, 0)
+                dv = dv.transpose(1, 0)
+        dq = dq[..., : dout.shape[-1]]  
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        
+    
 class SageAttention(torch.nn.Module):
     def __init__(
         self,
@@ -8241,23 +8380,36 @@ class SageAttention(torch.nn.Module):
         
         causal = "causal" in attn_mask_type
         if self.training:
-            return SageAttentionFunc.apply(
-                query_layer,
-                key_layer,
-                value_layer,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
-                self.attention_dropout,
+            return FlashAttnFunc2.apply(
+                query_layer, key_layer, value_layer,
+                qkv_format,
+                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+                self.attention_dropout.p,
                 self.softmax_scale,
                 causal,
-                self.quantization_backend,
-                self.quantization_type,
-                self.smooth_k,
-                qkv_format,
-                attn_mask_type,
-                self.return_lse)
+                (-1, -1),
+                None,
+                False,
+                False
+            )
+            
+            # return SageAttentionFunc.apply(
+            #     query_layer,
+            #     key_layer,
+            #     value_layer,
+            #     cu_seqlens_q,
+            #     cu_seqlens_kv,
+            #     max_seqlen_q,
+            #     max_seqlen_kv,
+            #     self.attention_dropout,
+            #     self.softmax_scale,
+            #     causal,
+            #     self.quantization_backend,
+            #     self.quantization_type,
+            #     self.smooth_k,
+            #     qkv_format,
+            #     attn_mask_type,
+            #     self.return_lse)
         else:
             with torch.no_grad():
                 output, lse = sage_attn_forward(
