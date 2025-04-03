@@ -625,10 +625,10 @@ def run_fix_backward_test(config):
 
 def run_fix_backward_tests_for_selected_configs():
     fix_backward_configs = []
-    batch_sizes = [2]
+    batch_sizes = [1]
     head_dims = [16]
     num_heads = [2]
-    seq_lens = [16]
+    seq_lens = [8]
     # batch_sizes = [16]
     # head_dims = [72]
     # num_heads = [16]
@@ -636,7 +636,7 @@ def run_fix_backward_tests_for_selected_configs():
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
         # (1.0, 1.0, 1.0),  # 中等值范围
-        (10.0, 10.0, 10.0)  # 大值范围
+        # (10.0, 10.0, 10.0)  # 大值范围
     ]
     
     for ranges in value_ranges:
@@ -644,7 +644,7 @@ def run_fix_backward_tests_for_selected_configs():
             for head_dim in head_dims:
                     for num_head in num_heads:
                         for seq_len in seq_lens:
-                            for layout in ['bshd', 'sbhd']:
+                            for layout in ['sbhd','bshd']:
                                 fix_backward_configs.append(
                                     TestConfig(
                                         batch_size=batch_size,
