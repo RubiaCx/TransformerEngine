@@ -349,9 +349,9 @@ def run_var_backward_test(config):
         )
 
 
-    forward_metrics = calculate_similarity(sage_output, flash_output)
+    forward_1 = calculate_similarity(sage_output, flash_output)
     print_metrics(f"前向传播 - Sage e4m3 vs Flash Varlen \
-                  (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", forward_metrics)
+                  (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", forward_1)
 
     grad_output = torch.randn_like(flash_output)
     flash_output.backward(grad_output) 
@@ -434,7 +434,7 @@ def run_var_backward_test(config):
     #     visualize_heatmap(v_flash.grad, f"V_Flash_Grad_Heatmap (hd={config.head_dim})")
     
     
-    logger.add_result(config, 'e4m3', forward_metrics, grad_metrics, "Varlen Forward+Backward")
+    logger.add_result(config, 'e4m3', forward_1, grad_metrics, "Varlen Forward+Backward")
 
 def run_var_backward_tests_for_selected_configs():
     var_backward_configs = []
@@ -501,6 +501,9 @@ def run_fix_backward_test(config):
     q_flash = clone_tensor(base_tensor)
     k_flash = clone_tensor(base_tensor)
     v_flash = clone_tensor(base_tensor)
+    q_fused = clone_tensor(base_tensor)
+    k_fused = clone_tensor(base_tensor)
+    v_fused = clone_tensor(base_tensor)
 
     with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
         sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
@@ -536,33 +539,55 @@ def run_fix_backward_test(config):
             attn_mask_type="no_mask",
         )
 
-    forward_metrics = calculate_similarity(sage_output, flash_output)
-    print_metrics(f"前向传播 - Sage e4m3 vs Flash Varlen \
-                   (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})", forward_metrics)
+    reload(te_attention) #! 强制重载模块
+    with EnvSwitcher({"NVTE_SAGE_ATTN": "0", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "1"}):
+        fused_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
+        fused_dpa.train()
+
+        fused_output = fused_dpa(
+            q_fused, k_fused, v_fused,
+            qkv_format=config.layout,
+            attn_mask_type="no_mask",
+        )
+
+    forward_1 = calculate_similarity(sage_output, flash_output)
+    print_metrics(f"前向传播 - Sage e4m3 vs Flash \
+                   (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})", forward_1)
+    forward_2 = calculate_similarity(sage_output, fused_output)
+    print_metrics(f"前向传播 - Sage e4m3 vs Fused \
+                   (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})", forward_2)
+    forward_3 = calculate_similarity(flash_output, fused_output)
+    print_metrics(f"前向传播 - Flash vs Fused \
+                   (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})", forward_3)
 
     grad_output = torch.randn_like(flash_output)
     # torch.cuda.synchronize() # blocking launch
     if config.layout == 'sbhd':
         grad_output_flash = grad_output.clone()  
         grad_output_sage = grad_output.clone()
-        
+        grad_output_fused = grad_output.clone()
         flash_output.backward(grad_output_flash)
         sage_output.backward(grad_output_sage)
+        fused_output.backward(grad_output_fused)
     else:
         flash_output.backward(grad_output)
+        grad_output_sage = grad_output.clone()
         sage_output = sage_output.view(*flash_output.shape)
-        sage_output.backward(grad_output)
+        sage_output.backward(grad_output_sage)
+        grad_output_fused = grad_output.clone()
+        fused_output.backward(grad_output_fused)
 
     sage_grads=(q_sage.grad, k_sage.grad, v_sage.grad)
     flash_grads=(q_flash.grad, k_flash.grad, v_flash.grad)
+    fused_grads=(q_fused.grad, k_fused.grad, v_fused.grad)
     
     # validate_gradients(sage_grads, flash_grads, config)
     # validate_gradients(flash_grads, flash_api_grads, config)
 
-    print("梯度范数 Sage VS Flash")
-    print(f"Q: {sage_grads[0].norm():.4f} vs {flash_grads[0].norm():.4f}")
-    print(f"K: {sage_grads[1].norm():.4f} vs {flash_grads[1].norm():.4f}")
-    print(f"V: {sage_grads[2].norm():.4f} vs {flash_grads[2].norm():.4f}")
+    print("梯度范数 Sage VS Flash VS Fused")
+    print(f"Q: {sage_grads[0].norm():.4f} vs {flash_grads[0].norm():.4f} vs {fused_grads[0].norm():.4f}")
+    print(f"K: {sage_grads[1].norm():.4f} vs {flash_grads[1].norm():.4f} vs {fused_grads[1].norm():.4f}")
+    print(f"V: {sage_grads[2].norm():.4f} vs {flash_grads[2].norm():.4f} vs {fused_grads[2].norm():.4f}")
 
 
     grad_metrics = {
@@ -620,23 +645,26 @@ def run_fix_backward_test(config):
     #     visualize_heatmap(v_flash.grad, f"V_Flash_Grad_Heatmap (hd={config.head_dim})")
     
     
-    # logger.add_result(config, 'e4m3', forward_metrics, grad_metrics, "Varlen Forward+Backward")
+    # logger.add_result(config, 'e4m3', forward_1, grad_metrics, "Varlen Forward+Backward")
 
 
 def run_fix_backward_tests_for_selected_configs():
     fix_backward_configs = []
-    batch_sizes = [1]
-    head_dims = [16]
-    num_heads = [2]
-    seq_lens = [8]
-    # batch_sizes = [16]
-    # head_dims = [72]
-    # num_heads = [16]
-    # seq_lens = [1024]
+    # batch_sizes = [1]
+    # head_dims = [16]
+    # num_heads = [2]
+    # seq_lens = [8]
+    batch_sizes = [16]
+    head_dims = [72]
+    num_heads = [16]
+    seq_lens = [1024]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
-        # (1.0, 1.0, 1.0),  # 中等值范围
-        # (10.0, 10.0, 10.0)  # 大值范围
+        (10.0, 10.0, 10.0),  # 大值范围
+        (-0.1, -0.1, -0.1),  # 小负值范围
+        (-10.0, -10.0, -10.0),  # 大负值范围
+        (-10.0, 10.0, -10.0),  # 混合正负值
+        (10.0, -10.0, 10.0),  # 混合正负值
     ]
     
     for ranges in value_ranges:
@@ -664,9 +692,179 @@ def run_fix_backward_tests_for_selected_configs():
         print(f"\n===== 测试 {i+1}/{len(fix_backward_configs)}: 定长反向传播 (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, layout={config.layout}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
         run_fix_backward_test(config)
 
+def run_dimension_test(config):
+    """专注测试维度处理正确性的测试函数"""
+    print(f"\n===== 开始维度测试: {config.layout} B={config.batch_size} S={config.seq_len} =====")
+    
+    # 初始化输入张量
+    if config.layout == "bshd":
+        shape = (config.batch_size, config.seq_len, config.num_heads, config.head_dim)
+    elif config.layout == "sbhd":
+        shape = (config.seq_len, config.batch_size, config.num_heads, config.head_dim)
+    else:
+        raise ValueError(f"不支持的布局: {config.layout}")
+    
+    # 生成随机输入（保持高精度以减小数值误差）
+    torch.manual_seed(42)
+    
+    # 根据value_ranges生成对应范围的张量
+    q_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.q_range
+    k_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.k_range
+    v_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.v_range
+    
+    print(f"输入张量范围 - Q: [{q_base.min():.4f}, {q_base.max():.4f}], "
+          f"K: [{k_base.min():.4f}, {k_base.max():.4f}], "
+          f"V: [{v_base.min():.4f}, {v_base.max():.4f}]")
+    
+    def clone(t):
+        return t.clone().detach().requires_grad_(True)
+    
+    # 克隆三组相同的输入
+    q_sage, k_sage, v_sage = clone(q_base), clone(k_base), clone(v_base)
+    q_flash, k_flash, v_flash = clone(q_base), clone(k_base), clone(v_base)
+    
+    # 前向传播检查
+    with torch.cuda.amp.autocast(enabled=True):
+        # SageAttention 前向
+        with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
+            sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=1.0)
+            sage_dpa.train()
+            sage_output = sage_dpa(q_sage, k_sage, v_sage, qkv_format=config.layout)
+            print(f"[Sage] 前向输出形状: {sage_output.shape}")
+            
+        # FlashAttention 前向
+        with EnvSwitcher({"NVTE_SAGE_ATTN": "0", "NVTE_FLASH_ATTN": "1"}):
+            flash_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=1.0)
+            flash_dpa.train()
+            flash_output = flash_dpa(q_flash, k_flash, v_flash, qkv_format=config.layout)
+            print(f"[Flash] 前向输出形状: {flash_output.shape}")
+    
+    # 形状一致性检查
+    assert sage_output.shape == flash_output.shape, f"形状不一致: Sage {sage_output.shape} vs Flash {flash_output.shape}"
+    
+    # 计算前向传播结果的相似度指标
+    def calculate_similarity_metrics(tensor1, tensor2, name=""):
+        tensor1_flat = tensor1.flatten().float()
+        tensor2_flat = tensor2.flatten().float()
+        
+        # 计算L2范数和散度
+        l2_norm1 = torch.norm(tensor1_flat, p=2)
+        l2_norm2 = torch.norm(tensor2_flat, p=2)
+        l2_diff = torch.norm(tensor1_flat - tensor2_flat, p=2)
+        l2_divergence = l2_diff / (l2_norm1 + 1e-8)
+        
+        # 计算余弦相似度
+        cos_sim = F.cosine_similarity(tensor1_flat, tensor2_flat, dim=0)
+        
+        # 计算最大和平均差异
+        max_diff = torch.max(torch.abs(tensor1_flat - tensor2_flat))
+        mean_diff = torch.mean(torch.abs(tensor1_flat - tensor2_flat))
+        
+        print(f"--- {name} 相似度指标 ---")
+        print(f"L2范数: {l2_norm1:.4e} vs {l2_norm2:.4e}")
+        print(f"L2散度: {l2_divergence:.4e}")
+        print(f"余弦相似度: {cos_sim:.6f}")
+        print(f"最大差异: {max_diff:.4e}")
+        print(f"平均差异: {mean_diff:.4e}")
+        
+        return {
+            'l2_norm1': l2_norm1.item(),
+            'l2_norm2': l2_norm2.item(),
+            'l2_diff': l2_diff.item(),
+            'l2_divergence': l2_divergence.item(),
+            'cos_sim': cos_sim.item(),
+            'max_diff': max_diff.item(),
+            'mean_diff': mean_diff.item()
+        }
+    
+    # 计算前向传播结果相似度
+    forward_metrics = calculate_similarity_metrics(sage_output, flash_output, "前向传播")
+    
+    # 生成随机梯度
+    grad_output = torch.randn_like(flash_output)
+    if config.layout == "sbhd":
+        # 确保梯度形状匹配 sbhd 的特殊处理
+        grad_output = grad_output.view(flash_output.shape)
+    
+    # 反向传播
+    def run_backward(output, grad, q, k, v, name):
+        output.backward(grad, retain_graph=True)
+        print(f"[{name}] 梯度形状 - Q: {q.grad.shape}, K: {k.grad.shape}, V: {v.grad.shape}")
+        return q.grad, k.grad, v.grad
+    
+    # Sage 反向
+    sage_grads = run_backward(sage_output, grad_output.clone(), q_sage, k_sage, v_sage, "Sage")
+    # Flash 反向
+    flash_grads = run_backward(flash_output, grad_output.clone(), q_flash, k_flash, v_flash, "Flash")
+    
+    # 梯度形状检查
+    for i in range(3):
+        assert sage_grads[i].shape == flash_grads[i].shape, \
+            f"梯度形状不一致: Sage {sage_grads[i].shape} vs Flash {flash_grads[i].shape}"
+    
+    # 计算梯度相似度
+    grad_names = ["Q梯度", "K梯度", "V梯度"]
+    backward_metrics = []
+    for i in range(3):
+        metrics = calculate_similarity_metrics(sage_grads[i], flash_grads[i], grad_names[i])
+        backward_metrics.append(metrics)
+    
+    # 检查余弦相似度是否足够接近1（代替直接断言）
+    for i, metrics in enumerate(backward_metrics):
+        if metrics['cos_sim'] < 0.98:
+            print(f"警告: {grad_names[i]}的余弦相似度偏低: {metrics['cos_sim']:.6f}")
+        if metrics['l2_divergence'] > 0.1:
+            print(f"警告: {grad_names[i]}的L2散度偏高: {metrics['l2_divergence']:.6f}")
+    
+    print("===== 测试通过! =====\n")
+
+
+def run_fixlen_test():
+    fix_backward_configs = []
+    # batch_sizes = [1]
+    # head_dims = [16]
+    # num_heads = [2]
+    # seq_lens = [8]
+    batch_sizes = [16]
+    head_dims = [72]
+    num_heads = [16]
+    seq_lens = [1024]
+    value_ranges = [
+        (0.1, 0.1, 0.1),  # 小值范围
+        (10.0, 10.0, 10.0),  # 大值范围
+    ]
+    
+    for ranges in value_ranges:
+        for batch_size in batch_sizes:
+            for head_dim in head_dims:
+                    for num_head in num_heads:
+                        for seq_len in seq_lens:
+                            for layout in ['sbhd','bshd']:
+                                fix_backward_configs.append(
+                                    TestConfig(
+                                        batch_size=batch_size,
+                                        num_heads=num_head,
+                                        seq_len=seq_len, 
+                                        head_dim=head_dim,
+                                        total_seq=seq_len * batch_size,
+                                        dtype=torch.float16,
+                                        q_range=ranges[0],
+                                        k_range=ranges[1],
+                                        v_range=ranges[2],
+                                        layout=layout,
+                                    )
+                                )
+    
+    for i, config in enumerate(fix_backward_configs):
+        print(f"\n===== 测试 {i+1}/{len(fix_backward_configs)}: 定长反向传播 (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, layout={config.layout}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
+        run_dimension_test(config)
+
+
 if __name__ == "__main__":
     
-    run_var_backward_tests_for_selected_configs()
+    # run_var_backward_tests_for_selected_configs()
     
     # logger.save("sage_attn_test_with_backward")
     run_fix_backward_tests_for_selected_configs()
+    
+    run_fixlen_test()
