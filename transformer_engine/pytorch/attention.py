@@ -8231,13 +8231,13 @@ class SageAttnFunc(torch.autograd.Function):
         value_layer = v
 
         if qkv_format == "sbhd": # -> bhsd
-            q = q.permute(1, 2, 0, 3)
-            k = k.permute(1, 2, 0, 3)
-            v = v.permute(1, 2, 0, 3)
+            q = q.permute(1, 2, 0, 3).contiguous()
+            k = k.permute(1, 2, 0, 3).contiguous()
+            v = v.permute(1, 2, 0, 3).contiguous()
         elif qkv_format == "bshd": # -> bhsd
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
+            q = q.permute(0, 2, 1, 3).contiguous()
+            k = k.permute(0, 2, 1, 3).contiguous()
+            v = v.permute(0, 2, 1, 3).contiguous()
 
         output, lse = sage_attn_forward(
             q, k, v,
@@ -8257,9 +8257,9 @@ class SageAttnFunc(torch.autograd.Function):
 
         # BHSD -> 
         if qkv_format == "sbhd": 
-            output = output.permute(2, 0, 1, 3)
+            output = output.permute(2, 0, 1, 3).contiguous()
         elif qkv_format == "bshd": 
-            output = output.permute(0, 2, 1, 3)
+            output = output.permute(0, 2, 1, 3).contiguous()
 
         rng_state = torch.cuda.get_rng_state() if dropout_p.p > 0 else None
         ctx.save_for_backward(query_layer, key_layer, value_layer, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
@@ -8283,7 +8283,7 @@ class SageAttnFunc(torch.autograd.Function):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_kv, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         if ctx.format == "thd":
-            dout = dout.view(-1, out.size(1), out.size(2))
+            dout = dout.reshape(-1, out.size(1), out.size(2)).contiguous()
             _flash_attn_varlen_backward2(
                 dout,
                 q,
@@ -8307,7 +8307,7 @@ class SageAttnFunc(torch.autograd.Function):
                 rng_state=rng_state,
             )
         else:
-            dout = dout.view(dout.size(0), dout.size(1), dq.size(2), dq.size(3))
+            dout = dout.reshape(dout.size(0), dout.size(1), dq.size(2), dq.size(3))
 
             if ctx.format == "sbhd":
                 q = q.permute(1, 0, 2, 3).contiguous()
@@ -8342,13 +8342,13 @@ class SageAttnFunc(torch.autograd.Function):
             #     dk = dk.transpose(1, 0)
             #     dv = dv.transpose(1, 0)
             if ctx.format == "sbhd":
-                dq = dq.permute(1, 0, 2, 3).contiguous()
-                dk = dk.permute(1, 0, 2, 3).contiguous()
-                dv = dv.permute(1, 0, 2, 3).contiguous()
+                dq = dq.permute(1, 0, 2, 3)
+                dk = dk.permute(1, 0, 2, 3)
+                dv = dv.permute(1, 0, 2, 3)
 
-        dq = dq[..., : dout.shape[-1]]  
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : dout.shape[-1]].contiguous()
+        dk = dk[..., : dout.shape[-1]].contiguous()
+        dv = dv[..., : dout.shape[-1]].contiguous()
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 class FlashAttnFunc2(torch.autograd.Function):
@@ -8481,14 +8481,13 @@ class FlashAttnFunc2(torch.autograd.Function):
                 rng_state=rng_state,
             )
             if ctx.format == "sbhd":
-                dq = dq.transpose(1, 0).contiguous()
-                dk = dk.transpose(1, 0).contiguous()
-                dv = dv.transpose(1, 0).contiguous()
-        dq = dq[..., : dout.shape[-1]]  
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+                dq = dq.transpose(1, 0)
+                dk = dk.transpose(1, 0)
+                dv = dv.transpose(1, 0)
+        dq = dq[..., : dout.shape[-1]].contiguous()
+        dk = dk[..., : dout.shape[-1]].contiguous()
+        dv = dv[..., : dout.shape[-1]].contiguous()
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
-        
     
 class SageAttention(torch.nn.Module):
     def __init__(
@@ -8535,36 +8534,36 @@ class SageAttention(torch.nn.Module):
         
         causal = "causal" in attn_mask_type
         if self.training:
-            return FlashAttnFunc2.apply(
-                query_layer, key_layer, value_layer,
-                qkv_format,
-                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-                self.attention_dropout.p,
-                self.softmax_scale,
-                causal,
-                (-1, -1),
-                None,
-                False,
-                False
-            )
-            
-            # return SageAttnFunc.apply(
-            #     query_layer,
-            #     key_layer,
-            #     value_layer,
-            #     cu_seqlens_q,
-            #     cu_seqlens_kv,
-            #     max_seqlen_q,
-            #     max_seqlen_kv,
-            #     self.attention_dropout,
+            # return FlashAttnFunc2.apply(
+            #     query_layer, key_layer, value_layer,
+            #     qkv_format,
+            #     cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+            #     self.attention_dropout.p,
             #     self.softmax_scale,
             #     causal,
-            #     self.quantization_backend,
-            #     self.quantization_type,
-            #     self.smooth_k,
-            #     qkv_format,
-            #     attn_mask_type,
-            #     self.return_lse)
+            #     (-1, -1),
+            #     None,
+            #     False,
+            #     False
+            # )
+            
+            return SageAttnFunc.apply(
+                query_layer,
+                key_layer,
+                value_layer,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+                self.attention_dropout,
+                self.softmax_scale,
+                causal,
+                self.quantization_backend,
+                self.quantization_type,
+                self.smooth_k,
+                qkv_format,
+                attn_mask_type,
+                self.return_lse)
         
         else:
             with torch.no_grad():

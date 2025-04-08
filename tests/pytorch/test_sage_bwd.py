@@ -695,6 +695,7 @@ def run_fix_backward_tests_for_selected_configs():
 def run_dimension_test(config):
     """专注测试维度处理正确性的测试函数"""
     print(f"\n===== 开始维度测试: {config.layout} B={config.batch_size} S={config.seq_len} =====")
+    scale = 1.0 / (config.head_dim ** 0.5)
     
     # 初始化输入张量
     if config.layout == "bshd":
@@ -727,17 +728,17 @@ def run_dimension_test(config):
     with torch.cuda.amp.autocast(enabled=True):
         # SageAttention 前向
         with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
-            sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=1.0)
+            sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
             sage_dpa.train()
             sage_output = sage_dpa(q_sage, k_sage, v_sage, qkv_format=config.layout)
-            print(f"[Sage] 前向输出形状: {sage_output.shape}")
+            # print(f"[Sage] 前向输出形状: {sage_output.shape}")
             
         # FlashAttention 前向
         with EnvSwitcher({"NVTE_SAGE_ATTN": "0", "NVTE_FLASH_ATTN": "1"}):
-            flash_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=1.0)
+            flash_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
             flash_dpa.train()
             flash_output = flash_dpa(q_flash, k_flash, v_flash, qkv_format=config.layout)
-            print(f"[Flash] 前向输出形状: {flash_output.shape}")
+            # print(f"[Flash] 前向输出形状: {flash_output.shape}")
     
     # 形状一致性检查
     assert sage_output.shape == flash_output.shape, f"形状不一致: Sage {sage_output.shape} vs Flash {flash_output.shape}"
