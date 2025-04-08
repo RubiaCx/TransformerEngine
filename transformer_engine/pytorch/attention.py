@@ -6396,8 +6396,8 @@ class DotProductAttention(TransformerEngineBaseModule):
             softmax_scale,
             quantization_backend="triton",
             quantization_type="e4m3",
-            smooth_k=False,
-            return_lse=False,
+            smooth_k=True,
+            return_lse=True,
             attention_type=attention_type,
             **attn_kwargs,
             layer_number=layer_number,
@@ -8307,18 +8307,16 @@ class SageAttnFunc(torch.autograd.Function):
                 rng_state=rng_state,
             )
         else:
-            dout = dout.reshape(dout.size(0), dout.size(1), dq.size(2), dq.size(3))
-
             if ctx.format == "sbhd":
-                q = q.permute(1, 0, 2, 3).contiguous()
-                k = k.permute(1, 0, 2, 3).contiguous()
-                v = v.permute(1, 0, 2, 3).contiguous()
-                dq = dq.permute(1, 0, 2, 3).contiguous()
-                dk = dk.permute(1, 0, 2, 3).contiguous()
-                dv = dv.permute(1, 0, 2, 3).contiguous()
-                dout = dout.permute(1, 0, 2, 3).contiguous()
-                out = out.permute(1, 0, 2, 3).contiguous()
-
+                q = q.transpose(1, 0).contiguous()
+                k = k.transpose(1, 0).contiguous()
+                v = v.transpose(1, 0).contiguous()
+                dq = dq.transpose(1, 0).contiguous()
+                dk = dk.transpose(1, 0).contiguous()
+                dv = dv.transpose(1, 0).contiguous()
+                dout = dout.transpose(1, 0).contiguous()
+                out = out.transpose(1, 0).contiguous()
+            dout = dout.reshape(dout.size(0), dout.size(1), dq.size(2), dq.size(3)).contiguous()
             _flash_attn_backward2(
                 dout,
                 q,
@@ -8337,14 +8335,10 @@ class SageAttnFunc(torch.autograd.Function):
                 False,
                 rng_state=rng_state,
             )
-            # if ctx.format == "sbhd":
-            #     dq = dq.transpose(1, 0)
-            #     dk = dk.transpose(1, 0)
-            #     dv = dv.transpose(1, 0)
             if ctx.format == "sbhd":
-                dq = dq.permute(1, 0, 2, 3)
-                dk = dk.permute(1, 0, 2, 3)
-                dv = dv.permute(1, 0, 2, 3)
+                dq = dq.transpose(1, 0)
+                dk = dk.transpose(1, 0)
+                dv = dv.transpose(1, 0)
 
         dq = dq[..., : dout.shape[-1]].contiguous()
         dk = dk[..., : dout.shape[-1]].contiguous()
@@ -8496,7 +8490,7 @@ class SageAttention(torch.nn.Module):
         attention_type: str = "self",
         quantization_backend: str = "triton",
         quantization_type: str = "e4m3",
-        smooth_k: bool = False,
+        smooth_k: bool = True,
         return_lse: bool = True,
         attention_dropout: float = 0.0,
         attention_dropout_ctx: Optional[Callable] = nullcontext,
