@@ -6395,7 +6395,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.sage_attention = SageAttention(
             softmax_scale,
             quantization_backend="triton",
-            quantization_type="e4m3",
+            quantization_type="int8",
             smooth_k=True,
             return_lse=True,
             attention_type=attention_type,
@@ -7936,6 +7936,7 @@ def sage_attn_forward(
     km = None
     lse_correction = None
     # print(f"smooth_k: {smooth_k}")
+    # print(f"return_lse: {return_lse}")
     if smooth_k:
         if qkv_format == "thd":
             km = key_layer.mean(dim=0, keepdim=True) # [1, H, D]
@@ -7984,7 +7985,6 @@ def sage_attn_forward(
                     sm_scale=softmax_scale, tensor_layout="bhsd", quant_type=quantization_type
                 )
                 cu_seqlens_q_scale = cu_seqlens_k_scale = cu_seqlens_v_scale = None
-
     if qkv_format == "thd":
         if attn_mask_type == "causal":
             if quantization_type in ["int8", "e4m3", "e5m2"]:
@@ -8054,151 +8054,6 @@ def sage_attn_forward(
         output = output[..., :original_head_dim]
     return output, lse
 
-
-class SageAttentionFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        query_layer,
-        key_layer,
-        value_layer,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        max_seqlen_q,
-        max_seqlen_kv,
-        dropout_p,
-        softmax_scale,
-        causal,
-        quantization_backend,
-        quantization_type,
-        smooth_k,
-        qkv_format,
-        attn_mask_type,
-        return_lse,
-    ):        
-        head_size_og = query_layer.size(-1)
-
-        if head_size_og % 8 != 0:
-            query_layer = torch.nn.functional.pad(query_layer, (0, 8 - head_size_og % 8), value=0)
-            key_layer = torch.nn.functional.pad(key_layer, (0, 8 - head_size_og % 8), value=0)
-            value_layer = torch.nn.functional.pad(value_layer, (0, 8 - head_size_og % 8), value=0)
-    
-        output, lse = sage_attn_forward(
-            query_layer,
-            key_layer,
-            value_layer,
-            softmax_scale,
-            quantization_backend,
-            quantization_type,
-            smooth_k,
-            qkv_format,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            max_seqlen_q,
-            max_seqlen_kv,
-            attn_mask_type,
-            return_lse=True,
-        )
-        # BHSD -> 
-        if qkv_format == "sbhd": 
-            output = output.permute(2, 0, 1, 3)
-        elif qkv_format == "bshd": 
-            output = output.permute(0, 2, 1, 3)
-        rng_state = torch.cuda.get_rng_state() if dropout_p.p > 0 else None
-        ctx.save_for_backward(query_layer, key_layer, value_layer, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state)
-        ctx.input_shape = query_layer.shape
-        ctx.dropout_p = dropout_p
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.max_seqlen_q = max_seqlen_q if max_seqlen_q is not None else 0
-        ctx.max_seqlen_kv = max_seqlen_kv if max_seqlen_kv is not None else 0
-        ctx.qkv_format = qkv_format
-        ctx.attn_mask_type = attn_mask_type
-        output = output[..., :head_size_og]
-      
-        if qkv_format == "thd":  # -> [t, h*d]
-            output = output.reshape(output.size(0), -1).contiguous() 
-        else:
-            output = output.reshape(output.size(0), output.size(1), -1).contiguous()
-        return output
-        
-    @staticmethod
-    def backward(ctx, dout):
-        q, k, v, output, lse, cu_seqlens_q, cu_seqlens_kv, rng_state = ctx.saved_tensors
-        if ctx.qkv_format == "sbhd":
-            # [s,b,h,d] -> [b,s,h,d]
-            q = q.permute(1, 0, 2, 3)
-            k = k.permute(1, 0, 2, 3)
-            v = v.permute(1, 0, 2, 3)
-            dout = dout.reshape(ctx.input_shape).permute(1, 0, 2, 3)
-            ctx.input_shape = (q.size(0), q.size(1), q.size(2), q.size(3))
-            q = q.reshape(-1, q.size(2), q.size(3))
-            k = k.reshape(-1, k.size(2), k.size(3))
-            v = v.reshape(-1, v.size(2), v.size(3))
-            output = output.permute(1, 0, 2, 3)
-            output = output.reshape(-1, output.size(2), output.size(3))
-            dout = dout.reshape(-1, output.size(1), output.size(2))
-        elif ctx.qkv_format == "bshd":
-            q = q.reshape(-1, q.size(2), q.size(3))
-            k = k.reshape(-1, k.size(2), k.size(3))
-            v = v.reshape(-1, v.size(2), v.size(3))
-            output = output.reshape(-1, output.size(2), output.size(3))
-            dout = dout.view(-1, output.size(1), output.size(2))
-        elif ctx.qkv_format == "thd":
-            dout = dout.view(-1, output.size(1), output.size(2))
-
-            # dout = dout.reshape(-1, output.size(0), output.size(1))
-        if rng_state is not None:
-            cur_rng_state = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(rng_state)
-        head_size_og = output.size(2)
-        padded_head_dim = ((head_size_og + 7) // 8) * 8 
-
-        if dout.size(-1) != padded_head_dim:
-            dout = torch.nn.functional.pad(dout, (0, padded_head_dim - dout.size(-1)), value=0)
-
-        maybe_contiguous = lambda x: x.contiguous()  if x.stride(-1) != 1 else x
-        dout, q, k, v, output = [maybe_contiguous(x) for x in (dout, q, k, v, output)]
-        
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_backward(
-            dout,
-            q, k, v,
-            output,
-            lse, 
-            dq, dk, dv,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            int(ctx.max_seqlen_q), 
-            int(ctx.max_seqlen_kv),
-            float(ctx.dropout_p.p), 
-            float(ctx.softmax_scale), 
-            bool("causal" in ctx.attn_mask_type), 
-            [-1, -1], # window_size
-            None, # alibi_slopes
-            False, # deterministic
-            rng_state,
-        )
-        if rng_state is not None:
-            torch.cuda.set_rng_state(cur_rng_state)
-  
-        dq = dq[..., : head_size_og]
-        dk = dk[..., : head_size_og]
-        dv = dv[..., : head_size_og]
-        if ctx.qkv_format == "bshd":
-            dq = dq.reshape(ctx.input_shape)
-            dk = dk.reshape(ctx.input_shape)
-            dv = dv.reshape(ctx.input_shape)
-        elif ctx.qkv_format == "sbhd":
-            dq = dq.reshape(ctx.input_shape).permute(1, 0, 2, 3)
-            dk = dk.reshape(ctx.input_shape).permute(1, 0, 2, 3)
-            dv = dv.reshape(ctx.input_shape).permute(1, 0, 2, 3)
-        return (
-            dq, dk, dv, 
-            None, None, None, None, None, None, None, 
-            None, None, None, None, None, None
-        )
-
 class SageAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -8219,7 +8074,7 @@ class SageAttnFunc(torch.autograd.Function):
         return_lse,
     ):        
         ctx.format = qkv_format
-        
+
         head_size_og = q.size(-1)
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, (0, 8 - head_size_og % 8), value=0)
@@ -8269,7 +8124,8 @@ class SageAttnFunc(torch.autograd.Function):
         ctx.max_seqlen_q = max_seqlen_q if max_seqlen_q is not None else 0
         ctx.max_seqlen_kv = max_seqlen_kv if max_seqlen_kv is not None else 0
         ctx.attn_mask_type = attn_mask_type
-        if qkv_format == "thd":  # -> [t, h*d]
+        # -> [?, h*d]
+        if qkv_format == "thd": 
             output = output.reshape(output.size(0), -1).contiguous() 
         else:
             output = output.reshape(output.size(0), output.size(1), -1).contiguous()
@@ -8316,6 +8172,7 @@ class SageAttnFunc(torch.autograd.Function):
                 dv = dv.transpose(1, 0).contiguous()
                 dout = dout.transpose(1, 0).contiguous()
                 out = out.transpose(1, 0).contiguous()
+                lse = lse.contiguous()
             dout = dout.reshape(dout.size(0), dout.size(1), dq.size(2), dq.size(3)).contiguous()
             _flash_attn_backward2(
                 dout,
@@ -8489,8 +8346,8 @@ class SageAttention(torch.nn.Module):
         softmax_scale: float,
         attention_type: str = "self",
         quantization_backend: str = "triton",
-        quantization_type: str = "e4m3",
-        smooth_k: bool = True,
+        quantization_type: str = "int8",
+        smooth_k: bool = False,
         return_lse: bool = True,
         attention_dropout: float = 0.0,
         attention_dropout_ctx: Optional[Callable] = nullcontext,
@@ -8577,17 +8434,17 @@ class SageAttention(torch.nn.Module):
                     attn_mask_type,
                     self.return_lse 
                 )
-                #! output: [b, h, s, d] or [t, h, d]
-                if qkv_format == "sbhd":   # -> [s, b, h*d]
+                # [b, h, s, d] / [t, h, d] -> [?, h * d]
+                if qkv_format == "sbhd": 
                     output = output.permute(2, 0, 1, 3)
                     output = output.reshape(output.size(0), output.size(1), -1).contiguous()
-                elif qkv_format == "bhsd":   # -> [b, s, h*d]
+                elif qkv_format == "bhsd":
                     output = output.permute(0, 2, 1, 3)
                     output = output.reshape(output.size(0), output.size(1), -1).contiguous()
-                elif qkv_format == "bshd": # -> [b, s, h*d]
+                elif qkv_format == "bshd":
                     output = output.permute(0, 2, 1, 3)
                     output = output.reshape(output.size(0), output.size(1), -1).contiguous() 
-                elif qkv_format == "thd":  # -> [t, h*d]
+                elif qkv_format == "thd":
                     output = output.reshape(output.size(0), -1).contiguous() 
                     
             if self.return_lse:
