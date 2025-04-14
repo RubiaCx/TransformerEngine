@@ -8,8 +8,8 @@ import triton.language as tl
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn, 
-                    start_m,  
+                    K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, 
+                    stride_kn, stride_vn, start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
                     QUANT_TYPE: tl.constexpr,  
@@ -149,7 +149,8 @@ def forward(q, k, v,
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
     num_kv_groups = max(num_heads_q // num_heads_kv, 1)
-    assert num_heads_kv > 0 and num_kv_groups > 0
+    assert num_heads_kv > 0, "num_heads_kv must be positive"
+    assert num_kv_groups > 0, "num_kv_groups must be positive"
 
     lse = torch.empty([batch_size, num_heads_q, seq_len_q], dtype=torch.float32, device=q.device) if return_lse else torch.empty([0])
 

@@ -128,7 +128,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, Out, Lse,
     q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, 
-                                    stride_kn, stride_vn, start_m, BLOCK_M, HEAD_DIM, BLOCK_N,  
+                                    stride_kn, stride_vn, start_m, 
+                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n, QUANT_TYPE)
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, 
                                     stride_kn, stride_vn, start_m, BLOCK_M, HEAD_DIM, BLOCK_N,  

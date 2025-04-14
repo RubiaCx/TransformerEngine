@@ -19,8 +19,8 @@ import triton.language as tl
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
-                    start_m,  
+                    K_ptrs, K_scale_ptr, V_ptrs, 
+                    stride_kn, stride_vn, start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
                     ):
@@ -29,7 +29,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         # Attention(Q,K,V) = softmax(QK^T/sqrt(d))V
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k_mask = offs_n[None, :] < (kv_len - start_n)   
-        k = tl.load(K_ptrs, mask = k_mask)
+        k = tl.load(K_ptrs, mask=k_mask)
         k_scale = tl.load(K_scale_ptr)
         # QK^T，即公式中的 S_i^j
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
@@ -63,7 +63,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               stride_kz, stride_kh, stride_kn,  
               stride_vz, stride_vh, stride_vn,  
               stride_oz, stride_oh, stride_on,  
-              qo_len, kv_len, H:tl.constexpr, num_kv_groups:tl.constexpr,
+              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
               HEAD_DIM: tl.constexpr,  
               BLOCK_M: tl.constexpr,  
               BLOCK_N: tl.constexpr,  
@@ -92,31 +92,33 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     
-    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                    start_m,  
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, 
+                                    stride_kn, stride_vn, start_m,  
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
-                                    )
+                                    4 - STAGE, offs_m, offs_n)
+                                    
     acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask=(offs_m[:, None] < qo_len))
 
     if RETURN_LSE:
-        lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m  #!
+        lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
         l_i = tl.log2(l_i) + m_i
-        tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
+        tl.store(lse_ptrs, l_i, mask=(offs_m < qo_len))
 
 def forward(q, k, v, 
             q_scale, k_scale, v_scale, 
-            output_dtype=torch.float16, return_lse=False, tensor_layout=None):
+            output_dtype=torch.float16, 
+            return_lse=False, 
+            tensor_layout=None):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
     #! bhsd == HND；bshd == NHD 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
     if tensor_layout == "bhsd":
-        batch_size, num_heads_q, seq_len_q,  head_dim = q.shape
+        batch_size, num_heads_q, seq_len_q, head_dim = q.shape
         _, num_heads_kv, seq_len_kv, _ = k.shape
         stride_batch_q, stride_heads_q, stride_seq_q, stride_dim_q = q.stride()
         stride_batch_k, stride_heads_k, stride_seq_k, stride_dim_k = k.stride()
@@ -153,7 +155,8 @@ def forward(q, k, v,
         H=num_heads_q, num_kv_groups=num_kv_groups,
         HEAD_DIM=head_dim,  
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, 
-        STAGE=stage, RETURN_LSE=return_lse,
+        STAGE=stage, 
+        RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4
     )
