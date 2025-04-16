@@ -6398,7 +6398,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.sage_attention = SageAttention(
             softmax_scale,
             quantization_backend="triton",
-            quantization_type="none",
+            quantization_type="e4m3",
             smooth_k=True,
             return_lse=True,
             attention_type=attention_type,
