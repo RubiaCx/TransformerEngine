@@ -74,16 +74,19 @@ from transformer_engine.pytorch.graph import is_graph_capturing
 
 
 from transformer_engine.pytorch.triton.Sage_quant_per_block import per_block_quant as quant_per_block_triton
+from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen import per_block_varlen_quant as quant_per_block_varlen_triton
+
 from transformer_engine.pytorch.triton.Sage_attn import forward as sageattn_triton
 from transformer_engine.pytorch.triton.Sage_attn_quant import forward as sageattn_quant_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal import forward as sageattn_causal_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_quant import forward as sageattn_causal_quant_triton
 
-from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen import per_block_varlen_quant as quant_per_block_varlen_triton
 from transformer_engine.pytorch.triton.Sage_attn_varlen import forward as sageattn_varlen_triton
 from transformer_engine.pytorch.triton.Sage_attn_varlen_quant import forward as sageattn_varlen_quant_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_varlen import forward as sageattn_causal_varlen_triton
 from transformer_engine.pytorch.triton.Sage_attn_causal_varlen_quant import forward as sageattn_causal_varlen_quant_triton
+
+from transformer_engine.pytorch.triton.sage_attn_fwd import forward as sageattn_fwd_triton
 
 _flash_attn_version = PkgVersion(get_pkg_version("flash-attn"))
 _flash_attn_version_required = PkgVersion("2.0.6")
@@ -7878,20 +7881,16 @@ def print_param_info(name, param):
         print(f"{name}: {type(param)}, shape={getattr(param, 'shape', 'N/A')}, dtype={getattr(param, 'dtype', 'N/A')}")
 
 def sage_attn_forward(
-    query_layer, 
-    key_layer, 
-    value_layer,
+    query_layer, key_layer, value_layer,
     softmax_scale,
-    quantization_backend,
-    quantization_type,
+    quantization_backend, quantization_type,
     smooth_k,
     qkv_format,
-    cu_seqlens_q,
-    cu_seqlens_kv,
-    max_seqlen_q,
-    max_seqlen_kv,
+    cu_seqlens_q, cu_seqlens_kv,
+    max_seqlen_q, max_seqlen_kv,
     attn_mask_type,
-    return_lse):
+    return_lse
+    ):
     head_dim = query_layer.size(-1)
     original_head_dim = head_dim
 
@@ -7921,17 +7920,16 @@ def sage_attn_forward(
             max_seqlen_kv = seqlens_kv.max().item()
     # -> BHSD
     if qkv_format == "sbhd":  
-        query_layer = query_layer.permute(1, 2, 0, 3).contiguous()
-        key_layer = key_layer.permute(1, 2, 0, 3).contiguous()
-        value_layer = value_layer.permute(1, 2, 0, 3).contiguous()
+        query_layer = query_layer.permute(1, 2, 0, 3)
+        key_layer = key_layer.permute(1, 2, 0, 3)
+        value_layer = value_layer.permute(1, 2, 0, 3)
     elif qkv_format == "bshd":
-        query_layer = query_layer.permute(0, 2, 1, 3).contiguous()
-        key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
-        value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
-    elif qkv_format == "thd" or qkv_format == "bhsd":
-        query_layer = query_layer.contiguous()
-        key_layer = key_layer.contiguous()
-        value_layer = value_layer.contiguous()
+        query_layer = query_layer.permute(0, 2, 1, 3)
+        key_layer = key_layer.permute(0, 2, 1, 3)
+        value_layer = value_layer.permute(0, 2, 1, 3)
+    query_layer = query_layer.contiguous()
+    key_layer = key_layer.contiguous()
+    value_layer = value_layer.contiguous()
 
     km = None
     lse_correction = None
@@ -8031,36 +8029,20 @@ def sage_attn_forward(
                     output_dtype=query_layer.dtype
                 )
     else:
-        if attn_mask_type == "causal":
-            if quantization_type in ["int8", "e4m3", "e5m2"]:
-                output, lse = sageattn_causal_quant_triton(
-                    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale,
-                    return_lse=return_lse, tensor_layout="bhsd", 
-                    quant_type=quantization_type, 
-                    output_dtype=query_layer.dtype
-                )
-            else:
-                output, lse = sageattn_causal_triton(
-                    q_quant, k_quant, value_layer, q_scale, k_scale,
-                    return_lse=return_lse, tensor_layout="bhsd", 
-                    output_dtype=query_layer.dtype
-                )
-        elif attn_mask_type == "no_mask":
-            if quantization_type in ["int8", "e4m3", "e5m2"]:
-                output, lse = sageattn_quant_triton(
-                    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale,
-                    return_lse=return_lse, tensor_layout="bhsd", 
-                    quant_type=quantization_type, 
-                    output_dtype=query_layer.dtype
-                )
-            else:
-                output, lse = sageattn_triton(
-                    q_quant, k_quant, value_layer,  q_scale, k_scale, v_scale,
-                    return_lse=return_lse, tensor_layout="bhsd", 
-                    output_dtype=query_layer.dtype
-                )
+        if quantization_type in ["int8", "e4m3", "e5m2"]:
+            output, lse = sageattn_fwd_triton(
+                q_quant, k_quant, v_quant,  q_scale, k_scale, v_scale,
+                output_dtype=query_layer.dtype,
+                causal=attn_mask_type == "causal",
+                quant_type=quantization_type, 
+            )
         else:
-            raise NotImplementedError(f"Unsupported attn_mask_type: {attn_mask_type}")
+            output, lse = sageattn_fwd_triton(
+                q_quant, k_quant, value_layer,  q_scale, k_scale, v_scale,
+                output_dtype=query_layer.dtype,
+                causal=attn_mask_type == "causal",
+                quant_type=quantization_type, 
+            )
     lse = lse / 1.44269504
     if smooth_k and return_lse:
         lse = lse + lse_correction * softmax_scale

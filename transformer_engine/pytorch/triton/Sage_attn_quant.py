@@ -78,8 +78,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, Out, Lse,
               QUANT_TYPE: tl.constexpr,  
               ):
     start_m = tl.program_id(0)
-    off_z = tl.program_id(2).to(tl.int64)
     off_h = tl.program_id(1).to(tl.int64)
+    off_z = tl.program_id(2).to(tl.int64)
 
     q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
     k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  

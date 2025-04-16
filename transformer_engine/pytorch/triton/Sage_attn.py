@@ -36,6 +36,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         # rows_sum(exp(S_i^j - m_i^j)
         m_ij = tl.maximum(m_i, tl.max(qk, 1)) # 减去当前块的最大值，归一化
         qk = qk - m_ij[:, None]
+        
         p = tl.math.exp2(qk) 
         l_ij = tl.sum(p, 1) 
         # exp(m_i^j-1 - m_i^j) 对于上一块累积的 l_i，按照当前块的尺度修正：
