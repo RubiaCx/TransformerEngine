@@ -5,28 +5,14 @@ import triton.tools.experimental_descriptor
 import triton
 import triton.language as tl
 
-
-'''
-因果模式 (STAGE=3):
-[矩阵上三角+对角线]
-┌───────────────┐
-│ ░░░░░░░░░░░░░░│  阶段1 (STAGE=1)：上三角部分，Q * K^T 无掩码限制
-│ ░░░░░░░░░░░░░░│  
-│ ░░░░░░░░░░░░░░│  
-├───────────────┤
-│ █████████████░│  阶段2 (STAGE=2)：当前块，需应用三角掩码
-│ ███████████░░░│  
-│ █████████░░░░░│  
-└───────────────┘
-'''
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,
                     K_block_ptr, V_block_ptr,
                     start_m, 
                     q_scale, K_scale_ptr, V_scale_ptr, 
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-                    SEQ_LEN: tl.constexpr):
+                    HEAD_NUM: tl.constexpr, HEAD_DIM: tl.constexpr, SEQ_LEN: tl.constexpr,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -66,7 +52,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        K_scale_ptr += 1
+        K_scale_ptr += HEAD_NUM
         V_scale_ptr += 1
     return acc, l_i, m_i
 
@@ -75,9 +61,9 @@ def _attn_fwd_inner_quant(acc, l_i, m_i, q,
                           K_block_ptr, V_block_ptr,
                           start_m, 
                           q_scale, K_scale_ptr, V_scale_ptr, 
-                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
+                          HEAD_NUM: tl.constexpr, HEAD_DIM: tl.constexpr, SEQ_LEN: tl.constexpr,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                           STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-                          SEQ_LEN: tl.constexpr,
                           QUANT_TYPE: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
@@ -137,19 +123,21 @@ def _attn_fwd_inner_quant(acc, l_i, m_i, q,
         m_i = m_ij 
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        K_scale_ptr += 1
+        K_scale_ptr += HEAD_NUM
         V_scale_ptr += 1
     return acc, l_i, m_i
 
+
 @triton.jit
-def _attn_fwd(Q, K, V, 
-              Q_scale, K_scale, V_scale,
+def _attn_fwd(Q, K, V, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+              Q_scale, K_scale, V_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,
               LSE, Out, 
-              stride_qb, stride_qh, stride_qm, stride_qk, 
-              stride_kb, stride_kh, stride_kn, stride_kk, 
-              stride_vb, stride_vh, stride_vk, stride_vn, 
-              stride_ob, stride_oh, stride_om, stride_on, 
-              BS, HEAD_NUM, SEQ_LEN, GROUPS,
+              stride_qb, stride_qh, stride_qm, 
+              stride_kb, stride_kh, stride_kn, 
+              stride_vb, stride_vh, stride_vk, 
+              stride_ob, stride_oh, stride_om, 
+              BS, MAX_SEQ_LEN, GROUPS,
+              HEAD_NUM: tl.constexpr,
               HEAD_DIM: tl.constexpr, 
               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, 
               STAGE: tl.constexpr,
@@ -162,6 +150,13 @@ def _attn_fwd(Q, K, V,
     off_b = (off_hb // HEAD_NUM).to(tl.int64)
     off_h = (off_hb % HEAD_NUM).to(tl.int64)
 
+    cu_seqlens_q_start = tl.load(cu_seqlens_q + off_b)
+    cu_seqlens_q_end = tl.load(cu_seqlens_q + off_b + 1)
+    qo_len = cu_seqlens_q_end - cu_seqlens_q_start
+
+    if (start_m * BLOCK_M) >= qo_len:
+        return
+    
     qkv_offset = off_b * stride_qb + off_h * stride_qh
 
     q_scale_offset = off_b * HEAD_NUM * tl.cdiv(SEQ_LEN, BLOCK_M) + off_h * tl.cdiv(SEQ_LEN, BLOCK_M)
@@ -244,23 +239,23 @@ def _attn_fwd(Q, K, V,
     tl.store(lse_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
-def forward(q, k, v, 
-            q_scale, k_scale, v_scale, 
+def forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+            q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,
             output_dtype=torch.float16, 
             causal=False,
             quant_type="int8"):
         BLOCK_M = 128
         BLOCK_N = 64
-        # q k v 的 shape 是 [B, H, S, D]
-        BATCH, HEAD_N_Q, SEQ_L, HEAD_DIM_Q = q.shape
-        HEAD_N_K, HEAD_DIM_K = k.shape[1], k.shape[-1]
-        HEAD_DIM_V = v.shape[-1] # when v is in float8_e5m2 it is transposed.
-
+        # q k v 的 shape 是 [T, H, D]
+        _, HEAD_N_Q, HEAD_DIM_Q = q.shape
+        _, HEAD_N_K, HEAD_DIM_K = k.shape
+        HEAD_DIM_V = v.shape[-1] 
+        BATCH = cu_seqlens_q.shape[0] - 1
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
-        lse = torch.empty((BATCH, HEAD_N_Q, SEQ_L), dtype=torch.float32, device=q.device)
+        lse = torch.empty((BATCH, HEAD_N_Q, max_seqlen_q), dtype=torch.float32, device=q.device)
 
         quant_type_map = {
             "int8": 0,
@@ -274,17 +269,17 @@ def forward(q, k, v,
         extra_kern_args = {}
         # 沿 seq 维度分块 BLOCK_M；将 Batch 和 Head 维度合并；表示每个 warp 只处理 1 个 batch 和 head
         # grid = lambda args: (triton.cdiv(SEQ_L, args["BLOCK_M"]), BATCH * HEAD_N_Q, 1)
-        grid = lambda args: (triton.cdiv(SEQ_L,  BLOCK_M), HEAD_N_Q * BATCH, 1)
+        grid = lambda args: (triton.cdiv(max_seqlen_q,  BLOCK_M), HEAD_N_Q * BATCH, 1)
 
         _attn_fwd[grid](
-            q, k, v, 
-            q_scale, k_scale, v_scale,
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+            q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,
             lse, o, 
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3), 
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            BATCH, HEAD_N_Q, SEQ_L, GROUPS, HEAD_DIM=HEAD_DIM_K,
+            q.stride(0), q.stride(1), q.stride(2), 
+            k.stride(0), k.stride(1), k.stride(2), 
+            v.stride(0), v.stride(1), v.stride(2), 
+            o.stride(0), o.stride(1), o.stride(2), 
+            BATCH, HEAD_N_Q, max_seqlen_q, GROUPS, HEAD_DIM=HEAD_DIM_K,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             STAGE=stage,
             QUANT_TYPE=quant_type_map[quant_type], 

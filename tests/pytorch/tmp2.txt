@@ -1,0 +1,10 @@
+Q‑scale: 0.006777511443942785 K‑scale: 0.027189970016479492 V‑scale: 0.026451781392097473
+v_quant:  torch.Size([1, 1, 64, 64])
+q: torch.Size([1, 1, 64, 64]), k: torch.Size([1, 1, 64, 64]), v: torch.Size([1, 1, 64, 64]), q_scale: torch.Size([1, 1, 1]), k_scale: torch.Size([1, 1, 1]), v_scale: torch.Size([1, 1, 1]), output_dtype: torch.bfloat16, causal: False, quant_type: int8
+quant_type:  int8
+o: torch.Size([1, 1, 64, 64]), lse: torch.Size([1, 1, 64])
+Q‑scale: 0.0019213106716051698 K‑scale: 0.007707878481596708 V‑scale: 0.007498615421354771
+v_quant:  torch.Size([1, 1, 64, 64])
+q: torch.Size([1, 1, 64, 64]), k: torch.Size([1, 1, 64, 64]), v: torch.Size([1, 1, 64, 64]), q_scale: torch.Size([1, 1, 1]), k_scale: torch.Size([1, 1, 1]), v_scale: torch.Size([1, 1, 1]), output_dtype: torch.bfloat16, causal: False, quant_type: e4m3
+quant_type:  e4m3
+o: torch.Size([1, 1, 64, 64]), lse: torch.Size([1, 1, 64])

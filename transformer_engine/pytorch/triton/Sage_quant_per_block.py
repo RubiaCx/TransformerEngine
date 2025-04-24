@@ -50,11 +50,12 @@ def quant_per_block_kernel(Input, Output, Scale,
 def per_block_quant(q, k, v, 
                    quant_type="int8",  
                    BLKQ=128, BLKK=64, BLKV=64, 
-                   sm_scale=None, tensor_layout="bhsd"):
+                   sm_scale=None):
     dtype_map = {
         "int8": torch.int8,
         "e4m3": torch.float8_e4m3fn,
-        "e5m2": torch.float8_e5m2
+        "e5m2": torch.float8_e5m2,
+        "none": torch.int8,
     }
     assert quant_type in dtype_map, f"Unsupported quant type: {quant_type}"
     
@@ -62,20 +63,11 @@ def per_block_quant(q, k, v,
     k_quant = torch.empty(k.shape, dtype=dtype_map[quant_type], device=k.device)
     v_quant = torch.empty(v.shape, dtype=dtype_map[quant_type], device=v.device)
 
-    if tensor_layout == "bhsd":
-        batch_size, num_heads_q, seq_len_q, head_dim = q.shape
-        _, num_heads_kv, seq_len_kv, _ = k.shape
-        stride_batch_q, stride_heads_q, stride_seq_q, stride_dim_q = q.stride()
-        stride_batch_k, stride_heads_k, stride_seq_k, stride_dim_k = k.stride()
-        stride_batch_v, stride_heads_v, stride_seq_v, stride_dim_v = v.stride()
-    elif tensor_layout == "bshd":
-        batch_size, seq_len_q, num_heads_q, head_dim = q.shape
-        _, seq_len_kv, num_heads_kv, _ = k.shape
-        stride_batch_q, stride_seq_q, stride_heads_q, stride_dim_q = q.stride()
-        stride_batch_k, stride_seq_k, stride_heads_k, stride_dim_k = k.stride()
-        stride_batch_v, stride_seq_v, stride_heads_v, stride_dim_v = v.stride()
-    else:
-        raise ValueError(f"tensor_layout {tensor_layout} not supported")
+    batch_size, num_heads_q, seq_len_q, head_dim = q.shape
+    _, num_heads_kv, seq_len_kv, _ = k.shape
+    stride_batch_q, stride_heads_q, stride_seq_q, stride_dim_q = q.stride()
+    stride_batch_k, stride_heads_k, stride_seq_k, stride_dim_k = k.stride()
+    stride_batch_v, stride_heads_v, stride_seq_v, stride_dim_v = v.stride()
 
     q_scale = torch.empty((batch_size, num_heads_q, (seq_len_q + BLKQ - 1) // BLKQ), 
                          device=q.device, dtype=torch.float32)
@@ -87,7 +79,7 @@ def per_block_quant(q, k, v,
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    quant_type_code = {"int8":0, "e4m3":1, "e5m2":2}[quant_type]
+    quant_type_code = {"int8":0, "e4m3":1, "e5m2":2, "none":0}[quant_type]
 
     def launch_kernel(tensor_in, tensor_out, scale_out, blk_size, strides, is_query=False):
         grid = ((tensor_in.size(2) + blk_size - 1) // blk_size, 
@@ -111,5 +103,4 @@ def per_block_quant(q, k, v,
                  (stride_batch_k, stride_heads_k, stride_seq_k))
     launch_kernel(v, v_quant, v_scale, BLKV,
                  (stride_batch_v, stride_heads_v, stride_seq_v))
-
     return q_quant, q_scale, k_quant, k_scale, v_quant, v_scale 

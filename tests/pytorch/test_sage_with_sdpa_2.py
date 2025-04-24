@@ -1,6 +1,7 @@
 import torch
 from transformer_engine.pytorch.attention import (
     SageAttention,
+    SageAttention2,
     FlashAttention,
     UnfusedDotProductAttention,
 )
@@ -46,8 +47,11 @@ def create_tensors(config):
     return generate_tensor(), generate_tensor(), generate_tensor()
 
 def calculate_similarity(output1, output2):
-    output1 = output1.flatten().float()
-    output2 = output2.flatten().float()
+    # print(f"output1.shape={output1.shape}, output2.shape={output2.shape}")
+    # print(f"output1: {output1}")
+    # print(f"output2: {output2}")
+    output1 = output1.flatten().to(torch.float32)
+    output2 = output2.flatten().to(torch.float32)
     
     metrics = {
         'max_diff': torch.max(torch.abs(output1 - output2)),
@@ -58,7 +62,7 @@ def calculate_similarity(output1, output2):
 
 def print_metrics(name, metrics):
     print(f"\n{name} Metrics:")
-    print(f"Max Difference: {metrics['max_diff'].item():.6f}")
+    # print(f"Max Difference: {metrics['max_diff'].item():.6f}")
     print(f"Mean Difference: {metrics['mean_diff'].item():.6f}")
     print(f"Cosine Similarity: {metrics['cos_sim'].item():.6f}")
 
@@ -71,8 +75,28 @@ base_configs = [
     # (1, 24, 16000, 128, 'sbhd', 'causal'),
     # (1, 24, 72000, 128, 'sbhd', 'causal'),
     # (1, 32, 16000, 128, 'sbhd', 'causal'),
-    # (1, 32, 72000, 128, 'sbhd', 'causal'),
-    (1, 1, 64, 32, 'bshd', 'no_mask'),
+    # (1, 1, 64, 32, 'bshd', 'no_mask'),
+    (1, 1, 64, 32, 'sbhd', 'no_mask'),
+    (1, 1, 64, 32, 'sbhd', 'causal'),
+    # # (1, 1, 128, 64, 'sbhd', 'no_mask'),
+    (2, 1, 64, 32, 'sbhd', 'no_mask'),
+    (2, 1, 64, 32, 'sbhd', 'causal'),
+    (1, 4, 64, 32, 'sbhd', 'no_mask'),
+    (1, 4, 64, 32, 'sbhd', 'causal'),
+
+    (1, 4, 12, 64, 'bshd', 'causal'),
+    (8, 8, 256, 64, 'sbhd', 'no_mask'),
+    
+    (4, 8, 1024, 64, 'bshd', 'no_mask'),
+    (4, 16, 1024, 64, 'sbhd', 'no_mask'),
+    
+    (1, 32, 2048, 128, 'bshd', 'no_mask'),
+    (1, 32, 2048, 128, 'sbhd', 'no_mask'),
+    
+    # (2, 8, 256, 80, 'bshd', 'no_mask'),
+    # (2, 8, 256, 80, 'sbhd', 'no_mask'),
+    # (16, 16, 1024,  72, 'sbhd', 'no_mask'),
+    # (16, 16, 1024,  72, 'bshd', 'no_mask'),
     # (1, 1, 64, 32, 'bhsd', 'causal'),
     # (1, 4, 512, 64, 'bhsd', 'no_mask'),
     # (1, 4, 512, 64, 'bhsd', 'causal'),
@@ -86,7 +110,7 @@ base_configs = [
 
 test_configs = []
 for bs, h, s, d, layout, mask_type in base_configs:
-    for dtype in [torch.float16, torch.bfloat16]:
+    for dtype in [torch.float16]:
         for value_range in [1.0]:
             test_configs.append(
                 TestConfig(
@@ -144,12 +168,30 @@ logger = ResultLogger()
 def run_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
+    sage_int82 = SageAttention2(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="int8",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
     sage_int8 = SageAttention(
         softmax_scale=scale,
         quantization_backend="triton",
         quantization_type="int8",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_e4m32 = SageAttention2(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e4m3",
+        smooth_k=True,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
@@ -158,7 +200,16 @@ def run_test(config):
         quantization_backend="triton",
         quantization_type="e4m3",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_e5m22 = SageAttention2(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e5m2",
+        smooth_k=True,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
@@ -167,44 +218,76 @@ def run_test(config):
         quantization_backend="triton",
         quantization_type="e5m2",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
-    sage_fwd = SageAttention(
+    sage_none2 = SageAttention2(
         softmax_scale=scale,
         quantization_backend="triton",
         quantization_type="none",
         smooth_k=True,
-        return_lse=False,
+        return_lse=True,
         attention_dropout=0.0,
     ).cuda()
 
+    sage_none = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="none",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
     q, k, v = create_tensors(config)
     
-    sage_int8_output = sage_int8(
+    sage_int8_output, lse_int8 = sage_int8(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
     
-    sage_e4m3_output = sage_e4m3(
+    sage_e4m3_output, lse_e4m3 = sage_e4m3(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
 
-    sage_e5m2_output = sage_e5m2(
+    sage_e5m2_output, lse_e5m2 = sage_e5m2(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
 
-    sage_fwd_output = sage_fwd(
+    sage_none_output, lse_none = sage_none(
         q, k, v,
         qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
         attn_mask_type=config.attn_mask_type
     )
+        
+    sage_int8_output2 = sage_int82(
+        q, k, v,
+        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+        attn_mask_type=config.attn_mask_type
+    )
+    
+    # sage_e4m3_output2 = sage_e4m32(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
+
+    # sage_e5m2_output2 = sage_e5m22(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
+
+    # sage_none_output2 = sage_none2(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
 
      #! -> BHSD
     if config.layout == 'bhsd':
@@ -224,16 +307,17 @@ def run_test(config):
     #! BHSD -> 
     if config.layout == 'bshd':
         sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
-    elif config.layout == 'bhsd':
-        sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
         sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
     elif config.layout == 'sbhd':
         sdpa_output = sdpa_output.permute(2, 0, 1, 3).contiguous()
         sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
-
-        
+    
+    print(f"\nsize={config.batch_size}*{config.num_heads}*{config.seq_len}*{config.head_dim}, attn_mask_type={config.attn_mask_type}")
     metrics = calculate_similarity(sage_int8_output, sdpa_output)
-    print_metrics(f"Sage int8 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics)
+    print_metrics(f"Sage int8 vs Sdpa ", metrics)
+    
+    # metrics2 = calculate_similarity(sage_int8_output2, sdpa_output)
+    # print_metrics(f"Sage int82 vs Sdpa", metrics2)
 
     metrics_e4m3 = calculate_similarity(sage_e4m3_output, sdpa_output)
     print_metrics(f"Sage e4m3 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e4m3)
@@ -241,9 +325,22 @@ def run_test(config):
     metrics_e5m2 = calculate_similarity(sage_e5m2_output, sdpa_output)
     print_metrics(f"Sage e5m2 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
 
-    metrics_fwd = calculate_similarity(sage_fwd_output, sdpa_output)
-    print_metrics(f"Sage fwd vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_fwd)
+    metrics_none = calculate_similarity(sage_none_output, sdpa_output)
+    print_metrics(f"Sage none vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_none)
 
+    # metrics_none_2 = calculate_similarity(sage_none_output, sage_none_output2)
+    # print_metrics(f"Sage none vs Sage none2 (BS={config.batch_size}, Heads={config.num_heads})", metrics_none_2)    
+
+    # metrics3 = calculate_similarity(sage_int8_output, sage_int8_output2)
+    # print_metrics(f"Sage int8 vs Sage int82", metrics3)
+
+    # metrics4 = calculate_similarity(sage_none_output, sdpa_output)
+    # print_metrics(f"Sage none vs Sdpa", metrics4)
+    # metrics_e4m3_2 = calculate_similarity(sage_e4m3_output, sage_e4m3_output2)
+    # print_metrics(f"Sage e4m3 vs Sage e4m32 (BS={config.batch_size}, Heads={config.num_heads})", metrics_e4m3_2)
+
+    # metrics_e5m2_2 = calculate_similarity(sage_e5m2_output, sage_e5m2_output2)
+    # print_metrics(f"Sage e5m2 vs Sage e5m22 (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2_2)
     # logger.add_result(config, 'int8', metrics)
     # logger.add_result(config, 'e4m3', metrics_e4m3)
     # logger.add_result(config, 'e5m2', metrics_e5m2)

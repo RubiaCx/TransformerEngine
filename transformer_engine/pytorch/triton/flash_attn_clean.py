@@ -509,6 +509,8 @@ def test_op(BS, HEAD_NUM, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     ref_dq, q.grad = q.grad.clone(), None
     # triton implementation
     tri_out = attention(q, k, v, causal, sm_scale).half()
+    avg_ms = triton.testing.do_bench(lambda: attention(q, k, v, causal, sm_scale).half())
+    print('[Attn] avg_ms:', avg_ms)
     tri_out.backward(dout)
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
@@ -601,4 +603,5 @@ def bench_flash_attention(BATCH, HEAD_NUM, SEQ_LEN, HEAD_DIM, causal, mode, prov
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    bench_flash_attention.run(save_path=".", print_data=True)
+    # bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(1, 32, 4096, 128, True)

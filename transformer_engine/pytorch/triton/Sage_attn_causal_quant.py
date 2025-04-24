@@ -32,6 +32,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
         K_scale_ptr += lo // BLOCK_N
+        V_scale_ptr += lo // BLOCK_N
         K_ptrs += stride_kn * lo
         V_ptrs += stride_vn * lo
     for start_n in range(lo, hi, BLOCK_N):

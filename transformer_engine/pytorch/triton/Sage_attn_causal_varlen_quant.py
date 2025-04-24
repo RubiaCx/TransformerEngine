@@ -155,6 +155,7 @@ def _attn_fwd(Q, K, V,
         lse_ptrs = Lse + (off_z * H + off_h) * max_seqlen_q + offs_m
         l_i = tl.log2(l_i) + m_i 
         tl.store(lse_ptrs, l_i, mask=(offs_m < qo_len))
+        
 def forward(q, k, v, 
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
             q_scale, k_scale, v_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, cu_seqlens_v_scale,

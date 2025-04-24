@@ -20,8 +20,8 @@ import triton.language as tl
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
-                    start_m,  
+                    K_ptrs, K_scale_ptr, V_ptrs, 
+                    stride_kn, stride_vn, start_m,  
                     H: tl.constexpr,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
@@ -30,11 +30,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k_mask = offs_n[None, :] < (kv_len - start_n)   
-        k = tl.load(K_ptrs, mask = k_mask)
+        k = tl.load(K_ptrs, mask=k_mask)
         k_scale = tl.load(K_scale_ptr)
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk = qk - m_ij[:, None]
+        
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
         

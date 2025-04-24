@@ -85,19 +85,19 @@ def calculate_similarity(output1, output2):
 
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
-    # (1, 4, 128, 64, 'bshd', 'no_mask'),
-    # (8, 8, 256, 64, 'sbhd', 'no_mask'),
+    (1, 4, 128, 64, 'bshd', 'no_mask'),
+    (8, 8, 256, 64, 'sbhd', 'no_mask'),
     
-    # (4, 8, 1024, 64, 'bshd', 'no_mask'),
-    # (4, 16, 1024, 64, 'sbhd', 'no_mask'),
+    (4, 8, 1024, 64, 'bshd', 'no_mask'),
+    (4, 16, 1024, 64, 'sbhd', 'no_mask'),
     
-    # (1, 32, 2048, 128, 'bshd', 'no_mask'),
+    (1, 32, 2048, 128, 'bshd', 'no_mask'),
     (1, 32, 2048, 128, 'sbhd', 'no_mask'),
     
-    # (2, 8, 256, 80, 'bshd', 'no_mask'),
-    # (2, 8, 256, 80, 'sbhd', 'no_mask'),
-    # (16, 16, 1024,  72, 'sbhd', 'no_mask'),
-    # (16, 16, 1024,  72, 'bshd', 'no_mask'),
+    (2, 8, 256, 80, 'bshd', 'no_mask'),
+    (2, 8, 256, 80, 'sbhd', 'no_mask'),
+    (16, 16, 1024,  72, 'sbhd', 'no_mask'),
+    (16, 16, 1024,  72, 'bshd', 'no_mask'),
 ]
 
 test_configs = []
@@ -116,11 +116,11 @@ for bs, h, s, d, layout, mask_type in base_configs:
 
         ranges = [
             # (-7.0, 7.0),  
-            # (-10.0, 10.0), 
+            (-10.0, 10.0), 
             # (-10.0, 10.0), 
             # (0.0, 5.0),  
             # (-5.0, 0.0) 
-            (0.0, 50.0)
+            # (0.0, 50.0)
         ]
         
         for min_val, max_val in ranges:
@@ -201,7 +201,7 @@ def run_test(config):
             quantization_type="int8",
             smooth_k=True,
             return_lse=True,
-            attention_dropout=0.1,
+            attention_dropout=0.0,
         ).cuda().eval(),
         
         "e4m3": SageAttention(
@@ -210,7 +210,7 @@ def run_test(config):
             quantization_type="e4m3",
             smooth_k=True,
             return_lse=True,
-            attention_dropout=0.1,
+            attention_dropout=0.0,
         ).cuda().eval(),
         
         "e5m2": SageAttention(
@@ -219,7 +219,7 @@ def run_test(config):
             quantization_type="e5m2",
             smooth_k=True,
             return_lse=True,
-            attention_dropout=0.1,
+            attention_dropout=0.0,
         ).cuda().eval(),
         
         "none": SageAttention(
@@ -228,7 +228,7 @@ def run_test(config):
             quantization_type="none",
             smooth_k=True,
             return_lse=True,
-            attention_dropout=0.1,
+            attention_dropout=0.0,
         ).cuda().eval()
     }
     
