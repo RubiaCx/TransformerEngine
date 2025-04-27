@@ -8404,6 +8404,9 @@ class SageAttention(torch.nn.Module):
         head_dim = query_layer.size(-1)
         original_head_dim = head_dim
         
+        if self.softmax_scale is None:
+            self.softmax_scale = 1.0 / (head_dim ** 0.5)
+
         if head_dim < 64:
             pad_to = 64
         elif 64 <= head_dim < 128:
@@ -8417,9 +8420,6 @@ class SageAttention(torch.nn.Module):
             key_layer = F.pad(key_layer, (0, pad_to - head_dim))
             value_layer = F.pad(value_layer, (0, pad_to - head_dim))
             head_dim = pad_to
-
-        if self.softmax_scale is None:
-            self.softmax_scale = 1.0 / (original_head_dim ** 0.5)
     
         # -> BHSD
         if qkv_format == "sbhd":  
@@ -8434,21 +8434,6 @@ class SageAttention(torch.nn.Module):
         key_layer = key_layer.contiguous()
         value_layer = value_layer.contiguous()
         
-        k_mean = None
-        lse_correction = None
-        
-        if self.smooth_k:
-            k_mean = key_layer.mean(dim=2, keepdim=True)
-            key_layer = key_layer - k_mean
-
-        if self.return_lse and self.smooth_k:
-            '''
-            query_layer: [B, Hq, S, D]
-            km: [B, Hk, 1, D] -> [B, Hk, D, 1]
-            lse: [B, Hq, S]
-            '''
-            lse_correction = torch.matmul(query_layer, k_mean.transpose(2, 3)).squeeze(-1).to(torch.float32)
-            
         output, lse = sage_attention(
             query_layer, key_layer, value_layer,
             sm_scale=self.softmax_scale,
@@ -8457,19 +8442,16 @@ class SageAttention(torch.nn.Module):
             quant_type=self.quantization_type
         )
         # TODO 1. 保存fp16的原始qkv，反向**重新做**quant_per_block；2. 反向**复用**前向的quant_per_block
-        lse = lse / 1.44269504
-        if self.smooth_k and self.return_lse:
-            lse = lse + lse_correction * self.softmax_scale
         if output.shape[-1] > original_head_dim:
             output = output[..., :original_head_dim]
         # print(f"NEW output: {output}")
-
+        #! ERROR .contiguous() 加上会出错
         # BHSD -> 
         if qkv_format == "sbhd": 
             output = output.permute(2, 0, 1, 3)
         elif qkv_format == "bshd": 
             output = output.permute(0, 2, 1, 3)
-        # output = output.reshape(output.size(0), output.size(1), -1)
+        output = output.reshape(output.size(0), output.size(1), -1)
         if self.return_lse:
             return output, lse
         else:

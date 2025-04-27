@@ -165,7 +165,7 @@ class ResultLogger:
 
 logger = ResultLogger()
 
-def run_test(config):
+def run_fwd_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
     sage_int82 = SageAttention2(
@@ -345,8 +345,133 @@ def run_test(config):
     # logger.add_result(config, 'e4m3', metrics_e4m3)
     # logger.add_result(config, 'e5m2', metrics_e5m2)
 
+def run_bwd_test(config):
+    tols = {"atol": 1e-2, "rtol": 1e-2}
+    scale = 1.0 / (config.head_dim ** 0.5)
+    if config.layout == "bshd":
+        shape = (config.batch_size, config.seq_len, config.num_heads, config.head_dim)
+    elif config.layout == "sbhd":
+        shape = (config.seq_len, config.batch_size, config.num_heads, config.head_dim)
+    else:
+        raise ValueError(f"不支持的布局: {config.layout}")
+    
+    q_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.q_range
+    k_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.k_range
+    v_base = torch.randn(*shape, device="cuda", dtype=torch.float32).to(torch.float16) * config.v_range
+    
+    def clone(t):
+        return t.clone().detach().requires_grad_(True)
+    
+    q_sage, k_sage, v_sage = clone(q_base), clone(k_base), clone(v_base)
+    q_flash, k_flash, v_flash = clone(q_base), clone(k_base), clone(v_base)
+
+    sage_int8 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="int8",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_e4m3 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e4m3",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
+
+    sage_e5m2 = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="e5m2",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+
+    sage_none = SageAttention(
+        softmax_scale=scale,
+        quantization_backend="triton",
+        quantization_type="none",
+        smooth_k=True,
+        return_lse=True,
+        attention_dropout=0.0,
+    ).cuda()
+    q, k, v = create_tensors(config)
+    
+    sage_int8_output, lse_int8 = sage_int8(
+        q, k, v,
+        qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+        attn_mask_type=config.attn_mask_type
+    )
+    
+    # sage_e4m3_output, lse_e4m3 = sage_e4m3(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
+
+    # sage_e5m2_output, lse_e5m2 = sage_e5m2(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
+
+    # sage_none_output, lse_none = sage_none(
+    #     q, k, v,
+    #     qkv_layout=f"{config.layout}_{config.layout}_{config.layout}",
+    #     attn_mask_type=config.attn_mask_type
+    # )
+        
+     #! -> BHSD
+    if config.layout == 'bhsd':
+        q_sdpa = q.contiguous()
+        k_sdpa = k.contiguous()
+        v_sdpa = v.contiguous()
+    elif config.layout == 'sbhd':
+        q_sdpa = q.permute(1, 2, 0, 3).contiguous()
+        k_sdpa = k.permute(1, 2, 0, 3).contiguous()
+        v_sdpa = v.permute(1, 2, 0, 3).contiguous()
+    elif config.layout == 'bshd':
+        q_sdpa = q.permute(0, 2, 1, 3).contiguous()
+        k_sdpa = k.permute(0, 2, 1, 3).contiguous()
+        v_sdpa = v.permute(0, 2, 1, 3).contiguous()
+    
+    sdpa_output = sdpa(q_sdpa, k_sdpa, v_sdpa, is_causal=(config.attn_mask_type == "causal")).to(dtype)
+    #! BHSD -> 
+    if config.layout == 'bshd':
+        sdpa_output = sdpa_output.permute(0, 2, 1, 3).contiguous()
+        sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
+    elif config.layout == 'sbhd':
+        sdpa_output = sdpa_output.permute(2, 0, 1, 3).contiguous()
+        sdpa_output = sdpa_output.reshape(sdpa_output.size(0), sdpa_output.size(1), -1).contiguous()
+    
+    print(f"\nsize={config.batch_size}*{config.num_heads}*{config.seq_len}*{config.head_dim}, attn_mask_type={config.attn_mask_type}")
+    metrics = calculate_similarity(sage_int8_output, sdpa_output)
+    print_metrics(f"Sage int8 vs Sdpa ", metrics)
+    
+    # metrics2 = calculate_similarity(sage_int8_output2, sdpa_output)
+    # print_metrics(f"Sage int82 vs Sdpa", metrics2)
+
+    metrics_e4m3 = calculate_similarity(sage_e4m3_output, sdpa_output)
+    print_metrics(f"Sage e4m3 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e4m3)
+
+    metrics_e5m2 = calculate_similarity(sage_e5m2_output, sdpa_output)
+    print_metrics(f"Sage e5m2 vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_e5m2)
+
+    metrics_none = calculate_similarity(sage_none_output, sdpa_output)
+    print_metrics(f"Sage none vs Sdpa (BS={config.batch_size}, Heads={config.num_heads})", metrics_none)
+
+    # logger.add_result(config, 'int8', metrics)
+    # logger.add_result(config, 'e4m3', metrics_e4m3)
+    # logger.add_result(config, 'e5m2', metrics_e5m2)
+
 for config in test_configs:
-    run_test(config)
+    run_fwd_test(config)
 
 # logger.save()
 
