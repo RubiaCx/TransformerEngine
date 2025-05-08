@@ -756,9 +756,9 @@ def run_fix_backward_tests_for_selected_configs():
     # num_heads = [2]
     # seq_lens = [8]
     batch_sizes = [16]
-    head_dims = [72]
+    head_dims = [72, 64]
     num_heads = [16]
-    seq_lens = [512]
+    seq_lens = [1024]
     value_ranges = [
         (0.1, 0.1, 0.1),  # 小值范围
         # (10.0, 10.0, 10.0),  # 大值范围

@@ -285,24 +285,25 @@ def _attn_bwd_preprocess(O, DO,
                          BLOCK_Q: tl.constexpr, HEAD_DIM: tl.constexpr 
                          ):
     off_m = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    off_hb = tl.program_id(1)
+    off_h = tl.program_id(1).to(tl.int64)
+    off_b = tl.program_id(2).to(tl.int64)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(O + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    o = tl.load(O + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
-    tl.store(Delta + off_hb * SEQ_LEN + off_m, delta)
+    tl.store(Delta + off_h * off_b * SEQ_LEN + off_m, delta)
 
 # The main inner-loop logic for computing dK and dV.
 # 固定处理 K 和 V 的一个块（形状为 BLOCK_KV × HEAD_DIM），然后迭代处理 Q 和 dO 的多个块
 @triton.jit
 def _attn_bwd_dkdv(dk, dv, 
-                   Q, k, v, 
-                   sm_scale,
-                   DO, LSE, D, 
+                   Q_ptrs, k, v, 
+                   DO_ptrs, LSE, D, 
                    # shared by Q/K/V/DO.
                    stride_qs, stride_qd, 
+                   Q_scale_ptr, k_scale, v_scale, 
                    HEAD_NUM, SEQ_LEN,
                    BLOCK_Q: tl.constexpr, 
                    BLOCK_KV: tl.constexpr, 
@@ -314,18 +315,19 @@ def _attn_bwd_dkdv(dk, dv,
     offs_n = start_n + tl.arange(0, BLOCK_KV)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    qT_ptrs = Q + offs_m[None, :] * stride_qs + offs_k[:, None] * stride_qd
-    do_ptrs = DO + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
+    qT_ptrs = Q_ptrs + offs_m[None, :] * stride_qs + offs_k[:, None] * stride_qd
+    do_ptrs = DO_ptrs + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
     # BLOCK_KV must be a multiple of BLOCK_Q, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_KV % BLOCK_Q == 0)
     curr_m = start_m
     step_m = BLOCK_Q
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
+        q_scale = tl.load(Q_scale_ptr)
+        qT = tl.load(qT_ptrs) 
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
         m = tl.load(LSE + offs_m)
-        qkT = tl.dot(k, qT)
+        qkT = tl.dot(k, qT).to(tl.float32) * q_scale * k_scale
         pT = tl.math.exp2(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
@@ -333,30 +335,28 @@ def _attn_bwd_dkdv(dk, dv,
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         # Compute dV.
-        # ppT = pT.to(tl.float16)
-        ppT = pT.to(do.dtype) 
-        dv += tl.dot(ppT, do)
+        dv += tl.dot(pT.to(do.dtype), do) 
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dpT = tl.dot(v.to(do.dtype), tl.trans(do)).to(tl.float32) * v_scale 
         dsT = pT * (dpT - Di[None, :])
-        # dsT = dsT.to(tl.float16)
-        dsT = dsT.to(qT.dtype) 
-        dk += tl.dot(dsT, tl.trans(qT))
+        dk += tl.dot(dsT, tl.trans(qT).to(dsT.dtype)).to(tl.float32) * q_scale 
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qs
         do_ptrs += step_m * stride_qs
+        Q_scale_ptr += 1
     return dk, dv
 
 # the main inner-loop logic for computing dQ
 # 固定处理 Q 和 dO 的一个块（形状为 BLOCK_Q2 × HEAD_DIM），然后迭代处理 K 和 V 的多个块
 @triton.jit
-def _attn_bwd_dq(dq, q, K, V, 
+def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, 
                  do, m, D,
                  # shared by Q/K/V/DO.
                  stride_qs, stride_qd, 
+                 q_scale, K_scale_ptr, V_scale_ptr, 
                  HEAD_NUM, SEQ_LEN, 
                  BLOCK_Q: tl.constexpr, 
                  BLOCK_KV: tl.constexpr, 
@@ -367,8 +367,8 @@ def _attn_bwd_dq(dq, q, K, V,
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
     offs_k = tl.arange(0, HEAD_DIM)
-    kT_ptrs = K + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
-    vT_ptrs = V + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
+    kT_ptrs = K_ptrs + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
+    vT_ptrs = V_ptrs + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
     # BLOCK_Q must be a multiple of BLOCK_KV, otherwise the code wouldn't work.
@@ -378,7 +378,9 @@ def _attn_bwd_dq(dq, q, K, V,
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
-        qk = tl.dot(q, kT)
+        k_scale = tl.load(K_scale_ptr)
+        v_scale = tl.load(K_scale_ptr)
+        qk = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
         p = tl.math.exp2(qk - m)
         # Autoregressive masking.
         if MASK:
@@ -386,232 +388,160 @@ def _attn_bwd_dq(dq, q, K, V,
             mask = (offs_m[:, None] >= offs_n[None, :])
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
-        dp = tl.dot(do, vT).to(tl.float32)
+        dp = tl.dot(do, vT.to(do.dtype)).to(tl.float32) * v_scale
         ds = p * (dp - Di[:, None])
-        # ds = ds.to(tl.float16)
-        ds = ds.to(kT.dtype) 
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        dq += tl.dot(ds, tl.trans(kT))
+        dq += tl.dot(ds, tl.trans(kT).to(ds.dtype)).to(tl.float32) * q_scale
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_qs
         vT_ptrs += step_n * stride_qs
+        K_scale_ptr += 1
+        V_scale_ptr += 1
     return dq
 
 @triton.jit
-def _attn_bwd_causal(Q, K, V,
-                    sm_scale, 
-                    DO, DQ, DK, DV, 
-                    LSE, D,
-                    # shared by Q/K/V/DO.
-                    stride_qb, stride_qh, stride_qs, stride_qd,
-                    HEAD_NUM, SEQ_LEN, GROUPS,
-                    BLOCK_Q1: tl.constexpr, 
-                    BLOCK_KV1: tl.constexpr, 
-                    BLOCK_Q2: tl.constexpr, 
-                    BLOCK_KV2: tl.constexpr, 
-                    BLK_SLICE_FACTOR: tl.constexpr, 
-                    HEAD_DIM: tl.constexpr):
+def _attn_bwd(Q, K, V,
+              Q_scale, K_scale, V_scale,
+              sm_scale, causal,
+              DO, DQ, DK, DV, 
+              LSE, D,
+              # shared by Q/K/V/DO.
+              stride_qb, stride_qh, stride_qs, stride_qd,
+              HEAD_NUM, SEQ_LEN, GROUPS,
+              BLOCK_Q1: tl.constexpr, BLOCK_KV1: tl.constexpr, 
+              BLOCK_Q2: tl.constexpr, BLOCK_KV2: tl.constexpr, 
+              BLK_SLICE_FACTOR: tl.constexpr, 
+              HEAD_DIM: tl.constexpr):
     pid = tl.program_id(0)
-    bhid = tl.program_id(1)
-    off_chz = (bhid * SEQ_LEN).to(tl.int64)
-    adj = (stride_qh * (bhid % HEAD_NUM) + stride_qb * (bhid // HEAD_NUM)).to(tl.int64)
+    off_h = tl.program_id(1).to(tl.int64)
+    off_b = tl.program_id(2).to(tl.int64)
+    adj = (stride_qh * off_b + stride_qb * off_h).to(tl.int64) 
+    off_ch = (off_b * HEAD_NUM * SEQ_LEN).to(tl.int64) # 计算当前 batch 在 LSE 和 D 中的起始内存偏移量，挪动 HEAD_NUM * SEQ_LEN 个元素
 
     # offset pointers for batch/head
-    Q += adj
-    K += adj
-    V += adj
-    DO += adj
-    DQ += adj
-    DK += adj
-    DV += adj
-    LSE += off_chz
-    D += off_chz
+    Q  += adj;  K  += adj;  V  += adj
+    DO += adj; DQ += adj; DK += adj; DV += adj
+    LSE += off_ch;  D += off_ch
 
     # load scales
     offs_k = tl.arange(0, HEAD_DIM)
 
     start_n = pid * BLOCK_KV1
-    start_m = start_n
-
-    MASK_BLOCK_Q1: tl.constexpr = BLOCK_Q1 // BLK_SLICE_FACTOR
     offs_n = start_n + tl.arange(0, BLOCK_KV1)
-
     dv = tl.zeros([BLOCK_KV1, HEAD_DIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_KV1, HEAD_DIM], dtype=tl.float32)
-
     # load K and V: they stay in SRAM throughout the inner loop.
     k = tl.load(K + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
     v = tl.load(V + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
 
-    num_steps = BLOCK_KV1 // MASK_BLOCK_Q1
+    q_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
+    k_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)  
+    v_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)
+    Q_scale_ptr = Q_scale + q_scale_offset
+    K_scale_ptr = K_scale + k_scale_offset
+    V_scale_ptr = V_scale + v_scale_offset
+    q_scale = tl.load(Q_scale_ptr + start_n)
+    k_scale = tl.load(K_scale_ptr + start_n)
+    v_scale = tl.load(V_scale_ptr + start_n)
 
-    dk, dv = _attn_bwd_dkdv(dk, dv, 
-                            Q, k, v, 
-                            sm_scale, 
-                            DO, LSE, D, 
-                            stride_qs, stride_qd, 
-                            HEAD_NUM, SEQ_LEN, 
-                            MASK_BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
-                            start_n, start_m, num_steps, 
-                            MASK=True 
-                            )
-
-    start_m += num_steps * MASK_BLOCK_Q1
-    num_steps = (SEQ_LEN - start_m) // BLOCK_Q1
-
-    # Compute dK and dV for non-masked blocks.
-    dk, dv = _attn_bwd_dkdv( 
-        dk, dv, 
-        Q, k, v, 
-        sm_scale, 
-        DO, LSE, D, 
-        stride_qs, stride_qd, 
-        HEAD_NUM, SEQ_LEN,
-        BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
-        start_n, start_m, num_steps, 
-        MASK=False
-    )
+    start_m = start_n
+    if causal:
+        MASK_BLOCK_Q1: tl.constexpr = BLOCK_Q1 // BLK_SLICE_FACTOR
+        num_steps = BLOCK_KV1 // MASK_BLOCK_Q1
+        dk, dv = _attn_bwd_dkdv(dk, dv, 
+                                Q, k, v, 
+                                DO, LSE, D, 
+                                stride_qs, stride_qd, 
+                                Q_scale_ptr, k_scale, v_scale,
+                                HEAD_NUM, SEQ_LEN, 
+                                MASK_BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
+                                start_n, start_m, num_steps, 
+                                MASK=True)
+                                
+        start_m += num_steps * MASK_BLOCK_Q1
+        num_steps = (SEQ_LEN - start_m) // BLOCK_Q1
+        dk, dv = _attn_bwd_dkdv(dk, dv, 
+                                Q, k, v, 
+                                DO, LSE, D, 
+                                stride_qs, stride_qd, 
+                                Q_scale_ptr, k_scale, v_scale,
+                                HEAD_NUM, SEQ_LEN, 
+                                BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
+                                start_n, start_m, num_steps, 
+                                MASK=False)
+    else:
+        num_steps = SEQ_LEN // BLOCK_Q1
+        dk, dv = _attn_bwd_dkdv(dk, dv, 
+                                Q, k, v, 
+                                DO, LSE, D, 
+                                stride_qs, stride_qd, 
+                                Q_scale_ptr, k_scale, v_scale,
+                                HEAD_NUM, SEQ_LEN, 
+                                BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
+                                start_n, 0, num_steps, 
+                                MASK=False)
+        
     dv_ptrs = DV + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
     tl.store(dv_ptrs, dv)
-
-    dk_ptrs = DK + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
-    dk = dk * sm_scale
-    tl.store(dk_ptrs, dk)
-
-    # THIS BLOCK DOES DQ:
-    start_m = pid * BLOCK_Q2
-    end_n = start_m + BLOCK_Q2
-
-    MASK_BLOCK_Q2: tl.constexpr = BLOCK_KV2 // BLK_SLICE_FACTOR
-    offs_m = start_m + tl.arange(0, BLOCK_Q2)
-
-    q = tl.load(Q + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd)
-    dq = tl.zeros([BLOCK_Q2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd)
-
-    m = tl.load(LSE + offs_m)
-    m = m[:, None]
-
-    # Compute dQ for masked (diagonal) blocks.
-    # NOTE: This code scans each row of QK^T backward (from right to left,
-    # but inside each call to _attn_bwd_dq, from left to right), but that's
-    # not due to anything important.  I just wanted to reuse the loop
-    # structure for dK & dV above as much as possible.
-    num_steps = BLOCK_Q2 // MASK_BLOCK_Q2
-    dq = _attn_bwd_dq(dq, q, K, V, 
-                      do, m, D, 
-                      stride_qs, stride_qd, 
-                      HEAD_NUM, SEQ_LEN, 
-                      BLOCK_Q2, MASK_BLOCK_Q2, HEAD_DIM, 
-                      start_m, end_n - num_steps * MASK_BLOCK_Q2, num_steps, 
-                      MASK=True 
-                      )
-    end_n -= num_steps * MASK_BLOCK_Q2
-    # stage 2
-    num_steps = end_n // BLOCK_KV2
-    dq = _attn_bwd_dq(dq, q, K, V, 
-                      do, m, D, 
-                      stride_qs, stride_qd, 
-                      HEAD_NUM, SEQ_LEN, 
-                      BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
-                      start_m, end_n - num_steps * BLOCK_KV2, num_steps, 
-                      MASK=False 
-                      )
-    # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
-    dq = dq * LN2
-    tl.store(dq_ptrs, dq)
-
-
-@triton.jit
-def _attn_bwd_nomask(Q, K, V,
-                    sm_scale, 
-                    DO, DQ, DK, DV, 
-                    LSE, D,
-                    # shared by Q/K/V/DO.
-                    stride_qb, stride_qh, stride_qs, stride_qd,
-                    HEAD_NUM, SEQ_LEN, GROUPS,
-                    BLOCK_Q1: tl.constexpr, 
-                    BLOCK_KV1: tl.constexpr, 
-                    BLOCK_Q2: tl.constexpr, 
-                    BLOCK_KV2: tl.constexpr, 
-                    BLK_SLICE_FACTOR: tl.constexpr, 
-                    HEAD_DIM: tl.constexpr):
-    pid = tl.program_id(0)
-    bhid = tl.program_id(1)
-    off_chz = (bhid * SEQ_LEN).to(tl.int64)
-    adj = (stride_qh * (bhid % HEAD_NUM) + stride_qb * (bhid // HEAD_NUM)).to(tl.int64)
-
-    # offset pointers for batch/head
-    Q += adj
-    K += adj
-    V += adj
-    DO += adj
-    DQ += adj
-    DK += adj
-    DV += adj
-    LSE += off_chz
-    D += off_chz
-
-    # load scales
-    offs_k = tl.arange(0, HEAD_DIM)
-
-    start_n = pid * BLOCK_KV1
-    offs_n = start_n + tl.arange(0, BLOCK_KV1)
-
-    dv = tl.zeros([BLOCK_KV1, HEAD_DIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_KV1, HEAD_DIM], dtype=tl.float32)
-
-    # load K and V
-    k = tl.load(K + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
-    v = tl.load(V + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
-
-    num_steps = SEQ_LEN // BLOCK_Q1
-    dk, dv = _attn_bwd_dkdv( 
-        dk, dv, 
-        Q, k, v, 
-        sm_scale, 
-        DO, LSE, D, 
-        stride_qs, stride_qd, 
-        HEAD_NUM, SEQ_LEN,
-        BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
-        start_n, 0, num_steps, 
-        MASK=False
-    )
-
-    dv_ptrs = DV + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
-    tl.store(dv_ptrs, dv)
-
     dk_ptrs = DK + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
     dk = dk * sm_scale
     tl.store(dk_ptrs, dk)
 
     start_m = pid * BLOCK_Q2
     offs_m = start_m + tl.arange(0, BLOCK_Q2)
-
     q = tl.load(Q + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd)
     dq = tl.zeros([BLOCK_Q2, HEAD_DIM], dtype=tl.float32)
     do = tl.load(DO + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd)
 
     m = tl.load(LSE + offs_m)
     m = m[:, None]
-
-    num_steps = SEQ_LEN // BLOCK_KV2
-    dq = _attn_bwd_dq(dq, q, K, V, 
-                      do, m, D, 
-                      stride_qs, stride_qd, 
-                      HEAD_NUM, SEQ_LEN, 
-                      BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
-                      start_m, 0, num_steps,  
-                      MASK=False 
-                      )
-
+    if causal:
+        end_n = start_m + BLOCK_Q2
+        MASK_BLOCK_Q2: tl.constexpr = BLOCK_KV2 // BLK_SLICE_FACTOR
+        num_steps = BLOCK_Q2 // MASK_BLOCK_Q2
+        dq = _attn_bwd_dq(dq, q, K, V, 
+                          do, m, D, 
+                          stride_qs, stride_qd, 
+                          q_scale, K_scale_ptr, V_scale_ptr,
+                          HEAD_NUM, SEQ_LEN, 
+                          BLOCK_Q2, MASK_BLOCK_Q2, HEAD_DIM, 
+                          start_m, end_n - num_steps * MASK_BLOCK_Q2, num_steps, 
+                          MASK=True)
+                        
+        end_n -= num_steps * MASK_BLOCK_Q2
+        num_steps = end_n // BLOCK_KV2
+        dq = _attn_bwd_dq(dq, q, K, V, 
+                          do, m, D, 
+                          stride_qs, stride_qd, 
+                          q_scale, K_scale_ptr, V_scale_ptr,
+                          HEAD_NUM, SEQ_LEN, 
+                          BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
+                          start_m, end_n - num_steps * BLOCK_KV2, num_steps, 
+                          MASK=False)
+    else:
+        num_steps = SEQ_LEN // BLOCK_KV2
+        dq = _attn_bwd_dq(dq, q, K, V, 
+                          do, m, D, 
+                          stride_qs, stride_qd, 
+                          q_scale, K_scale_ptr, V_scale_ptr,
+                          HEAD_NUM, SEQ_LEN, 
+                          BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
+                          start_m, 0, num_steps,  
+                          MASK=False) 
+                               
     dq_ptrs = DQ + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
     dq = dq * LN2
     tl.store(dq_ptrs, dq)
 
+QUANT_CONFIG = {
+    "int8": (0, torch.int8),
+    "e4m3": (1, torch.float8_e4m3fn),
+    "e5m2": (2, torch.float8_e5m2),
+    "none": (3, torch.int8)
+}
+    
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx,
@@ -620,14 +550,8 @@ class _attention(torch.autograd.Function):
                 output_dtype=torch.float16, 
                 causal=False,
                 quant_type="int8"):
-        BLOCK_Q = 128
-        BLOCK_KV = 64
-        QUANT_CONFIG = {
-            "int8": (0, torch.int8),
-            "e4m3": (1, torch.float8_e4m3fn),
-            "e5m2": (2, torch.float8_e5m2),
-            "none": (3, torch.int8)
-        }
+        BLOCK_Q, BLOCK_KV, = 128, 64
+
         try:
             quant_code, quant_dtype = QUANT_CONFIG[quant_type]
         except KeyError:
@@ -636,9 +560,8 @@ class _attention(torch.autograd.Function):
         BATCH, HEAD_N_Q, SEQ_Q, HEAD_DIM_Q = q.shape
         _, HEAD_N_K, SEQ_KV, HEAD_DIM_K = k.shape
         HEAD_DIM_V = v.shape[-1] 
-        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {64, 128, 256}
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
+        assert HEAD_DIM_K in {64, 128, 256}
             
         q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
         k_quant = torch.empty(k.shape, dtype=quant_dtype, device=k.device)
@@ -733,21 +656,68 @@ class _attention(torch.autograd.Function):
         assert do.is_contiguous()
         # assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         # print("SHAPE: ", q.shape, k.shape, v.shape, o.shape, do.shape)
-
+        # FP 16 
+        #! dq 对 e4m3 支持不好，首先试试e5m2 q k v（qk 和 v的quant type可以不一样）
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
 
         BATCH, HEAD_N_Q, SEQ_Q, HEAD_DIM_Q = q.shape
-        _, HEAD_N_K, _, HEAD_DIM_K = k.shape
+        _, HEAD_N_K, SEQ_KV, HEAD_DIM_K = k.shape
         PRE_BLOCK_Q = 128
-        GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
-        #! 前向反向的quant scale block size 对齐
-        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
-
-        k = k * (ctx.sm_scale * RCP_LN2) 
         assert SEQ_Q % PRE_BLOCK_Q == 0
+        GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
+        assert HEAD_DIM_K in {64, 128, 256}
+        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
+        BLK_SLICE_FACTOR = 2
+        
+        quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
+        q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
+        k_quant = torch.empty(k.shape, dtype=quant_dtype, device=k.device)
+        v_quant = torch.empty(v.shape, dtype=quant_dtype, device=v.device)
+        q_scale = torch.empty((BATCH, HEAD_N_Q, (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2), device=q.device, dtype=torch.float32)
+        k_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=k.device, dtype=torch.float32)
+        v_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=v.device, dtype=torch.float32)
+        
+        k = k * (ctx.sm_scale * RCP_LN2) 
+
+        grid_q = (triton.cdiv(SEQ_Q, BLOCK_Q2), HEAD_N_Q, BATCH)
+        quant_per_block[grid_q](
+            q, q_quant, q_scale,
+            q.stride(0), q.stride(1), q.stride(2),
+            q_quant.stride(0), q_quant.stride(1), q_quant.stride(2),
+            q_scale.stride(0), q_scale.stride(1),
+            sm_scale=1.0,
+            HEAD_DIM=HEAD_DIM_Q,
+            SEQ_LEN=SEQ_Q,
+            BLOCK=BLOCK_Q2,
+            QUANT_TYPE=quant_code
+        )
+
+        grid_kv = (triton.cdiv(SEQ_KV, BLOCK_KV2), HEAD_N_K, BATCH)
+        quant_per_block[grid_kv](
+            k, k_quant, k_scale,
+            k.stride(0), k.stride(1), k.stride(2),
+            k_quant.stride(0), k_quant.stride(1), k_quant.stride(2),
+            k_scale.stride(0), k_scale.stride(1),
+            sm_scale=1.0,
+            HEAD_DIM=HEAD_DIM_K,
+            SEQ_LEN=SEQ_KV,
+            BLOCK=BLOCK_KV2,
+            QUANT_TYPE=quant_code
+        )
+        quant_per_block[grid_kv](
+            v, v_quant, v_scale,
+            v.stride(0), v.stride(1), v.stride(2),
+            v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
+            v_scale.stride(0), v_scale.stride(1),
+            sm_scale=1.0,
+            HEAD_DIM=HEAD_DIM_K,
+            SEQ_LEN=SEQ_KV,
+            BLOCK=BLOCK_KV2,
+            QUANT_TYPE=quant_code
+        )
+
         pre_grid = (SEQ_Q // PRE_BLOCK_Q, BATCH * HEAD_N_Q)
         delta = torch.empty_like(lse)
         _attn_bwd_preprocess[pre_grid](
@@ -756,38 +726,25 @@ class _attention(torch.autograd.Function):
             BATCH, HEAD_N_Q, SEQ_Q, 
             BLOCK_Q=PRE_BLOCK_Q, HEAD_DIM=HEAD_DIM_Q 
         )
+
         # NUM_WARPS, NUM_STAGES = 4, 5
-        grid = (SEQ_Q // BLOCK_KV1, BATCH * HEAD_N_Q, 1)
-        if ctx.causal:
-            _attn_bwd_causal[grid](
-                q, k, v, 
-                ctx.sm_scale, 
-                do, dq, dk, dv, 
-                lse, delta, 
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3), 
-                HEAD_N_Q, SEQ_Q, GROUPS,
-                BLOCK_Q1=BLOCK_Q1, BLOCK_KV1=BLOCK_KV1, 
-                BLOCK_Q2=BLOCK_Q2, BLOCK_KV2=BLOCK_KV2, 
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, 
-                HEAD_DIM=HEAD_DIM_K, 
-                # num_warps=4 if HEAD_DIM_K == 64 else 8,
-                # num_stages=3 if HEAD_DIM_K == 64 else 2
-            )
-        else:
-            _attn_bwd_nomask[grid](
-                q, k, v, 
-                ctx.sm_scale, 
-                do, dq, dk, dv, 
-                lse, delta, 
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3), 
-                HEAD_N_Q, SEQ_Q, GROUPS,
-                BLOCK_Q1=BLOCK_Q1, BLOCK_KV1=BLOCK_KV1, 
-                BLOCK_Q2=BLOCK_Q2, BLOCK_KV2=BLOCK_KV2, 
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, 
-                HEAD_DIM=HEAD_DIM_K, 
-                # num_warps=4 if HEAD_DIM_K == 64 else 8,
-                # num_stages=3 if HEAD_DIM_K == 64 else 2
-            )
+        grid = (SEQ_Q // BLOCK_KV1, HEAD_N_Q, BATCH)
+        _attn_bwd[grid](
+            q_quant, k_quant, v_quant, 
+            q_scale, k_scale, v_scale,
+            ctx.sm_scale, 
+            ctx.causal,
+            do, dq, dk, dv, 
+            lse, delta, 
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), 
+            HEAD_N_Q, SEQ_Q, GROUPS,
+            BLOCK_Q1=BLOCK_Q1, BLOCK_KV1=BLOCK_KV1, 
+            BLOCK_Q2=BLOCK_Q2, BLOCK_KV2=BLOCK_KV2, 
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, 
+            HEAD_DIM=HEAD_DIM_K, 
+            num_warps=4 if HEAD_DIM_K == 64 else 8,
+            num_stages=3 if HEAD_DIM_K == 64 else 2
+        )
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
@@ -797,5 +754,3 @@ class _attention(torch.autograd.Function):
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):
     return _attention.apply(q, k, v, sm_scale, output_dtype, causal, quant_type)
-
-# TODO Flash FWD + Sage BWD / Flash BWD
