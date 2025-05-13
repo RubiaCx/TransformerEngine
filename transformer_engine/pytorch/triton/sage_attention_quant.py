@@ -36,6 +36,8 @@ def quant_per_block(Input, Output, Scale,
     x *= sm_scale
 
     if QUANT_TYPE == 0 or QUANT_TYPE == 3:  # int8
+        # min_scale = 1e-4  # 防止scale太小
+        # scale = tl.maximum(tl.max(tl.abs(x)) / 127., min_scale)
         scale = tl.max(tl.abs(x)) / 127. + 1e-8
         x_quant = x / (tl.max(tl.abs(x)) / 127.0 + 1e-8)
         x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
@@ -262,7 +264,7 @@ def _attn_fwd(Q, K, V,
                                                   q_scale, K_scale_ptr, V_scale_ptr, 
                                                   HEAD_DIM, SEQ_KV, GROUPS,
                                                   BLOCK_Q, BLOCK_KV, 
-                                                  4 - STAGE, offs_m, offs_n,  QUANT_TYPE)
+                                                  4 - STAGE, offs_m, offs_n, QUANT_TYPE)
         if STAGE & 2: # 2 or 3
             acc, l_i, m_i = _attn_fwd_inner_quant(acc, l_i, m_i, q, K_ptrs, V_ptrs, 
                                                   stride_ks, stride_vs, start_m, 
@@ -309,7 +311,7 @@ def _attn_bwd_dkdv(dk, dv,
                    HEAD_DIM: tl.constexpr, 
                    # Filled in by the wrapper.
                    start_n, start_m, num_steps, 
-                   MASK: tl.constexpr):
+                   MASK: tl.constexpr, QUANT_TYPE: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -329,17 +331,29 @@ def _attn_bwd_dkdv(dk, dv,
         lse = tl.load(LSE + offs_m)
         qkT = tl.dot(k, qT).to(tl.float32) * q_scale * k_scale
         pT = tl.math.exp2(qkT - lse[None, :])
-        # Autoregressive masking.
+
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
-        # Compute dV.
-        dv += tl.dot(pT, do.to(tl.float32)) * do_scale
+        # Quant pT & Compute dV
+        if QUANT_TYPE == 0:  # int8
+            pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
+            pT_quant = (pT / pT_scale + 0.5 * tl.where(pT >= 0, 1, -1)).to(tl.int8)
+        elif QUANT_TYPE == 1:  # e4m3
+            pT_scale = tl.max(tl.abs(pT)) / 448. + 1e-8
+            pT_quant = (pT / pT_scale).to(tl.float8e4nv)
+        elif QUANT_TYPE == 2:  # e5m2
+            pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
+            pT_quant = (pT / pT_scale).to(tl.float8e5)
+        else:
+            tl.static_assert(False, "Unsupported quant type")
+
+        dv += tl.dot(pT_quant, do) * do_scale * pT_scale
+
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
-        # TODO bmm2 和 bmm1 的 bwd gemm 都是 fp 8
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) * v_scale * do_scale
         dsT = pT * (dpT - Di[None, :])
         dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale 
@@ -365,7 +379,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
                  HEAD_DIM: tl.constexpr,
                  # Filled in by the wrapper.
                  start_m, start_n, num_steps, 
-                 MASK: tl.constexpr):
+                 MASK: tl.constexpr, QUANT_TYPE: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -381,7 +395,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
         k_scale = tl.load(K_scale_ptr)
-        v_scale = tl.load(K_scale_ptr)
+        v_scale = tl.load(V_scale_ptr)
         qk = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
         p = tl.math.exp2(qk - lse)
         # Autoregressive masking.
@@ -393,7 +407,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         dp = tl.dot(do, vT).to(tl.float32) * do_scale * v_scale 
         ds = p * (dp - Di[:, None])
         # Compute dQ.
-        dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * q_scale # ?
+        dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_qs
@@ -413,7 +427,7 @@ def _attn_bwd(Q, K, V, DO,
               BLOCK_Q1: tl.constexpr, BLOCK_KV1: tl.constexpr, 
               BLOCK_Q2: tl.constexpr, BLOCK_KV2: tl.constexpr, 
               BLK_SLICE_FACTOR: tl.constexpr, 
-              HEAD_DIM: tl.constexpr):
+              HEAD_DIM: tl.constexpr, QUANT_TYPE: tl.constexpr):
     pid = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
     off_b = tl.program_id(2).to(tl.int64)
@@ -461,7 +475,7 @@ def _attn_bwd(Q, K, V, DO,
                                 HEAD_NUM, SEQ_LEN, 
                                 MASK_BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
-                                MASK=True)
+                                MASK=True, QUANT_TYPE=QUANT_TYPE)
                                 
         start_m += num_steps * MASK_BLOCK_Q1
         num_steps = (SEQ_LEN - start_m) // BLOCK_Q1
@@ -473,7 +487,7 @@ def _attn_bwd(Q, K, V, DO,
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
-                                MASK=False)
+                                MASK=False, QUANT_TYPE=QUANT_TYPE)
     else:
         num_steps = SEQ_LEN // BLOCK_Q1
         dk, dv = _attn_bwd_dkdv(dk, dv, 
@@ -484,7 +498,7 @@ def _attn_bwd(Q, K, V, DO,
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, 0, num_steps, 
-                                MASK=False)
+                                MASK=False, QUANT_TYPE=QUANT_TYPE)
         
     dv_ptrs = DV + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
     tl.store(dv_ptrs, dv)
@@ -511,7 +525,7 @@ def _attn_bwd(Q, K, V, DO,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, MASK_BLOCK_Q2, HEAD_DIM, 
                           start_m, end_n - num_steps * MASK_BLOCK_Q2, num_steps, 
-                          MASK=True)
+                          MASK=True, QUANT_TYPE=QUANT_TYPE)
                         
         end_n -= num_steps * MASK_BLOCK_Q2
         num_steps = end_n // BLOCK_KV2
@@ -522,7 +536,7 @@ def _attn_bwd(Q, K, V, DO,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, end_n - num_steps * BLOCK_KV2, num_steps, 
-                          MASK=False)
+                          MASK=False, QUANT_TYPE=QUANT_TYPE)
     else:
         num_steps = SEQ_LEN // BLOCK_KV2
         dq = _attn_bwd_dq(dq, q, K, V, do,
@@ -532,7 +546,7 @@ def _attn_bwd(Q, K, V, DO,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, 0, num_steps,  
-                          MASK=False) 
+                          MASK=False, QUANT_TYPE=QUANT_TYPE)
                                
     dq_ptrs = DQ + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
     dq = dq * LN2
@@ -675,7 +689,7 @@ class _attention(torch.autograd.Function):
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
         BLK_SLICE_FACTOR = 2
         
-        quant_code, quant_dtype = QUANT_CONFIG["int8"]
+        quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
         q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
         do_quant = torch.empty(do.shape, dtype=quant_dtype, device=do.device)
         k_quant = torch.empty(k.shape, dtype=quant_dtype, device=k.device)
@@ -756,6 +770,7 @@ class _attention(torch.autograd.Function):
             BLOCK_Q2=BLOCK_Q2, BLOCK_KV2=BLOCK_KV2, 
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, 
             HEAD_DIM=HEAD_DIM_K, 
+            QUANT_TYPE=quant_code, 
             num_warps=4 if HEAD_DIM_K == 64 else 8,
             num_stages=3 if HEAD_DIM_K == 64 else 2
         )
