@@ -323,20 +323,22 @@ def _attn_bwd_dkdv(dk, dv,
     curr_m = start_m
     step_m = BLOCK_Q
     for blk_idx in range(num_steps):
+        qT = tl.load(qT_ptrs) 
+        do = tl.load(do_ptrs)
+        lse = tl.load(LSE + offs_m) # Load lse before computing qk to reduce pipeline stall.
         q_scale = tl.load(Q_scale_ptr)
         do_scale = tl.load(DO_scale_ptr)
-        qT = tl.load(qT_ptrs) 
-        # Load lse before computing qk to reduce pipeline stall.
+        
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
-        lse = tl.load(LSE + offs_m)
+
         qkT = tl.dot(k, qT).to(tl.float32) * q_scale * k_scale
         pT = tl.math.exp2(qkT - lse[None, :])
 
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
-        do = tl.load(do_ptrs)
-        # Quant pT & Compute dV
+        
+        # 2 Quant pT & Compute dV
         if QUANT_TYPE == 0:  # int8
             pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
             pT_quant = (pT / pT_scale + 0.5 * tl.where(pT >= 0, 1, -1)).to(tl.int8)
@@ -351,12 +353,16 @@ def _attn_bwd_dkdv(dk, dv,
 
         dv += tl.dot(pT_quant, do) * do_scale * pT_scale
 
-        # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
-        # Compute dP and dS.
+        # 2 dP
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) * v_scale * do_scale
-        dsT = pT * (dpT - Di[None, :])
-        dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale 
+        Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
+        # 1 dK
+        dsT = (pT * (dpT - Di[None, :])).to(tl.float16)
+        # dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale 
+        qT = tl.trans(qT).to(tl.float16)
+        acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+        dk += tl.dot(dsT, qT, acc) * q_scale
+
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qs
@@ -403,11 +409,15 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
             offs_n = curr_n + tl.arange(0, BLOCK_KV)
             mask = (offs_m[:, None] >= offs_n[None, :])
             p = tl.where(mask, p, 0.0)
-        # Compute dP and dS.
+        # 2 dP
         dp = tl.dot(do, vT).to(tl.float32) * do_scale * v_scale 
-        ds = p * (dp - Di[:, None])
-        # Compute dQ.
-        dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
+        # 1 dQ
+        ds = (p * (dp - Di[:, None])).to(tl.float16)
+        # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
+        kT = tl.trans(kT).to(tl.float16)
+        acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+        dq += tl.dot(ds, kT, acc) * k_scale
+
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_qs
