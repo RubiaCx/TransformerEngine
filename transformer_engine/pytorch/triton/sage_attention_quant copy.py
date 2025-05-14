@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 RCP_LN2: tl.constexpr = 1.4426950408889634 # exp(x) = exp2(x * log2(e)) = exp2(x / ln(2)) = exp2(x * RCP_LN2)
 LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-MIN_SCALE: tl.constexpr = 1e-4
 
 @triton.jit
 def quant_per_block(Input, Output, Scale, 
@@ -38,17 +37,15 @@ def quant_per_block(Input, Output, Scale,
 
     if QUANT_TYPE == 0 or QUANT_TYPE == 3:  # int8
         # min_scale = 1e-4  # 防止scale太小
-        # scale = tl.max(tl.abs(x)) / 127. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 127., MIN_SCALE)
+        # scale = tl.maximum(tl.max(tl.abs(x)) / 127., min_scale)
+        scale = tl.max(tl.abs(x)) / 127. + 1e-8
         x_quant = x / (tl.max(tl.abs(x)) / 127.0 + 1e-8)
         x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
     elif QUANT_TYPE == 1:  # e4m3
-        # scale = tl.max(tl.abs(x)) / 448. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 448., MIN_SCALE)
+        scale = tl.max(tl.abs(x)) / 448. + 1e-8
         x_quant = (x / scale).to(tl.float8e4nv)
     elif QUANT_TYPE == 2:  # e5m2
-        # scale = tl.max(tl.abs(x)) / 57344. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 57344., MIN_SCALE)
+        scale = tl.max(tl.abs(x)) / 57344. + 1e-8
         x_quant = (x / scale).to(tl.float8e5)
     else:
         tl.static_assert(False, "Unsupported quant type")
@@ -342,16 +339,13 @@ def _attn_bwd_dkdv(dk, dv,
         
         # 2 Quant pT & Compute dV
         if QUANT_TYPE == 0:  # int8
-            # pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
-            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 127., MIN_SCALE)
+            pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
             pT_quant = (pT / pT_scale + 0.5 * tl.where(pT >= 0, 1, -1)).to(tl.int8)
         elif QUANT_TYPE == 1:  # e4m3
-            # pT_scale = tl.max(tl.abs(pT)) / 448.  + 1e-8
-            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 448.,  MIN_SCALE)
+            pT_scale = tl.max(tl.abs(pT)) / 448. + 1e-8
             pT_quant = (pT / pT_scale).to(tl.float8e4nv)
         elif QUANT_TYPE == 2:  # e5m2
-            # pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
-            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 57344., MIN_SCALE)
+            pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
             pT_quant = (pT / pT_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
@@ -419,10 +413,10 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         dp = tl.dot(do, vT).to(tl.float32) * do_scale * v_scale 
         # 1 dQ
         ds = (p * (dp - Di[:, None])).to(tl.float16)
+        # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
         kT = tl.trans(kT).to(tl.float16)
         acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
-        dq += tl.dot(ds, kT, acc) * q_scale
-        # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
+        dq += tl.dot(ds, kT, acc) * k_scale
 
         # Increment pointers.
         curr_n += step_n
@@ -583,7 +577,7 @@ class _attention(torch.autograd.Function):
                 output_dtype=torch.float16, 
                 causal=False,
                 quant_type="int8"):
-        BLOCK_Q, BLOCK_KV, = 128, 128
+        BLOCK_Q, BLOCK_KV, = 128, 64
 
         try:
             quant_code, quant_dtype = QUANT_CONFIG[quant_type]
@@ -673,10 +667,12 @@ class _attention(torch.autograd.Function):
             QUANT_TYPE=quant_code, 
             **extra_kern_args)
         ctx.save_for_backward(q, k, v, o, lse) # 对齐  exp2/log2 
-        ctx.sm_scale = sm_scale
-        ctx.causal = causal
         lse = lse * LN2
         lse = lse + lse_correction * sm_scale
+
+        ctx.sm_scale = sm_scale
+        ctx.causal = causal
+
         return o, lse
 
     @staticmethod
@@ -686,7 +682,8 @@ class _attention(torch.autograd.Function):
         do, q, k, v, o = [maybe_contiguous(x) for x in (do, q, k, v, o)]
         assert do.is_contiguous()
         # assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        print("SHAPE: ", q.shape, k.shape, v.shape, o.shape, do.shape)
+        # print("SHAPE: ", q.shape, k.shape, v.shape, o.shape, do.shape)
+        # FP 16 
         #! dq 对 e4m3 支持不好，首先试试e5m2 q k v（qk 和 v的quant type可以不一样）
         # TODO bmm2 fp8 gemm , bmm1 fp16 gemm ->  bmm2 + bmm1 fp8 gemm
         # TODO softmax input grad dynamic quant
@@ -699,7 +696,7 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK_Q = 128
         assert SEQ_Q % PRE_BLOCK_Q == 0
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
-        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 128, 128, 128, 128
+        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
         BLK_SLICE_FACTOR = 2
         # TODO 不量化 dv，量化 dq和dk
         quant_code, quant_dtype = QUANT_CONFIG["e4m3"]

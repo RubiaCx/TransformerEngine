@@ -41,3 +41,4 @@ develop-eggs/
 dist/
 downloads/
 .pytest_cache/
+visualization_results/

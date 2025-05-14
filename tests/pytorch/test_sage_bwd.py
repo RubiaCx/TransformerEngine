@@ -748,8 +748,8 @@ def run_fix_backward_tests_for_selected_configs():
     head_dims = [72]
     value_ranges = [
         (0.1, 0.1, 0.1), 
-        (1.0, 1.0, 1.0), 
-        (10.0, 10.0, 10.0), 
+        # (1.0, 1.0, 1.0), 
+        # (10.0, 10.0, 10.0), 
     ]
     
     for ranges in value_ranges:

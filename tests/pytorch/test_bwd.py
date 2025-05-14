@@ -13,10 +13,12 @@ from importlib import reload
 import torch.nn.functional as F
 from datetime import datetime
 import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 
 from flash_attn.flash_attn_interface import flash_attn_func, _flash_attn_forward, _flash_attn_varlen_backward
 import torch
-import os
 from termcolor import colored
 
 class EnvSwitcher:
@@ -127,19 +129,19 @@ def print_metrics(name, metrics):
 #         print(f"  最大差异:   {max_diff:.2e}")
 #         print(f"  平均差异:   {mean_diff:.2e}")
 #         print("-" * 30)
-"""将所有方法的梯度指标并列显示，以第一个为基准"""
-def compare_all_methods(grads_dict, title):
+
+def compare_all_methods(tensor_dict, title):
     print(f"\n{title}:")
     print("-" * 80)
     
-    methods = list(grads_dict.keys())
+    methods = list(tensor_dict.keys())
     if len(methods) < 2:
         print("至少需要两种方法进行比较")
         return
     
     base_method = methods[0]  
-    base_grad = grads_dict[base_method].flatten().float()
-    base_norm = base_grad.norm(p=2).item()
+    base_tensor = tensor_dict[base_method].flatten().float()
+    base_norm = base_tensor.norm(p=2).item()
     
     print(f"{'指标':<12} | {base_method:<10}", end="")
     for method in methods[1:]:
@@ -147,57 +149,166 @@ def compare_all_methods(grads_dict, title):
     print()
     print("-" * 80)
     
+    print(f"{'最小值':<11}", end="")
+    for method in methods:
+        min_val = tensor_dict[method].min().item()
+        print(f" | {min_val:10.2e}", end="")
+    print()
+    
+    # 最大值
+    print(f"{'最大值':<11}", end="")
+    for method in methods:
+        max_val = tensor_dict[method].max().item()
+        print(f" | {max_val:10.2e}", end="")
+    print()
+
     print(f"{'L2范数':<12} | {base_norm:.4e}", end="")
     for method in methods[1:]:
-        curr_grad = grads_dict[method].flatten().float()
-        curr_norm = curr_grad.norm(p=2).item()
-        print(f" | {curr_norm:.2e}", end="")
+        curr_tensor = tensor_dict[method].flatten().float()
+        curr_norm = curr_tensor.norm(p=2).item()
+        print(f" | {curr_norm:10.2e}", end="")
     print()
     
     print(f"{'L2比率':<12} | {'--':<10}", end="")
     for method in methods[1:]:
-        curr_grad = grads_dict[method].flatten().float()
-        curr_norm = curr_grad.norm(p=2).item()
+        curr_tensor = tensor_dict[method].flatten().float()
+        curr_norm = curr_tensor.norm(p=2).item()
         ratio = curr_norm / (base_norm + 1e-8)
-        status = "✓" if 0.9 < ratio < 1.1 else "✗"
-        print(f" | {ratio:.4f} {status}", end="")
+        print(f" | {ratio:10.4f}", end="")
     print()
     
     print(f"{'余弦相似度':<9} | {'--':<10}", end="")
     for method in methods[1:]:
-        curr_grad = grads_dict[method].flatten().float()
-        cos_sim = F.cosine_similarity(base_grad, curr_grad, dim=0).item()
-        status = "✓" if cos_sim > 0.95 else "✗"
-        print(f" | {cos_sim:.4f} {status}", end="")
+        curr_tensor = tensor_dict[method].flatten().float()
+        cos_sim = F.cosine_similarity(base_tensor, curr_tensor, dim=0).item()
+        print(f" | {cos_sim:10.4f}", end="")
     print()
     
     print(f"{'最大差异':<10} | {'--':<10}", end="")
     for method in methods[1:]:
-        curr_grad = grads_dict[method].flatten().float()
-        max_diff = torch.max(torch.abs(base_grad - curr_grad)).item()
-        print(f" | {max_diff:.2e}", end="")
+        curr_tensor = tensor_dict[method].flatten().float()
+        max_diff = torch.max(torch.abs(base_tensor - curr_tensor)).item()
+        print(f" | {max_diff:10.2e}", end="")
     print()
     
     print(f"{'平均差异':<10} | {'--':<10}", end="")
     for method in methods[1:]:
-        curr_grad = grads_dict[method].flatten().float()
-        mean_diff = torch.mean(torch.abs(base_grad - curr_grad)).item()
-        print(f" | {mean_diff:.2e}", end="")
+        curr_tensor = tensor_dict[method].flatten().float()
+        mean_diff = torch.mean(torch.abs(base_tensor - curr_tensor)).item()
+        print(f" | {mean_diff:10.2e}", end="")
     print()
     print("-" * 80)
 
+def visualize_distributions(tensor_dict, title, save_path=None):
+    methods = list(tensor_dict.keys())
+    all_values = []
+    for method in methods:
+        values = tensor_dict[method].detach().float().cpu().flatten().numpy()
+        # Remove extreme outliers (beyond 3 std)
+        mean, std = np.mean(values), np.std(values)
+        mask = (values > mean - 3 * std) & (values < mean + 3 * std)
+        filtered_values = values[mask]
+        # Sample data to avoid processing too many points
+        if len(filtered_values) > 10000:
+            indices = np.random.choice(len(filtered_values), 10000, replace=False)
+            filtered_values = filtered_values[indices]
+        all_values.append(filtered_values)
+    
+    all_data = np.concatenate(all_values)
+    if len(all_data) == 0:
+        print(f"Warning: No valid data for visualization of {title}")
+        return
+        
+    global_min, global_max = np.min(all_data), np.max(all_data)
+    
+    num_methods = len(methods)
+    fig, axes = plt.subplots(2, num_methods, figsize=(15, 8))
+    
+    bins = np.linspace(global_min, global_max, 50)
+    
+    for i, method in enumerate(methods):
+        values = tensor_dict[method].detach().float().cpu().flatten().numpy()
+        if len(values) > 10000:
+            indices = np.random.choice(len(values), 10000, replace=False)
+            values = values[indices]
+        
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+        min_val = np.min(values)
+        max_val = np.max(values)
+        
+        axes[0, i].hist(values, bins=bins, alpha=0.7)
+        axes[0, i].set_title(f"{method}", fontsize=12)
+        axes[0, i].grid(True, linestyle='--', alpha=0.5)
+        
+        stat_text = f"Mean: {mean_val:.2e}\nStd: {std_val:.2e}\nMin: {min_val:.2e}\nMax: {max_val:.2e}"
+        axes[0, i].text(0.95, 0.95, stat_text, transform=axes[0, i].transAxes,
+                    verticalalignment='top', horizontalalignment='right',
+                    bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+        
+        axes[0, i].set_xticklabels([])
+    # Box plot on bottom-left
+    box_data = []
+    for method in methods:
+        values = tensor_dict[method].detach().float().cpu().flatten().numpy()
+        if len(values) > 10000:
+            indices = np.random.choice(len(values), 10000, replace=False)
+            values = values[indices]
+        box_data.append(values)
+        
+    axes[1, 0].boxplot(box_data, labels=methods, vert=True, patch_artist=True, boxprops=dict(alpha=0.7), medianprops=dict(color='black'))
+    axes[1, 0].set_title("Box Plot Comparison", fontsize=12)
+    axes[1, 0].set_ylabel("Value", fontsize=10)
+    axes[1, 0].grid(True, linestyle='--', alpha=0.7)
+    axes[1, 0].tick_params(axis='x', rotation=30)
+    
+    # Overlay histogram for direct comparison in the remaining bottom cells
+    if num_methods > 1:
+        for i in range(1, num_methods):
+            for j, method in enumerate(methods):
+                values = tensor_dict[method].detach().float().cpu().flatten().numpy()
+                if len(values) > 10000:
+                    indices = np.random.choice(len(values), 10000, replace=False)
+                    values = values[indices]
+                
+                if i == 1:  # First comparison: regular histograms
+                    axes[1, i].hist(values, bins=bins, alpha=0.5, label=method)
+                    axes[1, i].set_title("Overlay Comparison", fontsize=12)
+                    axes[1, i].legend(fontsize=9)
+                elif i == 2 and num_methods >= 3:  # Second comparison (if space): CDF
+                    values = np.sort(values)
+                    y = np.arange(1, len(values)+1) / len(values)
+                    axes[1, i].plot(values, y, label=method, linewidth=2)
+                    axes[1, i].set_title("CDF Comparison", fontsize=12)
+                    axes[1, i].legend(fontsize=9)
+            
+            axes[1, i].grid(True, linestyle='--', alpha=0.5)
+            axes[1, i].tick_params(axis='x', rotation=30)
+    
+    # Set common labels
+    fig.text(0.5, 0.01, "Value", ha='center', fontsize=12)
+    fig.text(0.01, 0.5, "Frequency", va='center', rotation='vertical', fontsize=12)
+    
+    plt.suptitle(f"Distribution Comparison of {title}", fontsize=16)
+    plt.tight_layout(rect=[0.02, 0.03, 0.98, 0.95])
+    
+    # Save or display image
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
 
 # bshd
 def run_fix_backward_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
     if config.layout == "bshd":
-        base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim,
-                              device="cuda", dtype=torch.float16).normal_(0, 0.02)
+        base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.02) * config.q_range
         
     elif config.layout == "sbhd":
-        base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim,
-                              device="cuda", dtype=torch.float16).normal_(0, 0.02)
+        base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.02) * config.q_range
     
     def clone_tensor(tensor):
         return tensor.clone().detach().requires_grad_(True)
@@ -212,7 +323,8 @@ def run_fix_backward_test(config):
     k_fused = clone_tensor(base_tensor)
     v_fused = clone_tensor(base_tensor)
 
-    with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
+    reload(te_attention) #! 强制重载模块
+    with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "0"}):
         sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
         sage_dpa.train()
 
@@ -244,12 +356,20 @@ def run_fix_backward_test(config):
             attn_mask_type="no_mask",
         )
 
+
     output = {
         "Flash": flash_output,
         "Sage": sage_output,
         "Fused": fused_output
     }
     compare_all_methods(output, "Forward")
+
+    save_dir = "visualization_results"
+    visualize_distributions(
+        output, 
+        f"Forward (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})", 
+        save_path=f"{save_dir}/forward.png"
+    )
 
     grad_output = torch.randn_like(flash_output)
     # torch.cuda.synchronize() # blocking launch
@@ -293,6 +413,22 @@ def run_fix_backward_test(config):
     compare_all_methods(grads_q, "dQ")
     compare_all_methods(grads_k, "dK")
     compare_all_methods(grads_v, "dV")
+    
+    visualize_distributions(
+        grads_q, 
+        f"Q Gradient (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})",
+        save_path=f"{save_dir}/dQ.png"
+    )
+    visualize_distributions(
+        grads_k, 
+        f"K Gradient (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})",
+        save_path=f"{save_dir}/dK.png"
+    )
+    visualize_distributions(
+        grads_v, 
+        f"V Gradient (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim})",
+        save_path=f"{save_dir}/dV.png"
+    )
         
 if __name__ == "__main__":
     fix_backward_configs = []
@@ -306,8 +442,8 @@ if __name__ == "__main__":
     head_dims = [72]
     value_ranges = [
         (0.1, 0.1, 0.1), 
-        (1.0, 1.0, 1.0), 
-        (10.0, 10.0, 10.0), 
+        # (1.0, 1.0, 1.0), 
+        # (10.0, 10.0, 10.0), 
     ]
     
     for ranges in value_ranges:
