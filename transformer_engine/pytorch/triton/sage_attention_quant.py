@@ -282,8 +282,7 @@ def _attn_fwd(Q, K, V,
 # 计算 Delta = rowsum(O ⊙ dO)
 @triton.jit
 def _attn_bwd_preprocess(O, DO, Delta, 
-                         SEQ_LEN, BLOCK_Q: tl.constexpr, HEAD_DIM: tl.constexpr 
-                         ):
+                         SEQ_LEN, BLOCK_Q: tl.constexpr, HEAD_DIM: tl.constexpr):
     off_m = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
     off_h = tl.program_id(1).to(tl.int64)
     off_b = tl.program_id(2).to(tl.int64)
@@ -350,8 +349,9 @@ def _attn_bwd_dkdv(dk, dv,
             pT_quant = (pT / pT_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
-
-        dv += tl.dot(pT_quant, do) * do_scale * pT_scale
+        # TODO fp32 -> v.Dtype
+        # TODO bf16
+        dv += tl.dot(pT_quant, do).to(tl.float32) * do_scale * pT_scale
 
         # 2 dP
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) * v_scale * do_scale
@@ -698,7 +698,7 @@ class _attention(torch.autograd.Function):
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
         BLK_SLICE_FACTOR = 2
-        
+        # TODO 不量化 dv，量化 dq和dk
         quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
         q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
         do_quant = torch.empty(do.shape, dtype=quant_dtype, device=do.device)
