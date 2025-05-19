@@ -9,12 +9,13 @@ import torch.nn.functional as F
 
 RCP_LN2: tl.constexpr = 1.4426950408889634 # exp(x) = exp2(x * log2(e)) = exp2(x / ln(2)) = exp2(x * RCP_LN2)
 LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
+MIN_SCALE: tl.constexpr = 1e-4
 
 @triton.jit
 def quant_per_block(Input, Output, Scale, 
                     stride_ib, stride_ih, stride_is,
                     stride_ob, stride_oh, stride_os,
-                    stride_sb, stride_sh, 
+                    stride_sb, stride_sh, stride_sk,
                     sm_scale: tl.constexpr,
                     HEAD_DIM: tl.constexpr,
                     SEQ_LEN: tl.constexpr,
@@ -29,23 +30,23 @@ def quant_per_block(Input, Output, Scale,
 
     input_ptrs = Input + off_b * stride_ib + off_h * stride_ih + offs_n[:, None] * stride_is + offs_k[None, :]
     output_ptrs = Output + off_b * stride_ob + off_h * stride_oh + offs_n[:, None] * stride_os + offs_k[None, :]
-    scale_ptrs = Scale + off_b * stride_sb + off_h * stride_sh + start_m
+    scale_ptrs = Scale + off_b * stride_sb + off_h * stride_sh + start_m * stride_sk
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < SEQ_LEN)
     x = x.to(tl.float32)
     x *= sm_scale
 
     if QUANT_TYPE == 0 or QUANT_TYPE == 3:  # int8
-        # min_scale = 1e-4  # 防止scale太小
-        # scale = tl.maximum(tl.max(tl.abs(x)) / 127., min_scale)
-        scale = tl.max(tl.abs(x)) / 127. + 1e-8
-        x_quant = x / (tl.max(tl.abs(x)) / 127.0 + 1e-8)
-        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
+        # scale = tl.max(tl.abs(x)) / 127. + 1e-8
+        scale = tl.maximum(tl.max(tl.abs(x)) / 127. + 1e-8, MIN_SCALE)
+        x_quant = ((x / scale) + 0.5 * tl.where(x >= 0, 1, -1)).to(tl.int8)
     elif QUANT_TYPE == 1:  # e4m3
-        scale = tl.max(tl.abs(x)) / 448. + 1e-8
+        # scale = tl.max(tl.abs(x)) / 448. + 1e-8
+        scale = tl.maximum(tl.max(tl.abs(x)) / 448. + 1e-8, MIN_SCALE)
         x_quant = (x / scale).to(tl.float8e4nv)
     elif QUANT_TYPE == 2:  # e5m2
-        scale = tl.max(tl.abs(x)) / 57344. + 1e-8
+        # scale = tl.max(tl.abs(x)) / 57344. + 1e-8
+        scale = tl.maximum(tl.max(tl.abs(x)) / 57344. + 1e-8, MIN_SCALE)
         x_quant = (x / scale).to(tl.float8e5)
     else:
         tl.static_assert(False, "Unsupported quant type")
@@ -106,7 +107,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
 
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
-
+        
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
 
@@ -170,13 +171,13 @@ def _attn_fwd_inner_quant(acc, l_i, m_i, q,
         acc = acc * alpha[:, None]
         
         if QUANT_TYPE == 0:  # int8
-            p_scale = tl.max(tl.abs(p)) / 127. + 1e-8
-            p_quant = (p / p_scale + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
+            p_scale = tl.maximum(tl.max(tl.abs(p)) / 127. + 1e-8, MIN_SCALE)
+            p_quant = ((p / p_scale) + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
         elif QUANT_TYPE == 1:  # e4m3
-            p_scale = tl.max(tl.abs(p)) / 448. + 1e-8
+            p_scale = tl.maximum(tl.max(tl.abs(p)) / 448. + 1e-8,  MIN_SCALE)
             p_quant = (p / p_scale).to(tl.float8e4nv)
         elif QUANT_TYPE == 2:  # e5m2
-            p_scale = tl.max(tl.abs(p)) / 57344. + 1e-8
+            p_scale = tl.maximum(tl.max(tl.abs(p)) / 57344. + 1e-8, MIN_SCALE)
             p_quant = (p / p_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
@@ -329,40 +330,59 @@ def _attn_bwd_dkdv(dk, dv,
         do_scale = tl.load(DO_scale_ptr)
         
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
-
-        qkT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale
-        pT = tl.math.exp2(qkT - lse[None, :])
-
+        #! qkT: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> -0.183081 ~ 0.197608
+        #! lse: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> 10.000704 ~ 10.002090
+        qkT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale 
+        # pT = tl.math.exp2(qkT - lse[None, :])
+        max_qkT = tl.max(qkT, axis=1)
+        pT = tl.math.exp2(qkT - max_qkT[:, None] - lse[None, :])
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         
         # 2 Quant pT & Compute dV
         if QUANT_TYPE == 0:  # int8
-            pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
-            pT_quant = (pT / pT_scale + 0.5 * tl.where(pT >= 0, 1, -1)).to(tl.int8)
+            # pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
+            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 127. + 1e-8, MIN_SCALE)
+            pT_quant = ((pT / pT_scale) + 0.5 * tl.where(pT >= 0, 1, -1)).to(tl.int8)
         elif QUANT_TYPE == 1:  # e4m3
-            pT_scale = tl.max(tl.abs(pT)) / 448. + 1e-8
+            # pT_scale = tl.max(tl.abs(pT)) / 448.  + 1e-8
+            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 448. + 1e-8,  MIN_SCALE)
             pT_quant = (pT / pT_scale).to(tl.float8e4nv)
         elif QUANT_TYPE == 2:  # e5m2
-            pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
+            # pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
+            pT_scale = tl.maximum(tl.max(tl.abs(pT)) / 57344. + 1e-8, MIN_SCALE)
             pT_quant = (pT / pT_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
-        # TODO fp32 -> v.Dtype
-        # TODO bf16
         dv += tl.dot(pT_quant, do).to(tl.float32) * do_scale * pT_scale
 
         # 2 dP
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) * v_scale * do_scale
         Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
         # 1 dK
-        dsT = (pT * (dpT - Di[None, :])).to(tl.float16)
+        # dsT = (pT * (dpT - Di[None, :]))
+        # qT = tl.trans(qT).to(tl.float32)
+        # acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+        # dk += tl.dot(dsT, qT, acc) * k_scale
+        dsT = (pT * (dpT - Di[None, :]))
         # dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale 
-        qT = tl.trans(qT).to(tl.float16)
-        acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-        dk += tl.dot(dsT, qT, acc) * q_scale
-
+        if QUANT_TYPE == 0:  # int8
+            # pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
+            dsT_scale = tl.maximum(tl.max(tl.abs(dsT)) / 127. + 1e-8, MIN_SCALE)
+            dsT_quant = ((dsT / dsT_scale) + 0.5 * tl.where(dsT >= 0, 1, -1)).to(tl.int8)
+        elif QUANT_TYPE == 1:  # e4m3
+            # pT_scale = tl.max(tl.abs(pT)) / 448.  + 1e-8
+            dsT_scale = tl.maximum(tl.max(tl.abs(dsT)) / 448. + 1e-8,  MIN_SCALE)
+            dsT_quant = (dsT / dsT_scale).to(tl.float8e4nv)
+        elif QUANT_TYPE == 2:  # e5m2
+            # pT_scale = tl.max(tl.abs(pT)) / 57344. + 1e-8
+            dsT_scale = tl.maximum(tl.max(tl.abs(dsT)) / 57344. + 1e-8, MIN_SCALE)
+            dsT_quant = (dsT / dsT_scale).to(tl.float8e5)
+        else:
+            tl.static_assert(False, "Unsupported quant type")
+        dk += tl.dot(dsT_quant, tl.trans(qT)).to(tl.float32) * q_scale * dsT_scale
+        
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qs
@@ -412,11 +432,20 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         # 2 dP
         dp = tl.dot(do, vT).to(tl.float32) * do_scale * v_scale 
         # 1 dQ
-        ds = (p * (dp - Di[:, None])).to(tl.float16)
+        ds = (p * (dp - Di[:, None]))
+        if QUANT_TYPE == 0:  # int8
+            ds_scale = tl.maximum(tl.max(tl.abs(ds)) / 127. + 1e-8, MIN_SCALE)
+            ds_quant = ((ds / ds_scale) + 0.5 * tl.where(ds >= 0, 1, -1)).to(tl.int8)
+        elif QUANT_TYPE == 1:  # e4m3
+            ds_scale = tl.maximum(tl.max(tl.abs(ds)) / 448. + 1e-8,  MIN_SCALE)
+            ds_quant = (ds / ds_scale).to(tl.float8e4nv)
+        elif QUANT_TYPE == 2:  # e5m2
+            ds_scale = tl.maximum(tl.max(tl.abs(ds)) / 57344. + 1e-8, MIN_SCALE)
+            ds_quant = (ds / ds_scale).to(tl.float8e5)
+        else:
+            tl.static_assert(False, "Unsupported quant type")
+        dq += tl.dot(ds_quant, tl.trans(kT)).to(tl.float32) * k_scale * ds_scale
         # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
-        kT = tl.trans(kT).to(tl.float16)
-        acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
-        dq += tl.dot(ds, kT, acc) * k_scale
 
         # Increment pointers.
         curr_n += step_n
@@ -577,7 +606,7 @@ class _attention(torch.autograd.Function):
                 output_dtype=torch.float16, 
                 causal=False,
                 quant_type="int8"):
-        BLOCK_Q, BLOCK_KV, = 128, 64
+        BLOCK_Q, BLOCK_KV, = 128, 128
 
         try:
             quant_code, quant_dtype = QUANT_CONFIG[quant_type]
@@ -615,7 +644,7 @@ class _attention(torch.autograd.Function):
             q, q_quant, q_scale,
             q.stride(0), q.stride(1), q.stride(2),
             q_quant.stride(0), q_quant.stride(1), q_quant.stride(2),
-            q_scale.stride(0), q_scale.stride(1),
+            q_scale.stride(0), q_scale.stride(1), q_scale.stride(2),
             sm_scale=(sm_scale * RCP_LN2),
             HEAD_DIM=HEAD_DIM_Q,
             SEQ_LEN=SEQ_Q,
@@ -628,7 +657,7 @@ class _attention(torch.autograd.Function):
             k, k_quant, k_scale,
             k.stride(0), k.stride(1), k.stride(2),
             k_quant.stride(0), k_quant.stride(1), k_quant.stride(2),
-            k_scale.stride(0), k_scale.stride(1),
+            k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_K,
             SEQ_LEN=SEQ_KV,
@@ -639,7 +668,7 @@ class _attention(torch.autograd.Function):
             v, v_quant, v_scale,
             v.stride(0), v.stride(1), v.stride(2),
             v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
-            v_scale.stride(0), v_scale.stride(1),
+            v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_V,
             SEQ_LEN=SEQ_KV,
@@ -667,12 +696,10 @@ class _attention(torch.autograd.Function):
             QUANT_TYPE=quant_code, 
             **extra_kern_args)
         ctx.save_for_backward(q, k, v, o, lse) # 对齐  exp2/log2 
-        lse = lse * LN2
-        lse = lse + lse_correction * sm_scale
-
         ctx.sm_scale = sm_scale
         ctx.causal = causal
-
+        lse = lse * LN2
+        lse = lse + lse_correction * sm_scale
         return o, lse
 
     @staticmethod
@@ -682,8 +709,6 @@ class _attention(torch.autograd.Function):
         do, q, k, v, o = [maybe_contiguous(x) for x in (do, q, k, v, o)]
         assert do.is_contiguous()
         # assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        # print("SHAPE: ", q.shape, k.shape, v.shape, o.shape, do.shape)
-        # FP 16 
         #! dq 对 e4m3 支持不好，首先试试e5m2 q k v（qk 和 v的quant type可以不一样）
         # TODO bmm2 fp8 gemm , bmm1 fp16 gemm ->  bmm2 + bmm1 fp8 gemm
         # TODO softmax input grad dynamic quant
@@ -696,7 +721,7 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK_Q = 128
         assert SEQ_Q % PRE_BLOCK_Q == 0
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
-        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
+        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 128, 128, 128, 128
         BLK_SLICE_FACTOR = 2
         # TODO 不量化 dv，量化 dq和dk
         quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
@@ -715,7 +740,7 @@ class _attention(torch.autograd.Function):
             q, q_quant, q_scale,
             q.stride(0), q.stride(1), q.stride(2),
             q_quant.stride(0), q_quant.stride(1), q_quant.stride(2),
-            q_scale.stride(0), q_scale.stride(1),
+            q_scale.stride(0), q_scale.stride(1), q_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_Q,
             SEQ_LEN=SEQ_Q,
@@ -726,7 +751,7 @@ class _attention(torch.autograd.Function):
             do, do_quant, do_scale,
             do.stride(0), do.stride(1), do.stride(2),
             do_quant.stride(0), do_quant.stride(1), do_quant.stride(2),
-            do_scale.stride(0), do_scale.stride(1),
+            do_scale.stride(0), do_scale.stride(1), do_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_Q,
             SEQ_LEN=SEQ_Q,
@@ -739,7 +764,7 @@ class _attention(torch.autograd.Function):
             k, k_quant, k_scale,
             k.stride(0), k.stride(1), k.stride(2),
             k_quant.stride(0), k_quant.stride(1), k_quant.stride(2),
-            k_scale.stride(0), k_scale.stride(1),
+            k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_K,
             SEQ_LEN=SEQ_KV,
@@ -750,7 +775,7 @@ class _attention(torch.autograd.Function):
             v, v_quant, v_scale,
             v.stride(0), v.stride(1), v.stride(2),
             v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
-            v_scale.stride(0), v_scale.stride(1),
+            v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_K,
             SEQ_LEN=SEQ_KV,
@@ -787,8 +812,9 @@ class _attention(torch.autograd.Function):
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
-        # print(f"dk.isnan().any(): {dk.isnan().any()}, dk.isinf().any(): {dk.isinf().any()}, dv.isnan().any(): {dv.isnan().any()}")
-        # print(f"dq.isnan().any(): {dq.isnan().any()}, dq.isinf().any(): {dq.isinf().any()}, dv.isinf().any(): {dv.isinf().any()}")
+        print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
+        print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
+        print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
         return dq, dk, dv, None, None, None, None
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):

@@ -256,6 +256,14 @@ def _attn_bwd_dq(dq, q, K, V,
         vT = tl.load(vT_ptrs)
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
+        # if tl.program_id(0) == 0 and tl.program_id(1) == 0:
+        #     if tl.program_id(2) == 0:
+        #         qk_min = tl.min(qk);  qk_max = tl.max(qk)
+        #         tl.device_print("qk min:", qk_min)
+        #         tl.device_print("qk max:", qk_max)
+        #         m_min = tl.min(m);  m_max = tl.max(m)
+        #         tl.device_print("m min:", m_min)
+        #         tl.device_print("m max:", m_max)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
@@ -445,6 +453,11 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, LSE = ctx.saved_tensors
+        print(f"lse ranges: {LSE.min()}, {LSE.max()}")
+        print(f"o ranges: {o.min()}, {o.max()}")
+        print(f"q ranges: {q.min()}, {q.max()}")
+        print(f"k ranges: {k.min()}, {k.max()}")
+        print(f"v ranges: {v.min()}, {v.max()}")
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         dq = torch.empty_like(q)
@@ -645,6 +658,5 @@ def bench_flash_attention(BATCH, HEAD_NUM, SEQ_LEN, HEAD_DIM, causal, mode, prov
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    bench_flash_attention.run(save_path=".", print_data=True)
-    test_op(1, 32, 4096, 128, True)
-    test_op(1, 32, 4096, 128, False)
+    # bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(16, 16, 1024, 64, True)

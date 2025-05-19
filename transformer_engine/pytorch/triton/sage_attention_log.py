@@ -309,6 +309,7 @@ def _attn_bwd_dkdv(dk, dv,
                    HEAD_DIM: tl.constexpr, 
                    # Filled in by the wrapper.
                    start_n, start_m, num_steps, 
+                   debug_pT_ptr, debug_dsT_ptr,
                    MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
@@ -327,6 +328,9 @@ def _attn_bwd_dkdv(dk, dv,
         m = tl.load(LSE + offs_m)
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
+        if blk_idx == 0:
+            tl.device_print("pT", pT)
+            tl.store(debug_pT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], pT)
         # Autoregressive masking.
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
@@ -342,8 +346,12 @@ def _attn_bwd_dkdv(dk, dv,
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
         # dsT = dsT.to(tl.float16)
+        if blk_idx == 0:
+            # tl.device_print("dsT", dsT)
+            tl.store(debug_dsT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], dsT)
         dsT = dsT.to(qT.dtype) 
         dk += tl.dot(dsT, tl.trans(qT))
+        
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qs
@@ -363,6 +371,7 @@ def _attn_bwd_dq(dq, q, K, V,
                  HEAD_DIM: tl.constexpr,
                  # Filled in by the wrapper.
                  start_m, start_n, num_steps, 
+                 debug_p_ptr, debug_ds_ptr, 
                  MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
@@ -380,6 +389,9 @@ def _attn_bwd_dq(dq, q, K, V,
         vT = tl.load(vT_ptrs)
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
+        if blk_idx == 0:
+            tl.store(debug_p_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
+                     tl.trans(p))
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_KV)
@@ -388,11 +400,15 @@ def _attn_bwd_dq(dq, q, K, V,
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
+        if blk_idx == 0:
+            tl.store(debug_ds_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
+                     tl.trans(ds))
         # ds = ds.to(tl.float16)
         ds = ds.to(kT.dtype) 
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
+        
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_qs
@@ -407,6 +423,7 @@ def _attn_bwd(Q, K, V,
               # shared by Q/K/V/DO.
               stride_qb, stride_qh, stride_qs, stride_qd,
               HEAD_NUM, SEQ_LEN, GROUPS,
+              debug_pT_ptr, debug_dsT_ptr, debug_p_ptr, debug_ds_ptr,
               BLOCK_Q1: tl.constexpr, BLOCK_KV1: tl.constexpr, 
               BLOCK_Q2: tl.constexpr, BLOCK_KV2: tl.constexpr, 
               BLK_SLICE_FACTOR: tl.constexpr, 
@@ -450,6 +467,7 @@ def _attn_bwd(Q, K, V,
                                 HEAD_NUM, SEQ_LEN, 
                                 MASK_BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
+                                debug_pT_ptr, debug_dsT_ptr,
                                 MASK=True)
                                 
         start_m += num_steps * MASK_BLOCK_Q1
@@ -461,6 +479,7 @@ def _attn_bwd(Q, K, V,
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
+                                debug_pT_ptr, debug_dsT_ptr,
                                 MASK=False)
     else:
         num_steps = SEQ_LEN // BLOCK_Q1
@@ -471,6 +490,7 @@ def _attn_bwd(Q, K, V,
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, 0, num_steps, 
+                                debug_pT_ptr, debug_dsT_ptr,
                                 MASK=False)
         
     dv_ptrs = DV + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd
@@ -497,6 +517,7 @@ def _attn_bwd(Q, K, V,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, MASK_BLOCK_Q2, HEAD_DIM, 
                           start_m, end_n - num_steps * MASK_BLOCK_Q2, num_steps, 
+                          debug_p_ptr, debug_ds_ptr,
                           MASK=True)
                         
         end_n -= num_steps * MASK_BLOCK_Q2
@@ -507,6 +528,7 @@ def _attn_bwd(Q, K, V,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, end_n - num_steps * BLOCK_KV2, num_steps, 
+                          debug_p_ptr, debug_ds_ptr,
                           MASK=False)
     else:
         num_steps = SEQ_LEN // BLOCK_KV2
@@ -516,6 +538,7 @@ def _attn_bwd(Q, K, V,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, 0, num_steps,  
+                          debug_p_ptr, debug_ds_ptr,
                           MASK=False) 
                                
     dq_ptrs = DQ + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
@@ -651,14 +674,22 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
 
         BATCH, HEAD_N_Q, SEQ_Q, HEAD_DIM_Q = q.shape
-        _, HEAD_N_K, _, HEAD_DIM_K = k.shape
+        _, HEAD_N_K, SEQ_KV, HEAD_DIM_K = k.shape
         PRE_BLOCK_Q = 128
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         assert HEAD_DIM_K in {64, 128, 256}
-
         #! 前向反向的quant scale block size 对齐
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
+
+        num_blocks_kv = SEQ_KV // BLOCK_KV2
+        total_kv = num_blocks_kv * BATCH * HEAD_N_K * BLOCK_KV2
+        num_blocks_q  = SEQ_Q// BLOCK_Q2
+        total_q  = num_blocks_q * BATCH * HEAD_N_Q * BLOCK_Q2
+        debug_pT = torch.empty((BATCH * BLOCK_KV2, BLOCK_Q2), device=q.device, dtype=torch.float32)
+        debug_dsT = torch.empty_like(debug_pT)
+        debug_p  = torch.empty((BATCH * BLOCK_KV1, BLOCK_Q1), device=q.device, dtype=torch.float32)
+        debug_ds = torch.empty_like(debug_p)
 
         k = k * (ctx.sm_scale * RCP_LN2) 
         assert SEQ_Q % PRE_BLOCK_Q == 0
@@ -681,6 +712,7 @@ class _attention(torch.autograd.Function):
             lse, delta, 
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), 
             HEAD_N_Q, SEQ_Q, GROUPS,
+            debug_pT, debug_dsT, debug_p, debug_ds, 
             BLOCK_Q1=BLOCK_Q1, BLOCK_KV1=BLOCK_KV1, 
             BLOCK_Q2=BLOCK_Q2, BLOCK_KV2=BLOCK_KV2, 
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, 
@@ -688,13 +720,146 @@ class _attention(torch.autograd.Function):
             num_warps=4 if HEAD_DIM_K == 64 else 8,
             num_stages=3 if HEAD_DIM_K == 64 else 2
         )
+        torch.cuda.synchronize()
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
         print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
         print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
         print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
+        pT_arr  = debug_pT.cpu().numpy().reshape(-1)
+        dsT_arr = debug_dsT.cpu().numpy().reshape(-1)
+        p_arr   = debug_p.cpu().numpy().reshape(-1)
+        ds_arr  = debug_ds.cpu().numpy().reshape(-1)
+        import matplotlib.pyplot as plt
+        import numpy as np
+        def plot_hist(data, title):
+            data = data[~np.isnan(data)]  # 过滤NaN
+            data = data[np.isfinite(data)]  # 过滤INF
+            plt.figure()
+            ax = plt.gca()
+            plt.hist(data)
+            plt.title(title)
+            plt.title(title, fontsize=14, fontweight='bold', pad=20)
+            plt.xlabel('Value', fontsize=12, labelpad=10)
+            plt.ylabel('Frequency', fontsize=12, labelpad=10)
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            
+            # 添加网格线
+            ax.yaxis.grid(True, linestyle='--', alpha=0.4)
+            ax.xaxis.grid(False)
+            
+            # 优化边框
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_alpha(0.4)
+            ax.spines['bottom'].set_alpha(0.4)
+            
+            # 自动调整科学计数法显示
+            if np.max(np.abs(data)) > 1e4 or np.max(np.abs(data)) < 1e-4:
+                ax.ticklabel_format(axis='both', style='sci', scilimits=(0,0))
+            textstr = '\n'.join((
+                f'Total samples: {len(data):,}',
+                f'Mean: {np.mean(data):.2e}',
+                f'Std: {np.std(data):.2e}',
+                f'Max: {np.max(data):.2e}',
+                f'Min: {np.min(data):.2e}'))
+            ax.text(0.98, 0.95, textstr, transform=ax.transAxes,
+                    fontsize=10, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            # 设置对数坐标
+            ax.set_yscale('log')
+            plt.tight_layout()
+            plt.savefig(f"{title}.png")
+
+        plot_hist(pT_arr,  "Distribution of pT = tl.math.exp2(qkT - m[None, :])")
+        plot_hist(dsT_arr, "Distribution of dsT = pT * (tl.dot(v, tl.trans(do)) - Di[None, :])")
+        plot_hist(p_arr,   "Distribution of p = tl.math.exp2(qk - m)")
+        plot_hist(ds_arr,  "Distribution of ds = p * (tl.dot(do, vT) - Di[:, None])")
         return dq, dk, dv, None, None, None, None
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):
     return _attention.apply(q, k, v, sm_scale, output_dtype, causal, quant_type)
+
+
+
+def debug_backward(q, k, v, sm_scale, causal, do):
+    """调试用反向传播"""
+    class DebugFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, k, v):
+            output, lse = _attention.apply(q, k, v, sm_scale, torch.float16, False, "int8")
+            ctx.save_for_backward(q, k, v, output, lse)
+            ctx.sm_scale = sm_scale
+            ctx.causal = False
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            # 取出 forward 时保存的
+            q, k, v, output, lse = ctx.saved_tensors
+            # 调用原始 Triton backward，返回七个（dq, dk, dv, None, None, None, None）
+            grads = _attention.backward(ctx, grad_output)
+            # 只取前 3 个：dq, dk, dv
+            dq, dk, dv = grads[:3]
+            return dq, dk, dv
+
+    q = q.detach().requires_grad_(True)
+    k = k.detach().requires_grad_(True)
+    v = v.detach().requires_grad_(True)
+    output = DebugFunction.apply(q, k, v)
+    output.backward(do)
+    
+    return DebugFunction.backward.ctx.saved_tensors[-4:]
+
+if __name__ == "__main__":
+    # 测试配置
+    B, H, S, D = 16, 16, 1024, 128
+    dtype = torch.float16
+    torch.manual_seed(42)
+    def generate_tensor(shape, min_val, max_val, target_mean, target_std, device="cuda", dtype=torch.float16):
+        tensor = torch.randn(shape, device=device, dtype=dtype)  # 正态分布
+        tensor = (tensor - tensor.mean()) / (tensor.std() + 1e-8) # 标准化到均值为0，标准差为1
+        tensor = tensor * target_std + target_mean
+        if min_val is not None and max_val is not None:
+            tensor = torch.clamp(tensor, min_val, max_val)
+            tensor = tensor - tensor.mean() + target_mean
+        
+        return tensor
+    shape = (B, H, S, D)
+    q = generate_tensor(
+        shape=shape,
+        min_val=-4.65625,
+        max_val=4.5625,
+        target_mean=-4.676e-07,
+        target_std=1,
+        device="cuda",
+        dtype=dtype
+    )
+
+    k = generate_tensor(
+        shape=shape,
+        min_val=-4.96875,
+        max_val=4.71875,
+        target_mean=-5.920e-07,
+        target_std=1,
+        device="cuda",
+        dtype=dtype
+    )
+
+    v = generate_tensor(
+        shape=shape,
+        min_val=-3.5,
+        max_val=3.53125,
+        target_mean=-0.00517,
+        target_std=0.6734,
+        device="cuda",
+        dtype=dtype
+    )
+
+    do = torch.randn_like(q)
+    sm_scale = D ** -0.5
+
+    # 执行反向传播并获取调试数据
+    pT_arr, dsT_arr, p_arr, ds_arr = debug_backward(q, k, v, sm_scale, False, do)

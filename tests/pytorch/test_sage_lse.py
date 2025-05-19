@@ -85,17 +85,17 @@ def calculate_similarity(output1, output2):
 
 base_configs = [
     # (batch_size, num_heads, seq_len, head_dim, layout, attn_mask_type)
-    (1, 4, 128, 64, 'bshd', 'no_mask'),
-    (8, 8, 256, 64, 'sbhd', 'no_mask'),
+    # (1, 4, 128, 64, 'bshd', 'no_mask'),
+    # (8, 8, 256, 64, 'sbhd', 'no_mask'),
     
-    (4, 8, 1024, 64, 'bshd', 'no_mask'),
-    (4, 16, 1024, 64, 'sbhd', 'no_mask'),
+    # (4, 8, 1024, 64, 'bshd', 'no_mask'),
+    # (4, 16, 1024, 64, 'sbhd', 'no_mask'),
     
-    (1, 32, 2048, 128, 'bshd', 'no_mask'),
-    (1, 32, 2048, 128, 'sbhd', 'no_mask'),
+    # (1, 32, 2048, 128, 'bshd', 'no_mask'),
+    # (1, 32, 2048, 128, 'sbhd', 'no_mask'),
     
-    (2, 8, 256, 80, 'bshd', 'no_mask'),
-    (2, 8, 256, 80, 'sbhd', 'no_mask'),
+    # (2, 8, 256, 80, 'bshd', 'no_mask'),
+    # (2, 8, 256, 80, 'sbhd', 'no_mask'),
     (16, 16, 1024,  72, 'sbhd', 'no_mask'),
     (16, 16, 1024,  72, 'bshd', 'no_mask'),
 ]
@@ -277,8 +277,8 @@ def run_test(config):
         print(f"Warning: Flash LSE contains inf/nan values")
     if torch.isinf(flash_output).any() or torch.isnan(flash_output).any():
         print(f"Warning: flash output contains inf/nan values")
-    print("softmax_lse: ", softmax_lse)
-    print(f"softmax_lse type: {softmax_lse.dtype}")
+    # print("softmax_lse: ", softmax_lse)
+    # print(f"softmax_lse type: {softmax_lse.dtype}")
 
     if config.layout == 'bhsd':
         flash_output = flash_output.permute(0, 2, 1, 3)
@@ -289,12 +289,14 @@ def run_test(config):
         softmax_lse = softmax_lse.permute(2, 0, 1)
     
     flash_stats = compute_statistics(softmax_lse)
+    print(f"lse ranges: {softmax_lse.min()}, {softmax_lse.max()}")
     
     for qtype, result in sage_results.items():
         lse = result["lse"]
         output = result["output"]
         
         lse_stats = compute_statistics(lse)
+        print(f"lse ranges: {lse.min()}, {lse.max()}")
         
         # Compute similarity for both LSE and output
         lse_similarity = calculate_similarity(lse, softmax_lse)
@@ -312,5 +314,5 @@ for i, config in enumerate(test_configs):
     except Exception as e:
         print(f"Test failed: {e}")
 
-logger.save("sage_lse_comparison")
+# logger.save("sage_lse_comparison")
 

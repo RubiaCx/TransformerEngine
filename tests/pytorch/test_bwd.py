@@ -69,70 +69,9 @@ def calculate_similarity(output1, output2):
     }
     return metrics
 
-def print_metrics(name, metrics):
-    print(f"\n{name} Metrics:")
-    print(f"Max Difference: {metrics['max_diff'].item():.6f}")
-    print(f"Mean Difference: {metrics['mean_diff'].item():.6f}")
-    print(f"Cosine Similarity: {metrics['cos_sim'].item():.6f}")
-
-# def calculate_metrics(dict):
-#     """以第一个元素为base进行对比"""
-#     metrics = {}
-#     # 获取第一个key作为基准
-#     base_key = list(dict.keys())[0]
-#     base_grad = dict[base_key].flatten().float()
-    
-#     for key, grad in dict.items():
-#         if key == base_key:
-#             continue  # 跳过基准自身
-            
-#         flat_grad = grad.flatten().float()
-        
-#         # 基础统计
-#         l2_norm_base = base_grad.norm(p=2)
-#         l2_norm_current = flat_grad.norm(p=2)
-#         l2_ratio = (l2_norm_current / l2_norm_base).item()
-#         cos_sim = F.cosine_similarity(base_grad, flat_grad, dim=0).item()
-        
-#         # 差异统计
-#         abs_diff = torch.abs(base_grad - flat_grad)
-#         max_diff = abs_diff.max().item()
-#         mean_diff = abs_diff.mean().item()
-        
-#         # 记录关键指标
-#         metrics[f"{base_key}_vs_{key}"] = {
-#             'l2比率': l2_ratio,
-#             '余弦相似度': cos_sim,
-#             '最大差异': max_diff,
-#             '平均差异': mean_diff
-#         }
-    
-#     return metrics
-
-# def print_comparison(metrics, title):
-#     print(f"\n{title}:")
-#     print("-" * 50)
-    
-#     for comp_key, data in metrics.items():
-#         base, target = comp_key.split('_vs_')
-#         l2_ratio = data['l2比率'] 
-#         cos_sim = data['余弦相似度']
-#         max_diff = data['最大差异']
-#         mean_diff = data['平均差异']
-        
-#         # 显示结果状态
-#         status = "✓" if cos_sim > 0.95 else "✗"
-            
-#         print(f"{base} → {target} [{status}]")
-#         print(f"  L2比率:     {l2_ratio:.2%}")
-#         print(f"  余弦相似度: {cos_sim:.6f}")
-#         print(f"  最大差异:   {max_diff:.2e}")
-#         print(f"  平均差异:   {mean_diff:.2e}")
-#         print("-" * 30)
-
 def compare_all_methods(tensor_dict, title):
     print(f"\n{title}:")
-    print("-" * 80)
+    print("-" * 60)
     
     methods = list(tensor_dict.keys())
     if len(methods) < 2:
@@ -147,7 +86,7 @@ def compare_all_methods(tensor_dict, title):
     for method in methods[1:]:
         print(f" | {method:<10}", end="")
     print()
-    print("-" * 80)
+    print("-" * 60)
     
     print(f"{'最小值':<11}", end="")
     for method in methods:
@@ -173,14 +112,14 @@ def compare_all_methods(tensor_dict, title):
     for method in methods[1:]:
         curr_tensor = tensor_dict[method].flatten().float()
         curr_norm = curr_tensor.norm(p=2).item()
-        ratio = curr_norm / (base_norm + 1e-8)
+        ratio = curr_norm / base_norm
         print(f" | {ratio:10.4f}", end="")
     print()
     
     print(f"{'余弦相似度':<9} | {'--':<10}", end="")
     for method in methods[1:]:
         curr_tensor = tensor_dict[method].flatten().float()
-        cos_sim = F.cosine_similarity(base_tensor, curr_tensor, dim=0).item()
+        cos_sim = F.cosine_similarity(base_tensor, curr_tensor, dim=0)
         print(f" | {cos_sim:10.4f}", end="")
     print()
     
@@ -197,7 +136,7 @@ def compare_all_methods(tensor_dict, title):
         mean_diff = torch.mean(torch.abs(base_tensor - curr_tensor)).item()
         print(f" | {mean_diff:10.2e}", end="")
     print()
-    print("-" * 80)
+    print("-" * 60)
 
 def visualize_distributions(tensor_dict, title, save_path=None):
     methods = list(tensor_dict.keys())
@@ -300,28 +239,78 @@ def visualize_distributions(tensor_dict, title, save_path=None):
     else:
         plt.show()
 
+def generate_tensor(shape, min_val, max_val, target_mean, target_std, device="cuda", dtype=torch.float16):
+    tensor = torch.randn(shape, device=device, dtype=dtype)  # 正态分布
+    tensor = (tensor - tensor.mean()) / (tensor.std() + 1e-8) # 标准化到均值为0，标准差为1
+    tensor = tensor * target_std + target_mean
+    if min_val is not None and max_val is not None:
+        tensor = torch.clamp(tensor, min_val, max_val)
+        tensor = tensor - tensor.mean() + target_mean
+    
+    return tensor
 # bshd
 def run_fix_backward_test(config):
     tols = {"atol": 1e-2, "rtol": 1e-2}
     scale = 1.0 / (config.head_dim ** 0.5)
     if config.layout == "bshd":
-        base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.02) * config.q_range
+        base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.01) * config.q_range
         
     elif config.layout == "sbhd":
-        base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.02) * config.q_range
+        base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim, device="cuda", dtype=config.dtype).normal_(0, 0.01) * config.q_range
     
     def clone_tensor(tensor):
         return tensor.clone().detach().requires_grad_(True)
     
-    q_sage = clone_tensor(base_tensor)
-    k_sage = clone_tensor(base_tensor)
-    v_sage = clone_tensor(base_tensor)
-    q_flash = clone_tensor(base_tensor)
-    k_flash = clone_tensor(base_tensor)
-    v_flash = clone_tensor(base_tensor)
-    q_fused = clone_tensor(base_tensor)
-    k_fused = clone_tensor(base_tensor)
-    v_fused = clone_tensor(base_tensor)
+    # q_sage = clone_tensor(base_tensor)
+    # k_sage = clone_tensor(base_tensor)
+    # v_sage = clone_tensor(base_tensor)
+    # q_flash = clone_tensor(base_tensor)
+    # k_flash = clone_tensor(base_tensor)
+    # v_flash = clone_tensor(base_tensor)
+    # q_fused = clone_tensor(base_tensor)
+    # k_fused = clone_tensor(base_tensor)
+    # v_fused = clone_tensor(base_tensor)
+    
+    shape = (config.seq_len, config.batch_size, config.num_heads, config.head_dim)
+    q_tensor = generate_tensor(
+        shape=shape,
+        min_val=-4.65625,
+        max_val=4.5625,
+        target_mean=-4.676e-07,
+        target_std=1,
+        device="cuda",
+        dtype=config.dtype
+    )
+
+    k_tensor = generate_tensor(
+        shape=shape,
+        min_val=-4.96875,
+        max_val=4.71875,
+        target_mean=-5.920e-07,
+        target_std=1,
+        device="cuda",
+        dtype=config.dtype
+    )
+
+    v_tensor = generate_tensor(
+        shape=shape,
+        min_val=-3.5,
+        max_val=3.53125,
+        target_mean=-0.00517,
+        target_std=0.6734,
+        device="cuda",
+        dtype=config.dtype
+    )
+
+    q_sage = clone_tensor(q_tensor)
+    k_sage = clone_tensor(k_tensor)
+    v_sage = clone_tensor(v_tensor)
+    q_flash = clone_tensor(q_tensor)
+    k_flash = clone_tensor(k_tensor)
+    v_flash = clone_tensor(v_tensor)
+    q_fused = clone_tensor(q_tensor)
+    k_fused = clone_tensor(k_tensor)
+    v_fused = clone_tensor(v_tensor)
 
     reload(te_attention) #! 强制重载模块
     with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "0"}):
@@ -356,12 +345,13 @@ def run_fix_backward_test(config):
             attn_mask_type="no_mask",
         )
 
-
     output = {
         "Flash": flash_output,
         "Sage": sage_output,
         "Fused": fused_output
     }
+    if flash_output.shape != sage_output.shape:
+        print(f"Flash output shape: {flash_output.shape}, Sage output shape: {sage_output.shape}")
     compare_all_methods(output, "Forward")
 
     save_dir = "visualization_results"
@@ -432,42 +422,41 @@ def run_fix_backward_test(config):
         
 if __name__ == "__main__":
     fix_backward_configs = []
-    # seq_lens = [1024]
-    # batch_sizes = [16]
-    # num_heads = [16]
-    # head_dims = [72]
     seq_lens = [1024]
     batch_sizes = [16]
     num_heads = [16]
     head_dims = [72]
     value_ranges = [
         (0.1, 0.1, 0.1), 
-        # (1.0, 1.0, 1.0), 
-        # (10.0, 10.0, 10.0), 
+        (1.0, 1.0, 1.0), 
+        (10.0, 10.0, 10.0), 
     ]
-    
+    dtypes = [
+        torch.float16,
+        torch.bfloat16,
+    ]
     for ranges in value_ranges:
-        for batch_size in batch_sizes:
-            for head_dim in head_dims:
-                    for num_head in num_heads:
-                        for seq_len in seq_lens:
-                            for layout in ['sbhd']: # ,'bshd'
-                                fix_backward_configs.append(
-                                    TestConfig(
-                                        batch_size=batch_size,
-                                        num_heads=num_head,
-                                        seq_len=seq_len, 
-                                        head_dim=head_dim,
-                                        total_seq=seq_len * batch_size,
-                                        dtype= torch.float16,
-                                        # dtype= torch.bfloat16,
-                                        q_range=ranges[0],
-                                        k_range=ranges[1],
-                                        v_range=ranges[2],
-                                        layout=layout,
+        for dtype in dtypes:
+            for batch_size in batch_sizes:
+                for head_dim in head_dims:
+                        for num_head in num_heads:
+                            for seq_len in seq_lens:
+                                for layout in ['sbhd']: # ,'bshd'
+                                    fix_backward_configs.append(
+                                        TestConfig(
+                                            batch_size=batch_size,
+                                            num_heads=num_head,
+                                            seq_len=seq_len, 
+                                            head_dim=head_dim,
+                                            total_seq=seq_len * batch_size,
+                                            dtype= dtype,
+                                            q_range=ranges[0],
+                                            k_range=ranges[1],
+                                            v_range=ranges[2],
+                                            layout=layout,
+                                        )
                                     )
-                                )
     
     for i, config in enumerate(fix_backward_configs):
-        print(f"\n===== 测试 {i+1}/{len(fix_backward_configs)}: 定长反向传播 (B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, layout={config.layout}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
+        print(f"\n===== B={config.batch_size}, S={config.seq_len}, H={config.num_heads}, D={config.head_dim}, layout={config.layout}, dtype={config.dtype}, range={config.v_range} =====")
         run_fix_backward_test(config)

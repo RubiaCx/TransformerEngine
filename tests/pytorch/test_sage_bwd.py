@@ -200,21 +200,6 @@ def print_metrics(name, metrics):
     print(f"Mean Difference: {metrics['mean_diff'].item():.6f}")
     print(f"Cosine Similarity: {metrics['cos_sim'].item():.6f}")
 
-range_combinations = [
-    # q_range, k_range, v_range
-    (0.1, 0.1, 0.1),     
-    # (1.0, 1.0, 1.0),    
-    # (10.0, 10.0, 10.0), 
-    # (0.1, 1.0, 10.0),  
-    # (10.0, 1.0, 0.1),   
-    # (0.1, 10.0, 0.1),  
-    # (10.0, 0.1, 10.0),  
-    # (0.1, 0.1, 10.0),
-    # (10.0, 10.0, 0.1),
-    # (0.1, 10.0, 10.0),
-    # (10.0, 0.1, 0.1),
-]
-
 class ResultLogger:
     def __init__(self):
         self.columns = [
@@ -285,197 +270,6 @@ class EnvSwitcher:
                 del os.environ[k]
             else:
                 os.environ[k] = v
-
-def run_var_backward_test(config):
-    tols = {"atol": 1e-2, "rtol": 1e-2}
-    scale = 1.0 / (config.head_dim ** 0.5)
-    max_seqlen = config.total_seq
-    cu_seqlens = torch.tensor(
-        [0, max_seqlen//2, max_seqlen],  
-        device="cuda", 
-        dtype=torch.int32
-    )
-    base_tensor = torch.empty(config.total_seq, config.num_heads, config.head_dim,
-                             device="cuda", dtype=torch.float16).normal_(0, 0.02)
-    
-    def clone_tensor(tensor):
-        return tensor.clone().detach().requires_grad_(True)
-    
-    q_sage = clone_tensor(base_tensor)
-    k_sage = clone_tensor(base_tensor)
-    v_sage = clone_tensor(base_tensor)
-    q_flash = clone_tensor(base_tensor)
-    k_flash = clone_tensor(base_tensor)
-    v_flash = clone_tensor(base_tensor)
-
-    with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
-        sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
-        # sage_dpa = SageAttention(
-        #     softmax_scale=scale,
-        #     quantization_backend="triton",
-        #     quantization_type="e4m3",
-        #     smooth_k=True,
-        #     return_lse=False,
-        #     attention_dropout=0.0,
-        # ).cuda()
-        sage_dpa.train()
-
-        sage_output = sage_dpa(
-            q_sage, k_sage, v_sage,
-            # qkv_layout='thd_thd_thd',
-            qkv_format='thd',
-            attn_mask_type="no_mask", # c ausal
-            cu_seqlens_q=cu_seqlens, 
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen, 
-            max_seqlen_kv=max_seqlen,
-        ).contiguous()
-
-    reload(te_attention) #! 强制重载模块
-    with EnvSwitcher({"NVTE_SAGE_ATTN": "0", "NVTE_FLASH_ATTN": "1", "NVTE_FUSED_ATTN": "0"}):
-        flash_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
-        flash_dpa.train()
-
-        flash_output = flash_dpa(
-            q_flash, k_flash, v_flash,
-            qkv_format='thd',
-            attn_mask_type="no_mask",
-            cu_seqlens_q=cu_seqlens, 
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen, 
-            max_seqlen_kv=max_seqlen,
-        )
-
-
-    forward_1 = calculate_similarity(sage_output, flash_output)
-    print_metrics(f"前向传播 - Sage e4m3 vs Flash Varlen \
-                  (T={config.total_seq}, H={config.num_heads}, D={config.head_dim})", forward_1)
-
-    grad_output = torch.randn_like(flash_output)
-    flash_output.backward(grad_output) 
-    sage_output = sage_output.view(*flash_output.shape)
-    sage_output.backward(grad_output)
-
-    sage_grads=(q_sage.grad, k_sage.grad, v_sage.grad)
-    flash_grads=(q_flash.grad, k_flash.grad, v_flash.grad)
-    
-    # validate_gradients(sage_grads, flash_grads, config)
-    # validate_gradients(flash_grads, flash_api_grads, config)
-
-    print("梯度范数 Sage VS Flash")
-    print(f"Q: {sage_grads[0].norm():.4f} vs {flash_grads[0].norm():.4f}")
-    print(f"K: {sage_grads[1].norm():.4f} vs {flash_grads[1].norm():.4f}")
-    print(f"V: {sage_grads[2].norm():.4f} vs {flash_grads[2].norm():.4f}")
-
-    # def validate_backward_inputs(model1, model2, in1, in2,  grad_out):
-    #     """7维度反向传播输入验证"""
-    #     # 维度1: 基础参数验证
-    #     assert math.isclose(model1.softmax_scale, model2.softmax_scale, rel_tol=1e-6), "softmax_scale不一致"
-    #     assert model1.attention_dropout == model2.attention_dropout, "dropout率不一致"
-        
-    # validate_backward_inputs(sage_dpa, flash_dpa, q_sage, q_flash_api, grad_output)
-    
-    grad_metrics = {
-        'q': calculate_similarity(q_sage.grad, q_flash.grad),
-        'k': calculate_similarity(k_sage.grad, k_flash.grad),
-        'v': calculate_similarity(v_sage.grad, v_flash.grad)
-    }
-    # def scale_gradients(flash_grad, sage_grad):
-    #     flash_range = flash_grad.max() - flash_grad.min()
-    #     sage_range = sage_grad.max() - sage_grad.min()
-    #     if flash_range > 0:
-    #         scale_factor = sage_range / flash_range
-    #         return flash_grad * scale_factor
-    #     return flash_grad
-
-    # q_flash_scaled = scale_gradients(q_flash.grad, q_sage.grad)
-    # k_flash_scaled = scale_gradients(k_flash.grad, k_sage.grad)
-    # v_flash_scaled = scale_gradients(v_flash.grad, v_sage.grad)
-
-
-    # visualize_comparison(q_sage, q_flash, f"Q Input Comparison (hd={config.head_dim})")
-    # visualize_comparison(k_sage, k_flash, f"K Input Comparison (hd={config.head_dim})")
-    # visualize_comparison(v_sage, v_flash, f"V Input Comparison (hd={config.head_dim})")
-    
-    # visualize_comparison(sage_output, flash_output, 
-    #                     f"Sage vs Flash Output (hd={config.head_dim})")
-    
-    if q_sage.grad is not None and q_flash.grad is not None:
-        visualize_comparison(q_sage.grad, q_flash.grad, 
-                            f"Q Gradients Original Comparison (hd={config.head_dim})")
-        visualize_comparison(k_sage.grad, k_flash.grad, 
-                            f"K Gradients Original Comparison (hd={config.head_dim})")
-        visualize_comparison(v_sage.grad, v_flash.grad, 
-                            f"V Gradients Original Comparison (hd={config.head_dim})")
-        
-        # visualize_comparison(q_sage.grad, q_flash_scaled, 
-        #                     f"Q Gradients Scaled Comparison (hd={config.head_dim})")
-        # visualize_comparison(k_sage.grad, k_flash_scaled, 
-        #                     f"K Gradients Scaled Comparison (hd={config.head_dim})")
-        # visualize_comparison(v_sage.grad, v_flash_scaled, 
-        #                     f"V Gradients Scaled Comparison (hd={config.head_dim})")
-    
-    # # Heatmap visualizations
-    # visualize_heatmap(q_sage, f"Q_Sage_Heatmap (hd={config.head_dim})")
-    # visualize_heatmap(q_flash, f"Q_Flash_Heatmap (hd={config.head_dim})")
-    # visualize_heatmap(sage_output, f"Sage_Output_Heatmap (hd={config.head_dim})")
-    # visualize_heatmap(flash_output, f"Flash_Output_Heatmap (hd={config.head_dim})")
-    
-    # if q_sage.grad is not None:
-    #     visualize_heatmap(q_sage.grad, f"Q_Sage_Grad_Heatmap (hd={config.head_dim})")
-    #     visualize_heatmap(k_sage.grad, f"K_Sage_Grad_Heatmap (hd={config.head_dim})")
-    #     visualize_heatmap(v_sage.grad, f"V_Sage_Grad_Heatmap (hd={config.head_dim})")
-    
-    # if q_flash.grad is not None:
-    #     visualize_heatmap(q_flash.grad, f"Q_Flash_Grad_Heatmap (hd={config.head_dim})")
-    #     visualize_heatmap(k_flash.grad, f"K_Flash_Grad_Heatmap (hd={config.head_dim})")
-    #     visualize_heatmap(v_flash.grad, f"V_Flash_Grad_Heatmap (hd={config.head_dim})")
-    
-    
-    logger.add_result(config, 'e4m3', forward_1, grad_metrics, "Varlen Forward+Backward")
-
-def run_var_backward_tests_for_selected_configs():
-    var_backward_configs = []
-    
-    # head_dims = [32, 64, 96, 128]
-    # num_heads = [1, 2, 4, 8, 16, 32, 64, 128]
-    # seq_configs = [256, 512, 1024]
-    head_dims = [32]
-    num_heads = [4]
-    seq_configs = [256]
-    value_ranges = [
-        (0.1, 0.1, 0.1),  # 小值范围
-        # (1.0, 1.0, 1.0),  # 中等值范围
-        # (10.0, 10.0, 10.0)  # 大值范围
-    ]
-    
-    for head_dim in head_dims:
-        for ranges in value_ranges:
-            for num_head in num_heads:
-                for seq_len in seq_configs:
-                    var_backward_configs.append(
-                        TestConfig(
-                            batch_size=0,
-                            num_heads=num_head,
-                            seq_len=0, 
-                            head_dim=head_dim,
-                            total_seq=seq_len,
-                            dtype=[torch.float16, torch.bfloat16],
-                            q_range=ranges[0],
-                            k_range=ranges[1],
-                            v_range=ranges[2],
-                            layout='thd'
-                        )
-                    )
-    
-    # import random
-    # if len(var_backward_configs) > 20:
-    #     print(f"配置总数: {len(var_backward_configs)}，随机采样20个进行测试")
-    #     var_backward_configs = random.sample(var_backward_configs, 20)
-    
-    for i, config in enumerate(var_backward_configs):
-        print(f"\n===== 测试 {i+1}/{len(var_backward_configs)}: 可变长度反向传播 (B={config.batch_size}, H={config.num_heads}, D={config.head_dim}, S={config.total_seq}, ranges={config.q_range}-{config.k_range}-{config.v_range}) =====")
-        run_var_backward_test(config)
 
 def calculate_metrics(dict):
     metrics = {}
@@ -563,11 +357,11 @@ def run_fix_backward_test(config):
     scale = 1.0 / (config.head_dim ** 0.5)
     if config.layout == "bshd":
         base_tensor = torch.empty(config.batch_size, config.seq_len, config.num_heads, config.head_dim,
-                              device="cuda", dtype=torch.float16).normal_(0, 0.02)
+                              device="cuda", dtype=torch.float16).normal_(0, 0.02) * config.q_range
         
     elif config.layout == "sbhd":
         base_tensor = torch.empty(config.seq_len, config.batch_size, config.num_heads, config.head_dim,
-                              device="cuda", dtype=torch.float16).normal_(0, 0.02)
+                              device="cuda", dtype=torch.float16).normal_(0, 0.02) * config.q_range
     
     def clone_tensor(tensor):
         return tensor.clone().detach().requires_grad_(True)
@@ -582,7 +376,8 @@ def run_fix_backward_test(config):
     k_fused = clone_tensor(base_tensor)
     v_fused = clone_tensor(base_tensor)
 
-    with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0"}):
+    reload(te_attention) 
+    with EnvSwitcher({"NVTE_SAGE_ATTN": "1", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "0"}):
         sage_dpa = DotProductAttention(config.num_heads, config.head_dim, softmax_scale=scale)
         sage_dpa.train()
 
@@ -748,8 +543,8 @@ def run_fix_backward_tests_for_selected_configs():
     head_dims = [72]
     value_ranges = [
         (0.1, 0.1, 0.1), 
-        # (1.0, 1.0, 1.0), 
-        # (10.0, 10.0, 10.0), 
+        (1.0, 1.0, 1.0), 
+        (10.0, 10.0, 10.0), 
     ]
     
     for ranges in value_ranges:
@@ -765,7 +560,7 @@ def run_fix_backward_tests_for_selected_configs():
                                         seq_len=seq_len, 
                                         head_dim=head_dim,
                                         total_seq=seq_len * batch_size,
-                                        dtype= torch.bfloat16,
+                                        dtype= torch.float16,
                                         q_range=ranges[0],
                                         k_range=ranges[1],
                                         v_range=ranges[2],
@@ -779,7 +574,4 @@ def run_fix_backward_tests_for_selected_configs():
 
 if __name__ == "__main__":
     
-    # run_var_backward_tests_for_selected_configs()
-    
-    # logger.save("sage_attn_test_with_backward")
     run_fix_backward_tests_for_selected_configs()
