@@ -329,8 +329,16 @@ def _attn_bwd_dkdv(dk, dv,
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
         if blk_idx == 0:
-            tl.device_print("pT", pT)
-            tl.store(debug_pT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], pT)
+            # tl.device_print("pT", pT)
+            # tl.store(debug_pT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], pT)
+            batch_head_offset = (tl.program_id(0) * HEAD_NUM + tl.program_id(1)) * (SEQ_LEN // BLOCK_KV) * BLOCK_KV
+            tl.store(
+                debug_pT_ptr 
+                + batch_head_offset 
+                + offs_n[:, None] * BLOCK_Q 
+                + tl.arange(0, BLOCK_Q)[None, :], 
+                pT
+            )
         # Autoregressive masking.
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
@@ -348,7 +356,15 @@ def _attn_bwd_dkdv(dk, dv,
         # dsT = dsT.to(tl.float16)
         if blk_idx == 0:
             # tl.device_print("dsT", dsT)
-            tl.store(debug_dsT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], dsT)
+            # tl.store(debug_dsT_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :], dsT)
+            batch_head_offset = (tl.program_id(0) * HEAD_NUM + tl.program_id(1)) * (SEQ_LEN // BLOCK_KV) * BLOCK_KV
+            tl.store(
+                debug_dsT_ptr 
+                + batch_head_offset 
+                + offs_n[:, None] * BLOCK_Q 
+                + tl.arange(0, BLOCK_Q)[None, :], 
+                dsT
+            )
         dsT = dsT.to(qT.dtype) 
         dk += tl.dot(dsT, tl.trans(qT))
         
@@ -390,8 +406,16 @@ def _attn_bwd_dq(dq, q, K, V,
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
         if blk_idx == 0:
-            tl.store(debug_p_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
-                     tl.trans(p))
+            # tl.store(debug_p_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
+            #          tl.trans(p))
+            # tl.device_print("p", p)
+            batch_head_offset = (tl.program_id(0) * HEAD_NUM + tl.program_id(1)) * (SEQ_LEN // BLOCK_KV) * BLOCK_KV
+            tl.store(
+                debug_p_ptr 
+                + batch_head_offset 
+                + offs_n[:, None] * BLOCK_Q 
+                + tl.arange(0, BLOCK_Q)[None, :], 
+                tl.trans(p))
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_KV)
@@ -401,8 +425,16 @@ def _attn_bwd_dq(dq, q, K, V,
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
         if blk_idx == 0:
-            tl.store(debug_ds_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
-                     tl.trans(ds))
+            # tl.store(debug_ds_ptr + offs_n[:, None] * BLOCK_Q + tl.arange(0, BLOCK_Q)[None, :],
+            #          tl.trans(ds))
+            # tl.device_print("ds", ds)
+            batch_head_offset = (tl.program_id(0) * HEAD_NUM + tl.program_id(1)) * (SEQ_LEN // BLOCK_KV) * BLOCK_KV
+            tl.store(
+                debug_ds_ptr 
+                + batch_head_offset 
+                + offs_n[:, None] * BLOCK_Q 
+                + tl.arange(0, BLOCK_Q)[None, :], 
+                tl.trans(ds))
         # ds = ds.to(tl.float16)
         ds = ds.to(kT.dtype) 
         # Compute dQ.
@@ -679,17 +711,15 @@ class _attention(torch.autograd.Function):
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         assert HEAD_DIM_K in {64, 128, 256}
         #! 前向反向的quant scale block size 对齐
-        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 32, 128, 128, 32
+        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 128, 128, 64
         BLK_SLICE_FACTOR = 2
 
         num_blocks_kv = SEQ_KV // BLOCK_KV2
-        total_kv = num_blocks_kv * BATCH * HEAD_N_K * BLOCK_KV2
         num_blocks_q  = SEQ_Q// BLOCK_Q2
-        total_q  = num_blocks_q * BATCH * HEAD_N_Q * BLOCK_Q2
-        debug_pT = torch.empty((BATCH * BLOCK_KV2, BLOCK_Q2), device=q.device, dtype=torch.float32)
-        debug_dsT = torch.empty_like(debug_pT)
-        debug_p  = torch.empty((BATCH * BLOCK_KV1, BLOCK_Q1), device=q.device, dtype=torch.float32)
-        debug_ds = torch.empty_like(debug_p)
+        debug_pT = torch.zeros((BATCH * BLOCK_KV2, BLOCK_Q2), device=q.device, dtype=torch.float32)
+        debug_dsT = torch.zeros_like(debug_pT)
+        debug_p  = torch.zeros((BATCH * BLOCK_KV1, BLOCK_Q1), device=q.device, dtype=torch.float32)
+        debug_ds = torch.zeros_like(debug_p)
 
         k = k * (ctx.sm_scale * RCP_LN2) 
         assert SEQ_Q % PRE_BLOCK_Q == 0
@@ -724,9 +754,9 @@ class _attention(torch.autograd.Function):
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
-        print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
-        print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
-        print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
+        # print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
+        # print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
+        # print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
         pT_arr  = debug_pT.cpu().numpy().reshape(-1)
         dsT_arr = debug_dsT.cpu().numpy().reshape(-1)
         p_arr   = debug_p.cpu().numpy().reshape(-1)
@@ -736,11 +766,12 @@ class _attention(torch.autograd.Function):
         def plot_hist(data, title):
             data = data[~np.isnan(data)]  # 过滤NaN
             data = data[np.isfinite(data)]  # 过滤INF
+            data = data[data != 0]  # 去除 0
             plt.figure()
             ax = plt.gca()
             plt.hist(data)
             plt.title(title)
-            plt.title(title, fontsize=14, fontweight='bold', pad=20)
+            plt.title(title, fontsize=12, fontweight='bold', pad=20)
             plt.xlabel('Value', fontsize=12, labelpad=10)
             plt.ylabel('Frequency', fontsize=12, labelpad=10)
             plt.xticks(fontsize=10)

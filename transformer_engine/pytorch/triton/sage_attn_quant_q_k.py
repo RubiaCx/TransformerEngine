@@ -1,6 +1,7 @@
 import pytest
 import torch
 import triton.tools.experimental_descriptor
+from triton.language.extra import libdevice
 
 import triton
 import triton.language as tl
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 
 RCP_LN2: tl.constexpr = 1.4426950408889634 # exp(x) = exp2(x * log2(e)) = exp2(x / ln(2)) = exp2(x * RCP_LN2)
 LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-MIN_SCALE: tl.constexpr = 1e-4
+MIN_SCALE: tl.constexpr = 1e-8
 
 @triton.jit
 def quant_per_block(Input, Output, Scale, 
@@ -304,7 +305,7 @@ def _attn_bwd_dkdv(dk, dv,
                    LSE, D, 
                    # shared by Q/K/V/DO.
                    stride_qs, stride_qd, 
-                   Q_scale_ptr, DO_scale_ptr, k_scale, v_scale,
+                   Q_scale_ptr, k_scale,
                    HEAD_NUM, SEQ_LEN,
                    BLOCK_Q: tl.constexpr, 
                    BLOCK_KV: tl.constexpr, 
@@ -315,7 +316,6 @@ def _attn_bwd_dkdv(dk, dv,
     offs_m = start_m + tl.arange(0, BLOCK_Q)
     offs_n = start_n + tl.arange(0, BLOCK_KV)
     offs_k = tl.arange(0, HEAD_DIM)
-
     qT_ptrs = Q_ptrs + offs_m[None, :] * stride_qs + offs_k[:, None] * stride_qd
     do_ptrs = DO_ptrs + offs_m[:, None] * stride_qs + offs_k[None, :] * stride_qd
     # BLOCK_KV must be a multiple of BLOCK_Q, otherwise the code wouldn't work.
@@ -323,36 +323,23 @@ def _attn_bwd_dkdv(dk, dv,
     curr_m = start_m
     step_m = BLOCK_Q
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs) 
+        qT = tl.load(qT_ptrs)
         do = tl.load(do_ptrs)
         lse = tl.load(LSE + offs_m) # Load lse before computing qk to reduce pipeline stall.
         q_scale = tl.load(Q_scale_ptr)
-        do_scale = tl.load(DO_scale_ptr)
-        
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
-        #! qkT: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> -0.183081 ~ 0.197608
-        #! lse: 10 -> 10.000704 ~ 10.002090
-        qkT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale 
-        pT = tl.math.exp2(qkT - lse[None, :])
-        # max_qkT = tl.max(qkT, axis=1)
-        # pT = tl.math.exp2(qkT - max_qkT[:, None] - lse[None, :])
+        kqT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale
+        pT = tl.math.exp2(kqT - lse[None, :]) 
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
-        
         # 2 Quant pT & Compute dV
         dv += tl.dot(pT.to(do.dtype), do).to(tl.float32) 
         # 2 dP 
-        # TODO 数据分布
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) 
         Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
         # 1 dK
-        # dsT = (pT * (dpT - Di[None, :]))
-        # qT = tl.trans(qT).to(tl.float32)
-        # acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-        # dk += tl.dot(dsT, qT, acc) * k_scale
         dsT = (pT * (dpT - Di[None, :]))
-        # dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale 
         if QUANT_TYPE == 0:  # int8
             # pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
             dsT_scale = tl.maximum(tl.max(tl.abs(dsT)) / 127. + 1e-8, MIN_SCALE)
@@ -368,13 +355,12 @@ def _attn_bwd_dkdv(dk, dv,
         else:
             tl.static_assert(False, "Unsupported quant type")
         dk += tl.dot(dsT_quant, tl.trans(qT)).to(tl.float32) * q_scale * dsT_scale
-        
+        # dk += tl.dot(dsT, tl.trans(qT).to(tl.float32)) * q_scale
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qs
         do_ptrs += step_m * stride_qs
         Q_scale_ptr += 1
-        DO_scale_ptr += 1
     return dk, dv
 
 # the main inner-loop logic for computing dQ
@@ -384,7 +370,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
                 lse, D,
                  # shared by Q/K/V/DO.
                  stride_qs, stride_qd, 
-                 q_scale, do_scale, K_scale_ptr, V_scale_ptr, 
+                 q_scale, K_scale_ptr, 
                  HEAD_NUM, SEQ_LEN, 
                  BLOCK_Q: tl.constexpr, 
                  BLOCK_KV: tl.constexpr, 
@@ -397,19 +383,18 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
     offs_k = tl.arange(0, HEAD_DIM)
     kT_ptrs = K_ptrs + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
     vT_ptrs = V_ptrs + offs_n[None, :] * stride_qs + offs_k[:, None] * stride_qd
-    # D (= delta) is pre-divided by ds_scale.
-    Di = tl.load(D + offs_m)
-    # BLOCK_Q must be a multiple of BLOCK_KV, otherwise the code wouldn't work.
-    tl.static_assert(BLOCK_Q % BLOCK_KV == 0)
+    # mask_kv = (offs_k[:, None] < HEAD_DIM) & (offs_n[None, :] < SEQ_LEN)  
+    Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
+    tl.static_assert(BLOCK_Q % BLOCK_KV == 0) # BLOCK_Q must be a multiple of BLOCK_KV, otherwise the code wouldn't work.
     curr_n = start_n
     step_n = BLOCK_KV
     for blk_idx in range(num_steps):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
         k_scale = tl.load(K_scale_ptr)
-        v_scale = tl.load(V_scale_ptr)
-        qk = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
-        p = tl.math.exp2(qk - lse)
+
+        qkT = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
+        p = tl.math.exp2(qkT - lse)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_KV)
@@ -430,20 +415,24 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
             ds_quant = (ds / ds_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
-        dq += tl.dot(ds_quant, tl.trans(kT)).to(tl.float32) * k_scale * ds_scale
-        # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
 
-        # Increment pointers.
+        if QUANT_TYPE == 0:
+            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.int32)
+            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
+        else:
+            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
+        dq = dq + dq_tmp
+        # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
         curr_n += step_n
         kT_ptrs += step_n * stride_qs
         vT_ptrs += step_n * stride_qs
         K_scale_ptr += 1
-        V_scale_ptr += 1
     return dq
 
 @triton.jit
 def _attn_bwd(Q, K, V, DO, 
-              Q_scale, K_scale, V_scale, DO_scale,
+              Q_scale, K_scale, 
               sm_scale, causal,
               DQ, DK, DV, 
               LSE, D,
@@ -476,17 +465,11 @@ def _attn_bwd(Q, K, V, DO,
     v = tl.load(V + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
 
     q_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
-    do_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
     k_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)  
-    v_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)
     Q_scale_ptr = Q_scale + q_scale_offset
-    DO_scale_ptr = DO_scale + do_scale_offset
     K_scale_ptr = K_scale + k_scale_offset
-    V_scale_ptr = V_scale + v_scale_offset
-    q_scale = tl.load(Q_scale_ptr + start_n)
-    do_scale = tl.load(DO_scale_ptr + start_n)
-    k_scale = tl.load(K_scale_ptr + start_n)
-    v_scale = tl.load(V_scale_ptr + start_n)
+    q_scale = tl.load(Q_scale_ptr + (start_n // BLOCK_Q2))
+    k_scale = tl.load(K_scale_ptr + (start_n // BLOCK_KV2))
 
     start_m = start_n
     if causal:
@@ -496,7 +479,7 @@ def _attn_bwd(Q, K, V, DO,
                                 Q, DO, k, v,
                                 LSE, D, 
                                 stride_qs, stride_qd, 
-                                Q_scale_ptr, DO_scale_ptr, k_scale, v_scale,
+                                Q_scale_ptr, k_scale,
                                 HEAD_NUM, SEQ_LEN, 
                                 MASK_BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
@@ -508,7 +491,7 @@ def _attn_bwd(Q, K, V, DO,
                                 Q, DO, k, v, 
                                 LSE, D, 
                                 stride_qs, stride_qd, 
-                                Q_scale_ptr, DO_scale_ptr, k_scale, v_scale,
+                                Q_scale_ptr, k_scale, 
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, start_m, num_steps, 
@@ -519,7 +502,7 @@ def _attn_bwd(Q, K, V, DO,
                                 Q, DO, k, v,
                                 LSE, D, 
                                 stride_qs, stride_qd, 
-                                Q_scale_ptr, DO_scale_ptr, k_scale, v_scale,
+                                Q_scale_ptr, k_scale,
                                 HEAD_NUM, SEQ_LEN, 
                                 BLOCK_Q1, BLOCK_KV1, HEAD_DIM, 
                                 start_n, 0, num_steps, 
@@ -546,7 +529,7 @@ def _attn_bwd(Q, K, V, DO,
         dq = _attn_bwd_dq(dq, q, K, V, do,
                           lse, D, 
                           stride_qs, stride_qd, 
-                          q_scale, do_scale, K_scale_ptr, V_scale_ptr,
+                          q_scale, K_scale_ptr,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, MASK_BLOCK_Q2, HEAD_DIM, 
                           start_m, end_n - num_steps * MASK_BLOCK_Q2, num_steps, 
@@ -557,7 +540,7 @@ def _attn_bwd(Q, K, V, DO,
         dq = _attn_bwd_dq(dq, q, K, V, do,
                           lse, D, 
                           stride_qs, stride_qd, 
-                          q_scale, do_scale, K_scale_ptr, V_scale_ptr,
+                          q_scale, K_scale_ptr,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, end_n - num_steps * BLOCK_KV2, num_steps, 
@@ -567,7 +550,7 @@ def _attn_bwd(Q, K, V, DO,
         dq = _attn_bwd_dq(dq, q, K, V, do,
                           lse, D, 
                           stride_qs, stride_qd, 
-                          q_scale, do_scale, K_scale_ptr, V_scale_ptr,
+                          q_scale, K_scale_ptr,
                           HEAD_NUM, SEQ_LEN, 
                           BLOCK_Q2, BLOCK_KV2, HEAD_DIM, 
                           start_m, 0, num_steps,  
@@ -693,14 +676,20 @@ class _attention(torch.autograd.Function):
         q, k, v, o, lse = ctx.saved_tensors
         maybe_contiguous = lambda x: x.contiguous() if x.is_contiguous() == False else x
         do, q, k, v, o = [maybe_contiguous(x) for x in (do, q, k, v, o)]
+        # print(f"Range of do: {do.min()}, {do.max()}")
+        # print(f"Range of q: {q.min()}, {q.max()}")
+        # print(f"Range of k: {k.min()}, {k.max()}")
+        # print(f"Range of v: {v.min()}, {v.max()}")
+        # print(f"Range of o: {o.min()}, {o.max()}")
+        # print(f"Range of lse: {lse.min()}, {lse.max()}")
         assert do.is_contiguous()
         # assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         #! dq 对 e4m3 支持不好，首先试试e5m2 q k v（qk 和 v的quant type可以不一样）
         # TODO bmm2 fp8 gemm , bmm1 fp16 gemm ->  bmm2 + bmm1 fp8 gemm
         # TODO softmax input grad dynamic quant
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
 
         BATCH, HEAD_N_Q, SEQ_Q, HEAD_DIM_Q = q.shape
         _, HEAD_N_K, SEQ_KV, HEAD_DIM_K = k.shape
@@ -708,20 +697,17 @@ class _attention(torch.autograd.Function):
         assert SEQ_Q % PRE_BLOCK_Q == 0
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 128, 128, 128, 128
+        NUM_Q_BLOCKS = (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2
+        NUM_KV_BLOCKS = (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2
         BLK_SLICE_FACTOR = 2
-        # TODO 不量化 dv，量化 dq和dk
-        quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
-        q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
-        do_quant = torch.empty(do.shape, dtype=quant_dtype, device=do.device)
-        k_quant = torch.empty(k.shape, dtype=quant_dtype, device=k.device)
-        v_quant = torch.empty(v.shape, dtype=quant_dtype, device=v.device)
-        q_scale = torch.empty((BATCH, HEAD_N_Q, (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2), device=q.device, dtype=torch.float32)
-        do_scale = torch.empty((BATCH, HEAD_N_Q, (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2), device=do.device, dtype=torch.float32)
-        k_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=k.device, dtype=torch.float32)
-        v_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=v.device, dtype=torch.float32)
+        quant_code, quant_dtype = QUANT_CONFIG["e5m2"]
+        q_quant = torch.zeros(q.shape, dtype=quant_dtype, device=q.device)
+        k_quant = torch.zeros(k.shape, dtype=quant_dtype, device=k.device)
+        q_scale = torch.zeros((BATCH, HEAD_N_Q, NUM_Q_BLOCKS), device=q.device, dtype=torch.float32)
+        k_scale = torch.zeros((BATCH, HEAD_N_K, NUM_KV_BLOCKS), device=k.device, dtype=torch.float32)
         k = k * (ctx.sm_scale * RCP_LN2) 
 
-        grid_q = (triton.cdiv(SEQ_Q, BLOCK_Q2), HEAD_N_Q, BATCH)
+        grid_q = (NUM_Q_BLOCKS, HEAD_N_Q, BATCH)
         quant_per_block[grid_q](
             q, q_quant, q_scale,
             q.stride(0), q.stride(1), q.stride(2),
@@ -733,35 +719,13 @@ class _attention(torch.autograd.Function):
             BLOCK=BLOCK_Q2,
             QUANT_TYPE=quant_code
         )
-        quant_per_block[grid_q](
-            do, do_quant, do_scale,
-            do.stride(0), do.stride(1), do.stride(2),
-            do_quant.stride(0), do_quant.stride(1), do_quant.stride(2),
-            do_scale.stride(0), do_scale.stride(1), do_scale.stride(2),
-            sm_scale=1.0,
-            HEAD_DIM=HEAD_DIM_Q,
-            SEQ_LEN=SEQ_Q,
-            BLOCK=BLOCK_Q2,
-            QUANT_TYPE=quant_code
-        )
         
-        grid_kv = (triton.cdiv(SEQ_KV, BLOCK_KV2), HEAD_N_K, BATCH)
+        grid_kv = (NUM_KV_BLOCKS, HEAD_N_K, BATCH)
         quant_per_block[grid_kv](
             k, k_quant, k_scale,
             k.stride(0), k.stride(1), k.stride(2),
             k_quant.stride(0), k_quant.stride(1), k_quant.stride(2),
             k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
-            sm_scale=1.0,
-            HEAD_DIM=HEAD_DIM_K,
-            SEQ_LEN=SEQ_KV,
-            BLOCK=BLOCK_KV2,
-            QUANT_TYPE=quant_code
-        )
-        quant_per_block[grid_kv](
-            v, v_quant, v_scale,
-            v.stride(0), v.stride(1), v.stride(2),
-            v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
-            v_scale.stride(0), v_scale.stride(1), v_scale.stride(2),
             sm_scale=1.0,
             HEAD_DIM=HEAD_DIM_K,
             SEQ_LEN=SEQ_KV,
@@ -779,8 +743,8 @@ class _attention(torch.autograd.Function):
         # NUM_WARPS, NUM_STAGES = 4, 5
         grid = (SEQ_Q // BLOCK_KV1, HEAD_N_Q, BATCH)
         _attn_bwd[grid](
-            q_quant, k_quant, v, do, 
-            q_scale, k_scale, v_scale, do_scale,
+            q_quant.contiguous(), k_quant.contiguous(), v.contiguous(), do.contiguous(), 
+            q_scale, k_scale, 
             ctx.sm_scale, 
             ctx.causal,
             dq, dk, dv, 
@@ -798,9 +762,9 @@ class _attention(torch.autograd.Function):
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
-        print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
-        print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
-        print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
+        # print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
+        # print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
+        # print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
         return dq, dk, dv, None, None, None, None
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):

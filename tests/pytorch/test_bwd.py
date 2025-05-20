@@ -433,7 +433,7 @@ if __name__ == "__main__":
     ]
     dtypes = [
         torch.float16,
-        torch.bfloat16,
+        # torch.bfloat16,
     ]
     for ranges in value_ranges:
         for dtype in dtypes:

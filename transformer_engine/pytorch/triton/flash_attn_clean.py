@@ -1,6 +1,7 @@
 import pytest
 import torch
 import triton.tools.experimental_descriptor
+from triton.language.extra import libdevice
 
 import triton
 import triton.language as tl
