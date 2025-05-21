@@ -443,10 +443,9 @@ def _attn_bwd(Q, K, V, DO,
               BLK_SLICE_FACTOR: tl.constexpr, 
               HEAD_DIM: tl.constexpr, QUANT_TYPE: tl.constexpr):
     pid = tl.program_id(0)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_b = tl.program_id(2).to(tl.int64)
-    adj = (stride_qh * off_b + stride_qb * off_h).to(tl.int64) 
-    off_ch = (off_b * HEAD_NUM * SEQ_LEN).to(tl.int64) # 计算当前 batch 在 LSE 和 D 中的起始内存偏移量，挪动 HEAD_NUM * SEQ_LEN 个元素
+    bhid = tl.program_id(1)
+    off_ch = (bhid * SEQ_LEN).to(tl.int64)
+    adj = (stride_qh * (bhid % HEAD_NUM) + stride_qb * (bhid // HEAD_NUM)).to(tl.int64)
 
     # offset pointers for batch/head
     Q  += adj;  K  += adj;  V  += adj
@@ -464,6 +463,8 @@ def _attn_bwd(Q, K, V, DO,
     k = tl.load(K + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
     v = tl.load(V + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
 
+    off_b = bhid // HEAD_NUM 
+    off_h = bhid % HEAD_NUM
     q_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
     k_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)  
     Q_scale_ptr = Q_scale + q_scale_offset
@@ -741,7 +742,7 @@ class _attention(torch.autograd.Function):
         )
 
         # NUM_WARPS, NUM_STAGES = 4, 5
-        grid = (SEQ_Q // BLOCK_KV1, HEAD_N_Q, BATCH)
+        grid = (SEQ_Q // BLOCK_KV1, BATCH * HEAD_N_Q, 1)
         _attn_bwd[grid](
             q_quant.contiguous(), k_quant.contiguous(), v.contiguous(), do.contiguous(), 
             q_scale, k_scale, 

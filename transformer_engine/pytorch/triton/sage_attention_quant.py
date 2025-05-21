@@ -324,7 +324,7 @@ def _attn_bwd_dkdv(dk, dv,
     curr_m = start_m
     step_m = BLOCK_Q
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs) 
+        qT = tl.load(qT_ptrs)
         do = tl.load(do_ptrs)
         lse = tl.load(LSE + offs_m) # Load lse before computing qk to reduce pipeline stall.
         q_scale = tl.load(Q_scale_ptr)
@@ -333,8 +333,8 @@ def _attn_bwd_dkdv(dk, dv,
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
         #! qkT: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> -0.183081 ~ 0.197608
         #! lse: 10 -> 10.000704 ~ 10.002090
-        qkT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale 
-        pT = tl.math.exp2(qkT - lse[None, :])
+        kqT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale
+        pT = tl.math.exp2(kqT - lse[None, :]) 
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
@@ -422,8 +422,8 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         vT = tl.load(vT_ptrs)
         k_scale = tl.load(K_scale_ptr)
         v_scale = tl.load(V_scale_ptr)
-        qk = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
-        p = tl.math.exp2(qk - lse)
+        qkT = tl.dot(q, kT).to(tl.float32) * q_scale * k_scale 
+        p = tl.math.exp2(qkT - lse)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_KV)
@@ -495,10 +495,12 @@ def _attn_bwd(Q, K, V, DO,
     k = tl.load(K + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
     v = tl.load(V + offs_n[:, None] * stride_qs + offs_k[None, :] * stride_qd)
 
-    q_scale_offset = bhid * tl.cdiv(SEQ_LEN, BLOCK_Q2)
-    do_scale_offset = bhid * tl.cdiv(SEQ_LEN, BLOCK_Q2)
-    k_scale_offset = bhid * tl.cdiv(SEQ_LEN, BLOCK_KV2)
-    v_scale_offset = bhid * tl.cdiv(SEQ_LEN, BLOCK_KV2)
+    off_b = bhid // HEAD_NUM 
+    off_h = bhid % HEAD_NUM
+    q_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
+    do_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_Q2)
+    k_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)  
+    v_scale_offset = (off_b * HEAD_NUM + off_h) * tl.cdiv(SEQ_LEN, BLOCK_KV2)
     Q_scale_ptr = Q_scale + q_scale_offset
     DO_scale_ptr = DO_scale + do_scale_offset
     K_scale_ptr = K_scale + k_scale_offset
@@ -801,7 +803,7 @@ class _attention(torch.autograd.Function):
         # NUM_WARPS, NUM_STAGES = 4, 5
         grid = (SEQ_Q // BLOCK_KV1, BATCH * HEAD_N_Q, 1)
         _attn_bwd[grid](
-            q_quant, k_quant, v_quant, do_quant, 
+            q_quant.contiguous(), k_quant.contiguous(), v_quant.contiguous(), do_quant.contiguous(), 
             q_scale, k_scale, v_scale, do_scale,
             ctx.sm_scale, 
             ctx.causal,
