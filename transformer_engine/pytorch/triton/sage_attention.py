@@ -285,15 +285,14 @@ def _attn_bwd_preprocess(O, DO,
                          BLOCK_Q: tl.constexpr, HEAD_DIM: tl.constexpr 
                          ):
     off_m = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_b = tl.program_id(2).to(tl.int64)
+    off_hb = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(O + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    o = tl.load(O + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
-    tl.store(Delta + off_h * off_b * SEQ_LEN + off_m, delta)
+    tl.store(Delta + off_hb * SEQ_LEN + off_m, delta)
 
 # The main inner-loop logic for computing dK and dV.
 # 固定处理 K 和 V 的一个块（形状为 BLOCK_KV × HEAD_DIM），然后迭代处理 Q 和 dO 的多个块
@@ -412,10 +411,9 @@ def _attn_bwd(Q, K, V,
               BLK_SLICE_FACTOR: tl.constexpr, 
               HEAD_DIM: tl.constexpr):
     pid = tl.program_id(0)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_b = tl.program_id(2).to(tl.int64)
-    adj = (stride_qh * off_b + stride_qb * off_h).to(tl.int64) 
-    off_chz = (off_b * HEAD_NUM * SEQ_LEN).to(tl.int64) # 计算当前 batch 在 LSE 和 D 中的起始内存偏移量，挪动 HEAD_NUM * SEQ_LEN 个元素
+    bhid = tl.program_id(1)
+    off_chz = (bhid * SEQ_LEN).to(tl.int64)
+    adj = (stride_qh * (bhid % HEAD_NUM) + stride_qb * (bhid // HEAD_NUM)).to(tl.int64)
 
     # offset pointers for batch/head
     Q += adj
@@ -670,7 +668,7 @@ class _attention(torch.autograd.Function):
             BLOCK_Q=PRE_BLOCK_Q, HEAD_DIM=HEAD_DIM_Q 
         )
         # NUM_WARPS, NUM_STAGES = 4, 5
-        grid = (triton.cdiv(SEQ_Q, BLOCK_Q2), HEAD_N_Q, BATCH)
+        grid = (SEQ_Q // BLOCK_KV1, BATCH * HEAD_N_Q, 1)
 
         _attn_bwd[grid](
             q, k, v, 
@@ -690,9 +688,9 @@ class _attention(torch.autograd.Function):
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
-        print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
-        print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
-        print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
+        # print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
+        # print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
+        # print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
         return dq, dk, dv, None, None, None, None
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):
