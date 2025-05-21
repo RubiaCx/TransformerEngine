@@ -38,16 +38,14 @@ def quant_per_block(Input, Output, Scale,
     x *= sm_scale
 
     if QUANT_TYPE == 0 or QUANT_TYPE == 3:  # int8
-        # scale = tl.max(tl.abs(x)) / 127. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 127. + 1e-8, MIN_SCALE)
-        x_quant = ((x / scale) + 0.5 * tl.where(x >= 0, 1, -1)).to(tl.int8)
+        scale = tl.max(tl.abs(x)) / 127. + 1e-8
+        x_quant = x / (tl.max(tl.abs(x)) / 127.0 + 1e-8)
+        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
     elif QUANT_TYPE == 1:  # e4m3
-        # scale = tl.max(tl.abs(x)) / 448. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 448. + 1e-8, MIN_SCALE)
+        scale = tl.max(tl.abs(x)) / 448. + 1e-8
         x_quant = (x / scale).to(tl.float8e4nv)
     elif QUANT_TYPE == 2:  # e5m2
-        # scale = tl.max(tl.abs(x)) / 57344. + 1e-8
-        scale = tl.maximum(tl.max(tl.abs(x)) / 57344. + 1e-8, MIN_SCALE)
+        scale = tl.max(tl.abs(x)) / 57344. + 1e-8
         x_quant = (x / scale).to(tl.float8e5)
     else:
         tl.static_assert(False, "Unsupported quant type")
@@ -172,13 +170,13 @@ def _attn_fwd_inner_quant(acc, l_i, m_i, q,
         acc = acc * alpha[:, None]
         #! TODO 其他粒度的量化
         if QUANT_TYPE == 0:  # int8
-            p_scale = tl.maximum(tl.max(tl.abs(p)) / 127. + 1e-8, MIN_SCALE)
-            p_quant = ((p / p_scale) + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
+            p_scale = tl.max(tl.abs(p)) / 127. + 1e-8
+            p_quant = (p / p_scale + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
         elif QUANT_TYPE == 1:  # e4m3
-            p_scale = tl.maximum(tl.max(tl.abs(p)) / 448. + 1e-8,  MIN_SCALE)
+            p_scale = tl.max(tl.abs(p)) / 448. + 1e-8
             p_quant = (p / p_scale).to(tl.float8e4nv)
         elif QUANT_TYPE == 2:  # e5m2
-            p_scale = tl.maximum(tl.max(tl.abs(p)) / 57344. + 1e-8, MIN_SCALE)
+            p_scale = tl.max(tl.abs(p)) / 57344. + 1e-8
             p_quant = (p / p_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
@@ -286,16 +284,14 @@ def _attn_fwd(Q, K, V,
 def _attn_bwd_preprocess(O, DO, Delta, 
                          SEQ_LEN, BLOCK_Q: tl.constexpr, HEAD_DIM: tl.constexpr):
     off_m = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_b = tl.program_id(2).to(tl.int64)
+    off_hb = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(O + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_h * off_b * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    
+    o = tl.load(O + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hb * HEAD_DIM * SEQ_LEN + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
-    tl.store(Delta + off_h * off_b * SEQ_LEN + off_m, delta)
+    tl.store(Delta + off_hb * SEQ_LEN + off_m, delta)
 
 # The main inner-loop logic for computing dK and dV.
 # 固定处理 K 和 V 的一个块（形状为 BLOCK_KV × HEAD_DIM），然后迭代处理 Q 和 dO 的多个块
@@ -334,12 +330,13 @@ def _attn_bwd_dkdv(dk, dv,
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         # 2 Quant pT & Compute dV
-        dv += tl.dot(pT.to(do.dtype), do).to(tl.float32) 
+        ppT = pT.to(do.dtype) 
+        dv += tl.dot(ppT, do)
         # 2 dP 
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32) 
         Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         # 1 dK
-        dsT = (pT * (dpT - Di[None, :]))
+        dsT = pT * (dpT - Di[None, :])
         if QUANT_TYPE == 0:  # int8
             # pT_scale = tl.max(tl.abs(pT)) / 127. + 1e-8
             dsT_scale = tl.maximum(tl.max(tl.abs(dsT)) / 127. + 1e-8, MIN_SCALE)
@@ -403,7 +400,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         # 2 dP
         dp = tl.dot(do, vT).to(tl.float32) 
         # 1 dQ
-        ds = (p * (dp - Di[:, None]))
+        ds = p * (dp - Di[:, None])
         if QUANT_TYPE == 0:  # int8
             ds_scale = tl.maximum(tl.max(tl.abs(ds)) / 127. + 1e-8, MIN_SCALE)
             ds_quant = ((ds / ds_scale) + 0.5 * tl.where(ds >= 0, 1, -1)).to(tl.int8)
@@ -416,13 +413,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
         else:
             tl.static_assert(False, "Unsupported quant type")
 
-        if QUANT_TYPE == 0:
-            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.int32)
-            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
-        else:
-            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
-            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
-        dq = dq + dq_tmp
+        dq += tl.dot(ds_quant, tl.trans(kT)).to(tl.float32) * ds_scale * k_scale
         # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
         curr_n += step_n
         kT_ptrs += step_n * stride_qs

@@ -72,7 +72,7 @@ from transformer_engine.pytorch.export import is_in_onnx_export_mode
 from transformer_engine.pytorch.jit import jit_fuser, no_torch_dynamo
 from transformer_engine.pytorch.graph import is_graph_capturing
 
-from transformer_engine.pytorch.triton.sage_attention_quant import sage_attention
+from transformer_engine.pytorch.triton.sage_attn_quant_q_k import sage_attention
 
 from transformer_engine.pytorch.triton.Sage_quant_per_block import per_block_quant as quant_per_block_triton
 from transformer_engine.pytorch.triton.Sage_quant_per_block_varlen import per_block_varlen_quant as quant_per_block_varlen_triton
