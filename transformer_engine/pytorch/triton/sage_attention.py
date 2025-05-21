@@ -656,7 +656,6 @@ class _attention(torch.autograd.Function):
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         assert HEAD_DIM_K in {64, 128, 256}
 
-        #! 前向反向的quant scale block size 对齐
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
 

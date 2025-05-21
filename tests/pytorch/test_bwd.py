@@ -136,6 +136,14 @@ def compare_all_methods(tensor_dict, title):
         mean_diff = torch.mean(torch.abs(base_tensor - curr_tensor)).item()
         print(f" | {mean_diff:10.2e}", end="")
     print()
+
+    print(f"{'最大差异比':<9} | {'--':<10}", end="")
+    for method in methods[1:]:
+        curr_tensor = tensor_dict[method].flatten().float()
+        max_diff = torch.max(torch.abs(base_tensor - curr_tensor)).item()
+        ratio = max_diff / torch.mean(torch.abs(base_tensor)).item()
+        print(f" | {ratio:10.4f}", end="")
+    print()
     print("-" * 60)
 
 def visualize_distributions(tensor_dict, title, save_path=None):
@@ -428,12 +436,12 @@ if __name__ == "__main__":
     head_dims = [72]
     value_ranges = [
         (0.1, 0.1, 0.1), 
-        (1.0, 1.0, 1.0), 
-        (10.0, 10.0, 10.0), 
+        # (1.0, 1.0, 1.0), 
+        # (10.0, 10.0, 10.0), 
     ]
     dtypes = [
         torch.float16,
-        # torch.bfloat16,
+        torch.bfloat16,
     ]
     for ranges in value_ranges:
         for dtype in dtypes:

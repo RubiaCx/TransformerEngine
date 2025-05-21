@@ -1,6 +1,7 @@
 import pytest
 import torch
 import triton.tools.experimental_descriptor
+from triton.language.extra import libdevice
 
 import triton
 import triton.language as tl
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 
 RCP_LN2: tl.constexpr = 1.4426950408889634 # exp(x) = exp2(x * log2(e)) = exp2(x / ln(2)) = exp2(x * RCP_LN2)
 LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-MIN_SCALE: tl.constexpr = 1e-4
+MIN_SCALE: tl.constexpr = 1e-8
 
 @triton.jit
 def quant_per_block(Input, Output, Scale, 
@@ -169,7 +170,7 @@ def _attn_fwd_inner_quant(acc, l_i, m_i, q,
         l_i = l_i * alpha + l_ij
 
         acc = acc * alpha[:, None]
-        
+        #! TODO 其他粒度的量化
         if QUANT_TYPE == 0:  # int8
             p_scale = tl.maximum(tl.max(tl.abs(p)) / 127. + 1e-8, MIN_SCALE)
             p_quant = ((p / p_scale) + 0.5 * tl.where(p >= 0, 1, -1)).to(tl.int8)
@@ -304,7 +305,7 @@ def _attn_bwd_dkdv(dk, dv,
                    LSE, D, 
                    # shared by Q/K/V/DO.
                    stride_qs, stride_qd, 
-                   Q_scale_ptr, DO_scale_ptr, k_scale, v_scale, 
+                   Q_scale_ptr, DO_scale_ptr, k_scale, v_scale,
                    HEAD_NUM, SEQ_LEN,
                    BLOCK_Q: tl.constexpr, 
                    BLOCK_KV: tl.constexpr, 
@@ -331,11 +332,9 @@ def _attn_bwd_dkdv(dk, dv,
         
         offs_m = curr_m + tl.arange(0, BLOCK_Q)
         #! qkT: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> -0.183081 ~ 0.197608
-        #! lse: 0.1 -> -0.000022 ~ 0.000024 | 1 -> -0.001836 ~ 0.001974 | 10 -> 10.000704 ~ 10.002090
+        #! lse: 10 -> 10.000704 ~ 10.002090
         qkT = tl.dot(k, qT).to(tl.float32) * k_scale * q_scale 
-        # pT = tl.math.exp2(qkT - lse[None, :])
-        max_qkT = tl.max(qkT, axis=1)
-        pT = tl.math.exp2(qkT - max_qkT[:, None] - lse[None, :])
+        pT = tl.math.exp2(qkT - lse[None, :])
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
@@ -357,7 +356,8 @@ def _attn_bwd_dkdv(dk, dv,
             tl.static_assert(False, "Unsupported quant type")
         dv += tl.dot(pT_quant, do).to(tl.float32) * do_scale * pT_scale
 
-        # 2 dP
+        # 2 dP 
+        # TODO 数据分布
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32) * v_scale * do_scale
         Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
         # 1 dK
@@ -444,7 +444,14 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
             ds_quant = (ds / ds_scale).to(tl.float8e5)
         else:
             tl.static_assert(False, "Unsupported quant type")
-        dq += tl.dot(ds_quant, tl.trans(kT)).to(tl.float32) * k_scale * ds_scale
+
+        if QUANT_TYPE == 0:
+            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.int32)
+            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
+        else:
+            accumulater = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+            dq_tmp = tl.dot(ds_quant, tl.trans(kT), accumulater).to(tl.float32) * ds_scale * k_scale 
+        dq = dq + dq_tmp
         # dq += tl.dot(ds, tl.trans(kT).to(tl.float32)) * k_scale
 
         # Increment pointers.
@@ -497,10 +504,10 @@ def _attn_bwd(Q, K, V, DO,
     DO_scale_ptr = DO_scale + do_scale_offset
     K_scale_ptr = K_scale + k_scale_offset
     V_scale_ptr = V_scale + v_scale_offset
-    q_scale = tl.load(Q_scale_ptr + start_n)
-    do_scale = tl.load(DO_scale_ptr + start_n)
-    k_scale = tl.load(K_scale_ptr + start_n)
-    v_scale = tl.load(V_scale_ptr + start_n)
+    q_scale = tl.load(Q_scale_ptr + (start_n // BLOCK_Q2))
+    do_scale = tl.load(DO_scale_ptr + (start_n // BLOCK_Q2))
+    k_scale = tl.load(K_scale_ptr + (start_n // BLOCK_KV2))
+    v_scale = tl.load(V_scale_ptr + (start_n // BLOCK_KV2))
 
     start_m = start_n
     if causal:
@@ -695,7 +702,7 @@ class _attention(torch.autograd.Function):
             STAGE=stage,
             QUANT_TYPE=quant_code, 
             **extra_kern_args)
-        ctx.save_for_backward(q, k, v, o, lse) # 对齐  exp2/log2 
+        ctx.save_for_backward(q, k, v, o, lse) # 对齐 exp2/log2 
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         lse = lse * LN2
@@ -712,9 +719,9 @@ class _attention(torch.autograd.Function):
         #! dq 对 e4m3 支持不好，首先试试e5m2 q k v（qk 和 v的quant type可以不一样）
         # TODO bmm2 fp8 gemm , bmm1 fp16 gemm ->  bmm2 + bmm1 fp8 gemm
         # TODO softmax input grad dynamic quant
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
 
         BATCH, HEAD_N_Q, SEQ_Q, HEAD_DIM_Q = q.shape
         _, HEAD_N_K, SEQ_KV, HEAD_DIM_K = k.shape
@@ -722,20 +729,22 @@ class _attention(torch.autograd.Function):
         assert SEQ_Q % PRE_BLOCK_Q == 0
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
         BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 128, 128, 128, 128
+        NUM_Q_BLOCKS = (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2
+        NUM_KV_BLOCKS = (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2
         BLK_SLICE_FACTOR = 2
         # TODO 不量化 dv，量化 dq和dk
-        quant_code, quant_dtype = QUANT_CONFIG["e4m3"]
-        q_quant = torch.empty(q.shape, dtype=quant_dtype, device=q.device)
-        do_quant = torch.empty(do.shape, dtype=quant_dtype, device=do.device)
-        k_quant = torch.empty(k.shape, dtype=quant_dtype, device=k.device)
-        v_quant = torch.empty(v.shape, dtype=quant_dtype, device=v.device)
-        q_scale = torch.empty((BATCH, HEAD_N_Q, (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2), device=q.device, dtype=torch.float32)
-        do_scale = torch.empty((BATCH, HEAD_N_Q, (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2), device=do.device, dtype=torch.float32)
-        k_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=k.device, dtype=torch.float32)
-        v_scale = torch.empty((BATCH, HEAD_N_K, (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2), device=v.device, dtype=torch.float32)
+        quant_code, quant_dtype = QUANT_CONFIG["e5m2"]
+        q_quant = torch.zeros(q.shape, dtype=quant_dtype, device=q.device)
+        do_quant = torch.zeros(do.shape, dtype=quant_dtype, device=do.device)
+        k_quant = torch.zeros(k.shape, dtype=quant_dtype, device=k.device)
+        v_quant = torch.zeros(v.shape, dtype=quant_dtype, device=v.device)
+        q_scale = torch.zeros((BATCH, HEAD_N_Q, NUM_Q_BLOCKS), device=q.device, dtype=torch.float32)
+        do_scale = torch.zeros((BATCH, HEAD_N_Q, NUM_Q_BLOCKS), device=do.device, dtype=torch.float32)
+        k_scale = torch.zeros((BATCH, HEAD_N_K, NUM_KV_BLOCKS), device=k.device, dtype=torch.float32)
+        v_scale = torch.zeros((BATCH, HEAD_N_K, NUM_KV_BLOCKS), device=v.device, dtype=torch.float32)
         k = k * (ctx.sm_scale * RCP_LN2) 
 
-        grid_q = (triton.cdiv(SEQ_Q, BLOCK_Q2), HEAD_N_Q, BATCH)
+        grid_q = (NUM_Q_BLOCKS, HEAD_N_Q, BATCH)
         quant_per_block[grid_q](
             q, q_quant, q_scale,
             q.stride(0), q.stride(1), q.stride(2),
@@ -759,7 +768,7 @@ class _attention(torch.autograd.Function):
             QUANT_TYPE=quant_code
         )
         
-        grid_kv = (triton.cdiv(SEQ_KV, BLOCK_KV2), HEAD_N_K, BATCH)
+        grid_kv = (NUM_KV_BLOCKS, HEAD_N_K, BATCH)
         quant_per_block[grid_kv](
             k, k_quant, k_scale,
             k.stride(0), k.stride(1), k.stride(2),
@@ -812,9 +821,9 @@ class _attention(torch.autograd.Function):
         dq = dq[..., : do.shape[-1]].contiguous()
         dk = dk[..., : do.shape[-1]].contiguous()
         dv = dv[..., : do.shape[-1]].contiguous()
-        print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
-        print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
-        print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
+        # print(f"NAN in dK: {dk.isnan().any()}, INF in dK: {dk.isinf().any()}")
+        # print(f"NAN in dV: {dv.isnan().any()}, INF in dV: {dv.isinf().any()}")
+        # print(f"NAN in dQ: {dq.isnan().any()}, INF in dQ: {dq.isinf().any()}")
         return dq, dk, dv, None, None, None, None
 
 def sage_attention(q, k, v, sm_scale, output_dtype=torch.float16, causal=False, quant_type="int8"):
