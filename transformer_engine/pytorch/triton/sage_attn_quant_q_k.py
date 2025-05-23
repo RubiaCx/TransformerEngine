@@ -330,11 +330,12 @@ def _attn_bwd_dkdv(dk, dv,
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
         # 2 Quant pT & Compute dV
-        ppT = pT.to(do.dtype) 
-        dv += tl.dot(ppT, do)
+        # ppT = pT.to(do.dtype) 
+        # dv += tl.dot(ppT, do)``
+        dv += tl.dot(pT.to(tl.float16), do.to(tl.float16)).to(tl.float32)
         # 2 dP 
         Di = tl.load(D + offs_m) # D (= delta) is pre-divided by ds_scale.
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dpT = tl.dot(v.to(tl.float16), tl.trans(do).to(tl.float16)).to(tl.float32)
         # 1 dK
         dsT = pT * (dpT - Di[None, :])
         if QUANT_TYPE == 0:  # int8
@@ -398,7 +399,7 @@ def _attn_bwd_dq(dq, q, K_ptrs, V_ptrs, do,
             mask = (offs_m[:, None] >= offs_n[None, :])
             p = tl.where(mask, p, 0.0)
         # 2 dP
-        dp = tl.dot(do, vT).to(tl.float32) 
+        dp = tl.dot(do.to(tl.float16), vT.to(tl.float16)).to(tl.float32) 
         # 1 dQ
         ds = p * (dp - Di[:, None])
         if QUANT_TYPE == 0:  # int8
@@ -692,7 +693,7 @@ class _attention(torch.autograd.Function):
         NUM_Q_BLOCKS = (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2
         NUM_KV_BLOCKS = (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2
         BLK_SLICE_FACTOR = 2
-        quant_code, quant_dtype = QUANT_CONFIG["e5m2"]
+        quant_code, quant_dtype = QUANT_CONFIG["int8"]
         q_quant = torch.zeros(q.shape, dtype=quant_dtype, device=q.device)
         k_quant = torch.zeros(k.shape, dtype=quant_dtype, device=k.device)
         q_scale = torch.zeros((BATCH, HEAD_N_Q, NUM_Q_BLOCKS), device=q.device, dtype=torch.float32)

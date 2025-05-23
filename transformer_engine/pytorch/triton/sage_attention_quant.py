@@ -729,7 +729,7 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK_Q = 128
         assert SEQ_Q % PRE_BLOCK_Q == 0
         GROUPS =  max(HEAD_N_Q // HEAD_N_K, 1)
-        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 128, 128, 128, 128
+        BLOCK_Q1, BLOCK_KV1, BLOCK_Q2, BLOCK_KV2 = 64, 64, 64, 64
         NUM_Q_BLOCKS = (SEQ_Q + BLOCK_Q2 - 1) // BLOCK_Q2
         NUM_KV_BLOCKS = (SEQ_KV + BLOCK_KV2 - 1) // BLOCK_KV2
         BLK_SLICE_FACTOR = 2
