@@ -679,13 +679,14 @@ def test_pretrain_recipe_quantizers(scope, err_mode):
     assert inp.nvfp4_columnwise_e4m3_max == (448 if act_4over6 else 0)
     assert out.nvfp4_use_4over6 == act_4over6
 
-    # Weight: rowwise 4over6 (2D), columnwise standard by default.
+    # Weight (2D): both copies use 4over6 by default, so that the forward and the
+    # input-gradient GEMM consume the same weight values.
     assert not weight.with_rht and not weight.stochastic_rounding
     assert weight.with_2d_quantization
     assert weight.nvfp4_use_4over6 == weight_4over6
-    assert not weight.columnwise_uses_4over6
+    assert weight.columnwise_uses_4over6 == weight_4over6
     assert weight.nvfp4_e4m3_max == (256 if weight_4over6 else 0)
-    assert weight.nvfp4_columnwise_e4m3_max == (448 if weight_4over6 else 0)
+    assert weight.nvfp4_columnwise_e4m3_max == 0
 
     # Gradients: standard NVFP4 with RHT + stochastic rounding.
     for grad in _make_quantizers(recipe, "backward", 2):
@@ -700,7 +701,8 @@ def test_pretrain_recipe_quantizers(scope, err_mode):
     "columnwise_scope, disable_rht, expect_inp, expect_weight",
     [
         # auto: off with RHT (pre-training), on without RHT (previous behavior).
-        ("auto", False, False, False),
+        # 2D weights (the default) keep both copies in the same scheme.
+        ("auto", False, False, True),
         ("auto", True, True, True),
         ("none", True, False, False),
         ("weights", False, False, True),
@@ -779,7 +781,10 @@ def test_pretrain_recipe_operands(
     """With the recipe quantizers, enabling 4over6 changes X and W rowwise copies only."""
     recipe_kwargs = dict(disable_2d_quantization=disable_2d_quantization)
     recipe_4over6 = NVFP4BlockScaling(
-        nvfp4_4over6="all", nvfp4_4over6_err_mode=err_mode, **recipe_kwargs
+        nvfp4_4over6="all",
+        nvfp4_4over6_err_mode=err_mode,
+        nvfp4_4over6_columnwise="none",
+        **recipe_kwargs,
     )
     recipe_baseline = NVFP4BlockScaling(**recipe_kwargs)
 
@@ -871,7 +876,10 @@ def test_linear_pretrain_recipe_4over6(
     without 4over6 for the same dY."""
     recipe_kwargs = dict(disable_2d_quantization=disable_2d_quantization)
     recipe_4over6 = NVFP4BlockScaling(
-        nvfp4_4over6=scope, nvfp4_4over6_err_mode=err_mode, **recipe_kwargs
+        nvfp4_4over6=scope,
+        nvfp4_4over6_err_mode=err_mode,
+        nvfp4_4over6_columnwise="none",
+        **recipe_kwargs,
     )
     recipe_baseline = NVFP4BlockScaling(**recipe_kwargs)
     assert not recipe_4over6.disable_rht and not recipe_4over6.disable_stochastic_rounding
@@ -1210,3 +1218,30 @@ def test_linear_backward_source(nvfp4_4over6, batch, seq, in_features, out_featu
     assert rel < 0.2, f"dgrad relative change {rel:.3e}"
     rel = (dw_a.double() - dw_d.double()).norm() / dw_d.double().norm()
     assert rel < 0.2, f"wgrad relative change {rel:.3e}"
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("scope", ["weights", "all"])
+@pytest.mark.parametrize("err_mode", ["MAE", "MSE"])
+def test_default_2d_weight_copies_encode_same_values(scope, err_mode):
+    """Default pre-training recipe: the rowwise (fprop) and columnwise (dgrad) copies of a
+    2D-quantized 4over6 weight decode to the same values."""
+    recipe = NVFP4BlockScaling(nvfp4_4over6=scope, nvfp4_4over6_err_mode=err_mode)
+    _, weight_quantizer, _ = _make_quantizers(recipe, "forward", 3)
+    assert weight_quantizer.with_2d_quantization and weight_quantizer.columnwise_uses_4over6
+    torch.manual_seed(11)
+    weight = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda")
+    weight[::37, ::29] *= 40.0
+
+    q = _quantize(weight_quantizer, weight)
+    assert q._rowwise_data is not None and q._columnwise_data is not None
+    assert float(q._amax_rowwise) == float(q._amax_columnwise)
+
+    def _decode(data, scale_inv, shape, columnwise):
+        values = _fp4_codes_to_values(_unpack_fp4(data))
+        scale = _e4m3_bytes_to_float(_valid_scale(scale_inv, shape, columnwise))
+        return values * scale.repeat_interleave(16, dim=1)
+
+    rowwise = _decode(q._rowwise_data, q._rowwise_scale_inv, weight.shape, False)
+    columnwise = _decode(q._columnwise_data, q._columnwise_scale_inv, weight.shape, True)
+    torch.testing.assert_close(rowwise, columnwise.T, rtol=0.0, atol=0.0)

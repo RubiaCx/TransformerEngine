@@ -636,6 +636,9 @@ class NVFP4BlockScaling(Recipe):
              pre-training configuration: only forward operands use 4over6)
              and to ``'all'`` when ``disable_rht=True`` (previous behavior of
              the RL/post-training configurations).
+             With ``'auto'``, 2D (16x16) weights always use 4over6 for both
+             copies, so that the forward and the input-gradient GEMM consume
+             the same weight values.
     nvfp4_backward_weight_source : {'high_precision', 'forward_quantized'}, default = 'high_precision'
              Source of the column-wise weight copy used by the input-gradient
              GEMM. ``'high_precision'`` quantizes it from the high-precision

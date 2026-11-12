@@ -1803,6 +1803,14 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     # Pre-training configuration (RHT enabled): only the fprop
                     # operands use 4over6. Without RHT: previous behavior.
                     columnwise_scope = "all" if self.recipe.disable_rht else "none"
+                    # 2D (16x16) weights: both copies must encode the same values, so
+                    # the copy used by the input-gradient GEMM follows the forward copy.
+                    if (
+                        columnwise_scope == "none"
+                        and tensor_type == "weight"
+                        and qparams.fp4_2d_quantization
+                    ):
+                        columnwise_scope = "weights"
                 if columnwise_scope == "all":
                     nvfp4_4over6_columnwise = True
                 elif columnwise_scope == "weights":
