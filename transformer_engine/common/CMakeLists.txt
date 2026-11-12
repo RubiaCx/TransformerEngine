@@ -370,6 +370,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      hadamard_transform/graph_safe_group_hadamard_transform.cu
      hadamard_transform/hadamard_transform.cu
      hadamard_transform/hadamard_transform_cast_fusion.cu
+     hadamard_transform/ms_eden_hadamard_transform_cast_fusion.cu
      hadamard_transform/row_cast_col_hadamard_transform_cast_fusion.cu
      hadamard_transform/group_hadamard_transform_cast_fusion.cu
      hadamard_transform/group_row_cast_col_hadamard_transform_cast_fusion.cu
@@ -473,12 +474,23 @@ set(CUTLASS_KERNEL_SOURCES
     gemm/cutlass_grouped_gemm.cu
     hadamard_transform/group_hadamard_transform_cast_fusion.cu
     hadamard_transform/group_row_cast_col_hadamard_transform_cast_fusion.cu
-    hadamard_transform/hadamard_transform_cast_fusion.cu)
+    hadamard_transform/hadamard_transform_cast_fusion.cu
+    hadamard_transform/ms_eden_hadamard_transform_cast_fusion.cu)
 set_property(
   SOURCE ${CUTLASS_KERNEL_SOURCES}
   APPEND
   PROPERTY
   COMPILE_OPTIONS "-g0;-dopt=on")
+
+# The MS-EDEN mode of the tiled-RHT kernel runs two 128-thread epilogue groups per CTA
+# (320 threads). The SM register file is shared by all threads of the CTA, which limits
+# the registers per thread: without a cap the kernel needs ~220 registers and the launch
+# fails with "too many resources requested for launch"; 172 launches on GB300 (SM 10.3).
+set_property(
+  SOURCE hadamard_transform/ms_eden_hadamard_transform_cast_fusion.cu
+  APPEND
+  PROPERTY
+  COMPILE_OPTIONS "--maxrregcount=172")
 
 # Configure dependencies
 target_link_libraries(transformer_engine PUBLIC

@@ -64,6 +64,10 @@ def _make_fused_quantization_output_spec(
         major * 10 + minor,
         disable_rht_cast_fusion,
     )
+    # The tiled-RHT kernels (MS-EDEN, dimension-128 RHT, rotated rowwise copy) always
+    # emit compact scales.
+    if quantizer.ms_eden or quantizer.rht_dim != 16 or quantizer.rht_rowwise:
+        alignment = None
     # Keep divisibility checks visible to Dynamo without specializing the dimensions.
     rows, cols = math.prod(shape[:-1]), shape[-1]
     if alignment is None:

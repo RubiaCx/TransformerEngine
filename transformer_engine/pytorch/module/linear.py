@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Callable, Dict, Optional, Tuple, Union, List
+import os
 import warnings
 import weakref
 
@@ -93,7 +94,11 @@ from ..dynamo import (
 )
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
-from ..tensor.nvfp4_tensor import NVFP4Quantizer
+from ..tensor.nvfp4_tensor import (
+    NVFP4Quantizer,
+    nvfp4_dgrad_rotated_weight,
+    rht_rotate_high_precision,
+)
 from ..tensor.utils import clear_columnwise_cache, is_custom
 from ..export import is_in_onnx_export_mode, assert_warmed_up
 from ..cpu_offload import (
@@ -299,6 +304,13 @@ class LinearBwdArgs:
     # --- Misc ---
     cpu_offloading: bool = False
     owns_input: bool = False
+
+    # --- NVFP4 RHT: sign-vector generation used by the forward pass (None unless the
+    # input quantizer resamples its RHT sign vector) ---
+    rht_sign_generation: Optional[int] = None
+    # Grad-output quantizer kept for the high-precision rotation debug mode
+    # (backward_override="high_precision" drops ``grad_output_quantizer``).
+    rht_debug_quantizer: Optional[Quantizer] = None
 
     # --- Per-backward scratch state (populated inside _linear_backward_impl) ---
     ub_obj_gradout: Optional[Any] = None
@@ -1070,6 +1082,17 @@ def _linear_setup_ctx(
     # Misc
     bwd_args.cpu_offloading = fwd_args.cpu_offloading
 
+    # NVFP4 RHT: remember the sign-vector generation of the forward pass so that the
+    # backward pass can check that its rotations pair with the forward ones.
+    if getattr(fwd_args.input_quantizer, "rht_dynamic_signs", False):
+        bwd_args.rht_sign_generation = fwd_args.input_quantizer.rht_sign_generation()
+    if (
+        backward_override == "high_precision"
+        and isinstance(fwd_args.grad_output_quantizer, NVFP4Quantizer)
+        and fwd_args.grad_output_quantizer.with_rht
+    ):
+        bwd_args.rht_debug_quantizer = fwd_args.grad_output_quantizer
+
     if backward_override is not None:
         bwd_args.fp8 = False
         bwd_args.debug = False
@@ -1143,6 +1166,55 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
     nvtx_label = "transformer_engine._Linear.backward"
     if bwd_args.ub_name is not None:
         nvtx_label = f"{nvtx_label}.{bwd_args.ub_name}"
+
+    # --- NVFP4 tiled RHT (begin) ---
+    # The rotations of the two operands of a backward GEMM only cancel if both use
+    # the same sign vector: the sign schedule must not advance between forward and
+    # backward.
+    if (
+        bwd_args.rht_sign_generation is not None
+        and input_quantizer.rht_sign_generation() != bwd_args.rht_sign_generation
+    ):
+        raise RuntimeError(
+            "The NVFP4 RHT sign schedule advanced between the forward pass (generation "
+            f"{bwd_args.rht_sign_generation}) and its backward pass (generation "
+            f"{input_quantizer.rht_sign_generation()}). Call nvfp4_rht_step() only after "
+            "the backward pass of a step."
+        )
+    # Debug mode: rotate the high-precision operands of the backward GEMMs without
+    # quantizing them (backward_override="high_precision" only). The results must
+    # equal the un-rotated ones up to floating-point error.
+    rht_debug_quantizer = None
+    if (
+        bwd_args.rht_debug_quantizer is not None
+        and os.environ.get("NVTE_NVFP4_RHT_HIGH_PRECISION_DEBUG", "0") == "1"
+    ):
+        rht_debug_quantizer = bwd_args.rht_debug_quantizer
+    # Rotated DGRAD (requested by the recipe through ``dgrad_rht``): the grad-output
+    # quantizer rotates its rowwise copy and provides the quantizer of the matching
+    # rotated weight copy. Only enabled where this function rotates the weight operand
+    # as well; otherwise the rowwise copy stays un-rotated.
+    rht_dgrad_quantizer = None
+    rht_grad_quantizer = (
+        rht_debug_quantizer if rht_debug_quantizer is not None else grad_output_quantizer
+    )
+    if getattr(rht_grad_quantizer, "dgrad_rht", False):
+        rotate_dgrad = (
+            bwd_args.requires_dgrad
+            and not is_dist_weight
+            and bwd_args.ub_name is None
+            and not bwd_args.sequence_parallel
+            and saved_weight.shape[0] % 128 == 0
+            and saved_weight.shape[-1] % 128 == 0
+        )
+        rht_grad_quantizer.set_rowwise_rht(rotate_dgrad)
+        if rotate_dgrad:
+            rht_dgrad_quantizer = rht_grad_quantizer
+    if rht_debug_quantizer is not None:
+        rht_debug_quantizer.refresh_rht_signs()
+        if isinstance(input_quantizer, NVFP4Quantizer):
+            input_quantizer.refresh_rht_signs()
+    # --- NVFP4 tiled RHT (end) ---
 
     with get_nvtx_range_context("_Linear_backward"):
         origin_weight_python_object = None
@@ -1411,9 +1483,26 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 weight_for_dgrad = saved_weight
                 if isinstance(weight_for_dgrad, QuantizedTensorStorage):
                     weight_for_dgrad = weight_for_dgrad.dequantize(dtype=bwd_args.activation_dtype)
+            # --- NVFP4 tiled RHT (begin) ---
+            grad_output_for_dgrad = grad_output
+            if rht_dgrad_quantizer is not None and bwd_args.fp8:
+                # Rotated DGRAD: replace the weight operand by a columnwise copy rotated
+                # along the output-channel dimension with the sign vector of the rotated
+                # rowwise grad-output copy. Re-quantized in every backward pass.
+                weight_for_dgrad = nvfp4_dgrad_rotated_weight(
+                    rht_dgrad_quantizer, weight_fp8, saved_weight
+                )
+            elif rht_debug_quantizer is not None and rht_debug_quantizer.rht_rowwise:
+                weight_for_dgrad = rht_rotate_high_precision(
+                    weight_for_dgrad, rht_debug_quantizer.rht_matrix_rowwise, dim=0
+                )
+                grad_output_for_dgrad = rht_rotate_high_precision(
+                    grad_output, rht_debug_quantizer.rht_matrix_rowwise, dim=-1
+                )
+            # --- NVFP4 tiled RHT (end) ---
             gemm_out, *_, reduce_scatter_out = general_gemm(
                 weight_for_dgrad,
-                grad_output,
+                grad_output_for_dgrad,
                 layout="NN",
                 grad=True,
                 quantization_params=grad_input_quantizer,
@@ -1654,7 +1743,15 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
             else:
 
                 # Call wgrad GEMM now
-                wgrad, grad_bias_ = wgrad_gemm(inputmat_total, grad_output)
+                if rht_debug_quantizer is not None:
+                    # NVFP4 tiled RHT debug mode: paired rotation of the high-precision
+                    # operands along the token dimension.
+                    wgrad, grad_bias_ = wgrad_gemm(
+                        rht_rotate_high_precision(inputmat_total, input_quantizer.rht_matrix, 0),
+                        rht_rotate_high_precision(grad_output, rht_debug_quantizer.rht_matrix, 0),
+                    )
+                else:
+                    wgrad, grad_bias_ = wgrad_gemm(inputmat_total, grad_output)
 
                 # Distributed weight (e.g. GTP): reduce-scatter the freshly computed wgrad
                 # (async; overlap with the next layer's bwd via the cascade).

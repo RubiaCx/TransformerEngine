@@ -15,6 +15,11 @@ from pydantic.dataclasses import dataclass
 _BACKWARD_OVERRIDES = (None, "high_precision", "dequantized")
 _NVFP4_4OVER6_SCOPES = ("none", "weights", "activations", "all")
 _NVFP4_4OVER6_ERR_MODES = ("MAE", "MSE")
+_NVFP4_GRAD_BIAS_CORRECTIONS = ("sr", "ms_eden")
+_NVFP4_RHT_DIMS = (16, 128)
+_NVFP4_RHT_SIGN_POLICIES = ("static", "resampled")
+_NVFP4_MS_EDEN_SCOPES = ("gradients", "all")
+_NVFP4_DGRAD_RHT_WEIGHT_SOURCES = ("high_precision", "dequantized")
 
 
 class _FormatHelper(NamedTuple):
@@ -84,6 +89,12 @@ class QParams:
     amax_epsilon: optional minimum value of abs max
     random_hadamard_transform: whether to use random hadamard transform
     stochastic_rounding: whether to use stocastic rounding
+    rht_dim: dimension of the tiled random hadamard transform (16 or 128)
+    ms_eden: whether the rotated copies use MS-EDEN, i.e. round-to-nearest FP4
+        values with EDEN-corrected, stochastically rounded micro-scales.
+        ``stochastic_rounding`` then only applies to un-rotated copies.
+    rht_rowwise: whether the rowwise copy is rotated too (along the last
+        dimension, the inner dimension of DGRAD for an output gradient).
     """
 
     power_2_scale: bool = False
@@ -91,8 +102,19 @@ class QParams:
     random_hadamard_transform: bool = False
     stochastic_rounding: bool = False
     fp4_2d_quantization: bool = False
+    rht_dim: int = 16
+    ms_eden: bool = False
+    rht_rowwise: bool = False
 
     def __post_init__(self) -> None:
+        # The repr of default-valued new fields is omitted so that existing
+        # configurations keep their repr.
+        extra = ""
+        if self.rht_dim != 16 or self.ms_eden or self.rht_rowwise:
+            extra = (
+                f",\nrht_dim={self.rht_dim},\nms_eden={self.ms_eden},"
+                f"\nrht_rowwise={self.rht_rowwise}"
+            )
         object.__setattr__(
             self,
             "_cached_repr",
@@ -100,7 +122,7 @@ class QParams:
             f"amax_epsilon={self.amax_epsilon},\n"
             f"random_hadamard_transform={self.random_hadamard_transform},\n"
             f"stochastic_rounding={self.stochastic_rounding},\n"
-            f"fp4_2d_quantization={self.fp4_2d_quantization}\n)",
+            f"fp4_2d_quantization={self.fp4_2d_quantization}{extra}\n)",
         )
 
     def __repr__(self) -> str:
@@ -592,6 +614,57 @@ class NVFP4BlockScaling(Recipe):
              to keep the standard NVFP4 448 bound for 4over6 tensors.
     nvfp4_4over6_err_mode : {'MAE', 'MSE'}, default = 'MAE'
              Error metric used by NVFP4 4over6 candidate selection.
+    grad_bias_correction : {'sr', 'ms_eden'}, default = 'sr'
+             Technique that removes the quantization bias of the rotated gradient
+             copies. ``'sr'`` is element-level stochastic rounding. ``'ms_eden'``
+             uses MS-EDEN (Quartet II, https://arxiv.org/abs/2601.22813): the
+             rotated values are rounded to nearest and the E4M3 micro-scales carry
+             a per-rotation-chunk EDEN correction with stochastic rounding.
+             Un-rotated gradient copies keep element-level stochastic rounding.
+             Requires RHT, BF16 inputs, the SM100 family and tensor dimensions
+             divisible by 128.
+    ms_eden_scope : {'gradients', 'all'}, default = 'gradients'
+             Operands quantized with MS-EDEN when ``grad_bias_correction='ms_eden'``.
+             ``'gradients'``: only the gradient copies; the other operand of each
+             rotated backward GEMM (forward input for WGRAD, weight for DGRAD) is
+             rotated with the same sign vector and rounded to nearest with a
+             range-aligned scale (two passes over the data). ``'all'``: the other
+             operand uses MS-EDEN as well (as in Quartet II).
+    ms_eden_grid_max : float, default = 6.0
+             Grid parameter ``s`` of the MS-EDEN round-to-nearest quantizer. The
+             micro-scale of a 16-element group is ``group_amax / s`` rounded to 3
+             mantissa bits. With ``s = 6`` the group amax maps to the largest E2M1
+             value (up to ~6% clipping of the largest element from scale
+             rounding); ``s <= 6 * 16 / 17`` never clips; ``s > 6`` clips elements
+             above ``6 / s`` of the group amax. The Quartet II code release uses
+             ``6 / ((17 / 16) * 0.93) ~= 6.072`` for backward tensors.
+    rht_dim : {16, 128}, default = 16
+             Dimension of the tiled random Hadamard transform applied along the
+             inner dimension of the rotated backward GEMMs.
+    rht_sign_policy : {'static', 'resampled'}, default = 'static'
+             ``'static'`` keeps one sign vector for the whole run (the hard-coded
+             vector for ``rht_dim=16``, a vector derived from ``rht_sign_seed``
+             otherwise). ``'resampled'`` derives a new sign vector from
+             ``(rht_sign_seed, step // rht_resample_interval)``, where the step
+             is advanced with ``transformer_engine.pytorch.nvfp4_rht_step()`` (or
+             automatically after each optimizer step with
+             ``nvfp4_rht_enable_auto_step()``). Both operands of a rotated GEMM
+             always use the same sign vector; the step must not advance between a
+             forward pass and its backward pass (checked in ``Linear``).
+    rht_resample_interval : int, default = 1
+             Number of steps between sign-vector resamplings.
+    rht_sign_seed : int, default = 0
+             Seed of the sign vectors.
+    dgrad_rht : bool, default = False
+             Also rotate the DGRAD operands: the rowwise copy of the output
+             gradient and a columnwise weight copy are rotated along the
+             output-channel dimension with a shared sign vector (independent of
+             the WGRAD one). The gradient copy uses ``grad_bias_correction``; the
+             weight copy follows ``ms_eden_scope``. The rotated weight copy is
+             re-quantized in every backward pass. Supported by ``Linear`` only.
+    dgrad_rht_weight_source : {'high_precision', 'dequantized'}, default = 'high_precision'
+             Source of the rotated weight copy: the high-precision weight, or the
+             de-quantized forward weight (as in Quartet II).
     backward_override : {None, 'high_precision', 'dequantized'}, default = None
             Backward precision mode. None does not modify backward behavior,
             `high_precision` keeps original high-precision operands for backward,
@@ -621,6 +694,20 @@ class NVFP4BlockScaling(Recipe):
     fp4_quant_fwd_weight: QParams = field(init=False, repr=False, compare=False)
     fp4_quant_bwd_grad: QParams = field(init=False, repr=False, compare=False)
 
+    # RHT dimension / sign policy and gradient bias correction (declared last so
+    # that the positional order of the pre-existing fields is unchanged).
+    grad_bias_correction: str = os.getenv("NVTE_NVFP4_GRAD_BIAS_CORRECTION", "sr").lower()
+    rht_dim: int = int(os.getenv("NVTE_NVFP4_RHT_DIM", "16"))
+    rht_sign_policy: str = os.getenv("NVTE_NVFP4_RHT_SIGN_POLICY", "static").lower()
+    rht_resample_interval: int = int(os.getenv("NVTE_NVFP4_RHT_RESAMPLE_INTERVAL", "1"))
+    rht_sign_seed: int = int(os.getenv("NVTE_NVFP4_RHT_SIGN_SEED", "0"))
+    dgrad_rht: bool = os.getenv("NVTE_NVFP4_DGRAD_RHT", "0") == "1"
+    dgrad_rht_weight_source: str = os.getenv(
+        "NVTE_NVFP4_DGRAD_RHT_WEIGHT_SOURCE", "high_precision"
+    ).lower()
+    ms_eden_scope: str = os.getenv("NVTE_NVFP4_MS_EDEN_SCOPE", "gradients").lower()
+    ms_eden_grid_max: float = float(os.getenv("NVTE_NVFP4_MS_EDEN_GRID_MAX", "6.0"))
+
     def __post_init__(self) -> None:
         assert self.fp4_format == Format.E2M1, "Only E2M1 is supported for NVFP4 scaling"
         assert self.fp8_format in (
@@ -640,13 +727,56 @@ class NVFP4BlockScaling(Recipe):
             self.nvfp4_4over6_err_mode in _NVFP4_4OVER6_ERR_MODES
         ), "NVTE_NVFP4_4OVER6_ERR_MODE must be one of: 'MAE', 'MSE'."
 
+        assert (
+            self.grad_bias_correction in _NVFP4_GRAD_BIAS_CORRECTIONS
+        ), "NVTE_NVFP4_GRAD_BIAS_CORRECTION must be one of: 'sr', 'ms_eden'."
+        assert self.rht_dim in _NVFP4_RHT_DIMS, "NVTE_NVFP4_RHT_DIM must be 16 or 128."
+        assert (
+            self.rht_sign_policy in _NVFP4_RHT_SIGN_POLICIES
+        ), "NVTE_NVFP4_RHT_SIGN_POLICY must be one of: 'static', 'resampled'."
+        assert self.rht_resample_interval >= 1, "NVTE_NVFP4_RHT_RESAMPLE_INTERVAL must be >= 1."
+        assert (
+            self.dgrad_rht_weight_source in _NVFP4_DGRAD_RHT_WEIGHT_SOURCES
+        ), "NVTE_NVFP4_DGRAD_RHT_WEIGHT_SOURCE must be one of: 'high_precision', 'dequantized'."
+        assert (
+            self.ms_eden_scope in _NVFP4_MS_EDEN_SCOPES
+        ), "NVTE_NVFP4_MS_EDEN_SCOPE must be one of: 'gradients', 'all'."
+        assert self.ms_eden_grid_max > 0, "NVTE_NVFP4_MS_EDEN_GRID_MAX must be positive."
+        use_ms_eden = self.grad_bias_correction == "ms_eden"
+        tiled_rht = use_ms_eden or self.rht_dim != 16 or self.dgrad_rht
+        if tiled_rht:
+            if self.disable_rht:
+                raise ValueError(
+                    "grad_bias_correction='ms_eden', rht_dim=128 and dgrad_rht require RHT "
+                    "(disable_rht=False)."
+                )
+            if self.fp8_format != Format.E4M3:
+                raise ValueError(
+                    "grad_bias_correction='ms_eden', rht_dim=128 and dgrad_rht require E4M3 scales."
+                )
+            if self.row_scaled_activation:
+                raise ValueError(
+                    "grad_bias_correction='ms_eden', rht_dim=128 and dgrad_rht are incompatible "
+                    "with row_scaled_activation."
+                )
+            if self.nvfp4_4over6 in ("activations", "all") and (use_ms_eden or self.rht_dim != 16):
+                raise ValueError(
+                    "grad_bias_correction='ms_eden' and rht_dim=128 are incompatible with 4over6 "
+                    "activations: the rotated forward-input copy does not support 4over6."
+                )
+
         # Quantization params
         # Note: RHT is currently only applied to column-wise usage so that
-        # it can be used for wgrad GEMM.
+        # it can be used for wgrad GEMM. Both WGRAD operands (the column-wise
+        # copies of the forward input and of the output gradient) are rotated with
+        # the same sign vector; MS-EDEN applies to the gradient, and to the input
+        # when ms_eden_scope='all'.
         self.fp4_quant_fwd_inp = QParams(
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=False,
             fp4_2d_quantization=False,
+            rht_dim=self.rht_dim,
+            ms_eden=use_ms_eden and self.ms_eden_scope == "all",
         )
         self.fp4_quant_fwd_weight = QParams(
             random_hadamard_transform=False,
@@ -657,9 +787,32 @@ class NVFP4BlockScaling(Recipe):
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=not self.disable_stochastic_rounding,
             fp4_2d_quantization=False,
+            rht_dim=self.rht_dim,
+            ms_eden=use_ms_eden,
+            rht_rowwise=self.dgrad_rht,
         )
 
     def _make_repr(self) -> str:
+        # Non-default RHT / bias-correction options are appended so that default
+        # configurations keep their repr.
+        extra = ""
+        if (
+            self.grad_bias_correction != "sr"
+            or self.rht_dim != 16
+            or self.rht_sign_policy != "static"
+            or self.dgrad_rht
+        ):
+            extra = (
+                f"grad_bias_correction={self.grad_bias_correction}, "
+                f"ms_eden_scope={self.ms_eden_scope}, "
+                f"ms_eden_grid_max={self.ms_eden_grid_max}, "
+                f"rht_dim={self.rht_dim}, "
+                f"rht_sign_policy={self.rht_sign_policy}, "
+                f"rht_resample_interval={self.rht_resample_interval}, "
+                f"rht_sign_seed={self.rht_sign_seed}, "
+                f"dgrad_rht={self.dgrad_rht}, "
+                f"dgrad_rht_weight_source={self.dgrad_rht_weight_source}, "
+            )
         return (
             f"recipe_type={self.__class__.__name__}, "
             f"fp4_format={str(self.fp4_format).split('.')[1]}, "
@@ -675,6 +828,7 @@ class NVFP4BlockScaling(Recipe):
             f"fp4_quant_fwd_inp={self.fp4_quant_fwd_inp}, "
             f"fp4_quant_fwd_weight={self.fp4_quant_fwd_weight}, "
             f"fp4_quant_bwd_grad={self.fp4_quant_bwd_grad}, "
+            f"{extra}"
         )
 
 
