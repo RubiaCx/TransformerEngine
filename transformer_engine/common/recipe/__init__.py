@@ -15,6 +15,8 @@ from pydantic.dataclasses import dataclass
 _BACKWARD_OVERRIDES = (None, "high_precision", "dequantized")
 _NVFP4_4OVER6_SCOPES = ("none", "weights", "activations", "all")
 _NVFP4_4OVER6_ERR_MODES = ("MAE", "MSE")
+_NVFP4_4OVER6_COLUMNWISE_SCOPES = ("auto", "none", "weights", "activations", "all")
+_NVFP4_BACKWARD_SOURCES = ("high_precision", "forward_quantized")
 
 
 class _FormatHelper(NamedTuple):
@@ -582,14 +584,58 @@ class NVFP4BlockScaling(Recipe):
     nvfp4_4over6 : {'none', 'weights', 'activations', 'all'}, default = 'none'
              Enable 4over6 adaptive NVFP4 block scaling for selected tensor
              scopes. For each selected FP4 block, quantization compares
-             map-to-4 and map-to-6 candidates and stores the candidate with
-             lower configured error. Current 4over6 support targets RL and
-             post-training scenarios; pre-training paths that combine 4over6
-             with RHT are not yet implemented.
+             map-to-4 and map-to-6 candidates (round-to-nearest) and stores
+             the candidate with lower configured error.
+
+             4over6 is applied to the row-wise copy of the selected forward
+             tensors, i.e. the un-rotated, round-to-nearest operands of the
+             forward GEMM (input ``X`` and weight ``W``). It can be combined
+             with the pre-training configuration (RHT and stochastic rounding
+             enabled): the column-wise RHT copy of the input used by the
+             weight-gradient GEMM and all gradient tensors (RHT + stochastic
+             rounding) remain standard NVFP4. 4over6 is never combined with
+             stochastic rounding. Whether column-wise copies quantized
+             without RHT (e.g. the weight copy ``W.T`` used by the
+             input-gradient GEMM) also use 4over6 is controlled by
+             ``nvfp4_4over6_columnwise``.
+
+             Limitations: 4over6 requires E4M3 block scales and is not
+             supported by the grouped (``GroupedTensor``) quantization path
+             or by row-scaled activations with column-wise output. 2D
+             (16x16) 4over6 requires both tensor dimensions to be multiples
+             of 16.
+    nvfp4_4over6_columnwise : {'auto', 'none', 'weights', 'activations', 'all'}, default = 'auto'
+             Select tensor scopes whose column-wise copy also uses 4over6.
+             Only applies to tensors selected by ``nvfp4_4over6`` and only to
+             column-wise copies quantized without RHT; a column-wise RHT copy
+             is always standard NVFP4. ``'weights'`` enables 4over6 for the
+             weight copy used by the input-gradient GEMM (``W.T``).
+             ``'auto'`` resolves to ``'none'`` when RHT is enabled (the
+             pre-training configuration: only forward operands use 4over6)
+             and to ``'all'`` when ``disable_rht=True`` (previous behavior of
+             the RL/post-training configurations).
+    nvfp4_backward_weight_source : {'high_precision', 'forward_quantized'}, default = 'high_precision'
+             Source of the column-wise weight copy used by the input-gradient
+             GEMM. ``'high_precision'`` quantizes it from the high-precision
+             weight, like the row-wise copy. ``'forward_quantized'`` quantizes
+             it from the de-quantized row-wise (forward) copy, so the backward
+             pass sees the weight values used by the forward pass. This costs a
+             de-quantization and a second quantization pass. It is a no-op for
+             2D (16x16) weight scaling when both copies use the same scheme
+             (standard or 4over6), since they already encode the same values.
+    nvfp4_backward_activation_source : {'high_precision', 'forward_quantized'}, default = 'high_precision'
+             Source of the column-wise input copy used by the weight-gradient
+             GEMM. With ``'forward_quantized'`` the copy (with RHT if enabled)
+             is quantized from the de-quantized row-wise (forward) input.
+             Not supported for row-scaled activations.
     nvfp4_4over6_e4m3_use_256 : {'none', 'weights', 'activations', 'all'}, default = 'all'
              Select 4over6 tensors that use 256 as the global E4M3 scale
              bound. By default, all 4over6 tensors use 256. Use ``'none'``
              to keep the standard NVFP4 448 bound for 4over6 tensors.
+             The bound applies to the copies quantized with 4over6. A
+             standard NVFP4 column-wise copy of the same tensor keeps the
+             448 bound; the two bounds are tracked separately in the tensor
+             metadata consumed by GEMM.
     nvfp4_4over6_err_mode : {'MAE', 'MSE'}, default = 'MAE'
              Error metric used by NVFP4 4over6 candidate selection.
     backward_override : {None, 'high_precision', 'dequantized'}, default = None
@@ -609,6 +655,13 @@ class NVFP4BlockScaling(Recipe):
     nvfp4_4over6: str = os.getenv("NVTE_NVFP4_4OVER6", "none")
     nvfp4_4over6_e4m3_use_256: str = os.getenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all")
     nvfp4_4over6_err_mode: str = os.getenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
+    nvfp4_4over6_columnwise: str = os.getenv("NVTE_NVFP4_4OVER6_COLUMNWISE", "auto")
+    nvfp4_backward_weight_source: str = os.getenv(
+        "NVTE_NVFP4_BACKWARD_WEIGHT_SOURCE", "high_precision"
+    )
+    nvfp4_backward_activation_source: str = os.getenv(
+        "NVTE_NVFP4_BACKWARD_ACTIVATION_SOURCE", "high_precision"
+    )
 
     fp4_format: Format = Format.E2M1
     fp8_format: Format = Format.E4M3
@@ -639,6 +692,18 @@ class NVFP4BlockScaling(Recipe):
         assert (
             self.nvfp4_4over6_err_mode in _NVFP4_4OVER6_ERR_MODES
         ), "NVTE_NVFP4_4OVER6_ERR_MODE must be one of: 'MAE', 'MSE'."
+        assert self.nvfp4_4over6_columnwise in _NVFP4_4OVER6_COLUMNWISE_SCOPES, (
+            "NVTE_NVFP4_4OVER6_COLUMNWISE must be one of: "
+            "'auto', 'none', 'weights', 'activations', 'all'."
+        )
+        assert self.nvfp4_backward_weight_source in _NVFP4_BACKWARD_SOURCES, (
+            "NVTE_NVFP4_BACKWARD_WEIGHT_SOURCE must be one of: "
+            "'high_precision', 'forward_quantized'."
+        )
+        assert self.nvfp4_backward_activation_source in _NVFP4_BACKWARD_SOURCES, (
+            "NVTE_NVFP4_BACKWARD_ACTIVATION_SOURCE must be one of: "
+            "'high_precision', 'forward_quantized'."
+        )
 
         # Quantization params
         # Note: RHT is currently only applied to column-wise usage so that
@@ -672,6 +737,9 @@ class NVFP4BlockScaling(Recipe):
             f"nvfp4_4over6={self.nvfp4_4over6}, "
             f"nvfp4_4over6_e4m3_use_256={self.nvfp4_4over6_e4m3_use_256}, "
             f"nvfp4_4over6_err_mode={self.nvfp4_4over6_err_mode}, "
+            f"nvfp4_4over6_columnwise={self.nvfp4_4over6_columnwise}, "
+            f"nvfp4_backward_weight_source={self.nvfp4_backward_weight_source}, "
+            f"nvfp4_backward_activation_source={self.nvfp4_backward_activation_source}, "
             f"fp4_quant_fwd_inp={self.fp4_quant_fwd_inp}, "
             f"fp4_quant_fwd_weight={self.fp4_quant_fwd_weight}, "
             f"fp4_quant_bwd_grad={self.fp4_quant_bwd_grad}, "

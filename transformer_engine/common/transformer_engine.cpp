@@ -936,6 +936,13 @@ void nvte_set_tensor_param_v2(NVTETensor tensor, NVTETensorParam param, const vo
                      t.nvfp4_e4m3_max == 114688,
                  "Unsupported NVFP4 scale type max (got ", t.nvfp4_e4m3_max, ")");
       break;
+    case kNVTENVFP4ColumnwiseE4M3Max:
+      std::memcpy(&t.nvfp4_columnwise_e4m3_max, buf, attr_size);
+      NVTE_CHECK(t.nvfp4_columnwise_e4m3_max == 0 || t.nvfp4_columnwise_e4m3_max == 448 ||
+                     t.nvfp4_columnwise_e4m3_max == 256 || t.nvfp4_columnwise_e4m3_max == 114688,
+                 "Unsupported columnwise NVFP4 scale type max (got ", t.nvfp4_columnwise_e4m3_max,
+                 ")");
+      break;
     default:
       NVTE_ERROR("Unsupported tensor parameter (", static_cast<int>(param), ")");
   }
@@ -1021,6 +1028,11 @@ void nvte_get_tensor_param_v2(const NVTETensor tensor, NVTETensorParam param, vo
       break;
     case kNVTENVFP4E4M3Max: {
       int val = t->get_nvfp4_scale_max();
+      std::memcpy(buf, &val, attr_size);
+    } break;
+    case kNVTENVFP4ColumnwiseE4M3Max: {
+      // Raw override value: 0 means "same bound as the rowwise copy".
+      int val = t->nvfp4_columnwise_e4m3_max;
       std::memcpy(buf, &val, attr_size);
     } break;
     default:
@@ -1140,6 +1152,9 @@ void nvte_get_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath:
       bool_to_uint8(config_.nvfp4_4over6_err_use_fast_math, buf);
       break;
+    case kNVTEQuantizationConfigNVFP44Over6ColumnwiseStandard:
+      bool_to_uint8(config_.nvfp4_4over6_columnwise_standard, buf);
+      break;
     case kNVTEQuantizationConfigMXFP82DQuantization:
       bool_to_uint8(config_.mxfp8_2d_quantization, buf);
       break;
@@ -1209,6 +1224,9 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
     }
     case kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath:
       uint8_to_bool(buf, config_.nvfp4_4over6_err_use_fast_math);
+      break;
+    case kNVTEQuantizationConfigNVFP44Over6ColumnwiseStandard:
+      uint8_to_bool(buf, config_.nvfp4_4over6_columnwise_standard);
       break;
     case kNVTEQuantizationConfigMXFP82DQuantization:
       uint8_to_bool(buf, config_.mxfp8_2d_quantization);

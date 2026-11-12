@@ -292,7 +292,6 @@ __device__ __forceinline__ void accumulate_dequant_error_pair_pow2(const uint32_
   // dequant_bits packs two FP16 values (1 sign, 5 exponent, 10 mantissa bits): x0's in the low
   // half, x1's in the high half.
   constexpr int fp16_bits = 16;
-  constexpr uint32_t fp16_low_half_mask = 0xFFFFu;
   constexpr int fp16_mantissa_bits = 10;
   // Top FP16 mantissa bit. Among E2M1 magnitudes it is set exactly for 1.5 * 2^k (1.5, 3, 6),
   // and clearing it maps 1.5 * 2^k to 2^k.
@@ -300,14 +299,39 @@ __device__ __forceinline__ void accumulate_dequant_error_pair_pow2(const uint32_
   constexpr uint32_t mantissa_msb_hi = mantissa_msb_lo << fp16_bits;
   // That bit selects D_1.5 over D_1; clearing it in both halves leaves the 2^k factors.
   const uint32_t pow2_bits = dequant_bits & ~(mantissa_msb_lo | mantissa_msb_hi);
-  const float q0 =
-      __half2float(__ushort_as_half(static_cast<uint16_t>(pow2_bits & fp16_low_half_mask)));
-  const float q1 = __half2float(__ushort_as_half(static_cast<uint16_t>(pow2_bits >> fp16_bits)));
+  float q0;
+  float q1;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo, hi;\n"
+      "mov.b32 {lo, hi}, %2;\n"
+      "cvt.f32.f16 %0, lo;\n"
+      "cvt.f32.f16 %1, hi;\n"
+      "}"
+      : "=f"(q0), "=f"(q1)
+      : "r"(pow2_bits));
   const float base0 = (dequant_bits & mantissa_msb_lo) ? bases.d15 : bases.d1;
   const float base1 = (dequant_bits & mantissa_msb_hi) ? bases.d15 : bases.d1;
   // q * base is exact, so the FMA's single rounding is that of the difference from x.
   *err = __fadd_rn(*err, compute_error_rn<Cfg::mode>(__fmaf_rn(q0, base0, -x0)));
   *err = __fadd_rn(*err, compute_error_rn<Cfg::mode>(__fmaf_rn(q1, base1, -x1)));
+}
+
+// Per-element strict error for blocks outside the range where the power-of-two factoring is
+// exact (zero or denormal-range scales).
+template <typename Cfg, int E4M3_MAX>
+__device__ __forceinline__ void accumulate_dequant_error_8x_out_of_range(
+    const uint32_t dequant_1, const uint32_t dequant_2, const uint32_t dequant_3,
+    const uint32_t dequant_4, const float *x, const float sf, const float global_amax,
+    float *err) {
+  accumulate_dequant_error<Cfg, E4M3_MAX, 0>(dequant_1, x[0], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 16>(dequant_1, x[1], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 0>(dequant_2, x[2], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 16>(dequant_2, x[3], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 0>(dequant_3, x[4], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 16>(dequant_3, x[5], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 0>(dequant_4, x[6], sf, global_amax, err);
+  accumulate_dequant_error<Cfg, E4M3_MAX, 16>(dequant_4, x[7], sf, global_amax, err);
 }
 
 template <typename Cfg, int E4M3_MAX>
@@ -363,15 +387,9 @@ __device__ __forceinline__ uint32_t cvt_fp32_to_fp4_8x_with_error(
     accumulate_dequant_error_pair_pow2<Cfg>(out_dequant_3, x[4], x[5], strict_bases, err);
     accumulate_dequant_error_pair_pow2<Cfg>(out_dequant_4, x[6], x[7], strict_bases, err);
   } else {
-    const float sf_float = static_cast<float>(sf);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 0>(out_dequant_1, x[0], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 16>(out_dequant_1, x[1], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 0>(out_dequant_2, x[2], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 16>(out_dequant_2, x[3], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 0>(out_dequant_3, x[4], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 16>(out_dequant_3, x[5], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 0>(out_dequant_4, x[6], sf_float, global_amax, err);
-    accumulate_dequant_error<Cfg, E4M3_MAX, 16>(out_dequant_4, x[7], sf_float, global_amax, err);
+    accumulate_dequant_error_8x_out_of_range<Cfg, E4M3_MAX>(
+        out_dequant_1, out_dequant_2, out_dequant_3, out_dequant_4, x, static_cast<float>(sf),
+        global_amax, err);
   }
   return out;
 }
@@ -407,6 +425,34 @@ __device__ __forceinline__ CandidatePair make_candidates(const float (&x0)[8], c
       x1, scales.inv_map6, scales.map6, fp16_error_scales.map6, global_amax,
       scales.global_encode_scale, strict_bases6, &candidates.map6.err);
   return candidates;
+}
+
+// Round-to-nearest FP4 cast of 8 values scaled by block_scale_inverse (standard NVFP4).
+__device__ __forceinline__ uint32_t cvt_fp32_to_fp4_8x(const float (&x)[8],
+                                                       const float block_scale_inverse) {
+  uint32_t out = 0;
+  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
+  if constexpr (is_blackwell) {
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+        "}"
+        : "=r"(out)
+        : "f"(__fmul_rn(x[0], block_scale_inverse)), "f"(__fmul_rn(x[1], block_scale_inverse)),
+          "f"(__fmul_rn(x[2], block_scale_inverse)), "f"(__fmul_rn(x[3], block_scale_inverse)),
+          "f"(__fmul_rn(x[4], block_scale_inverse)), "f"(__fmul_rn(x[5], block_scale_inverse)),
+          "f"(__fmul_rn(x[6], block_scale_inverse)), "f"(__fmul_rn(x[7], block_scale_inverse)));
+  } else {
+    NVTE_DEVICE_ERROR(
+        "FP4 cvt PTX instructions are architecture-specific. "
+        "Try recompiling with sm_XXXa instead of sm_XXX.");
+  }
+  return out;
 }
 
 __device__ __forceinline__ float reduce_group_sum_16(float value) {
@@ -451,6 +497,28 @@ __device__ __forceinline__ nvfp4_scale_t select_scale(const ScalePair &scales,
     return scales.map4;
   }
   return scales.map6;
+}
+
+// Quantize one 1x16 group (x0 = elements 0..7, x1 = elements 8..15) with 4over6 candidate
+// selection. Writes the selected packed FP4 codes (element i in bits [4i, 4i+4) of the 64-bit
+// little-endian pair) and returns the selected E4M3 block scale.
+//
+// This performs the same operation sequence as the 1D branch of quantize_stage_rowwise, so the
+// result is the same as the dedicated 4over6 kernel for the same block. It is used by the
+// rowwise half of the RHT cast-fusion kernels (pre-training recipe: rowwise 4over6 +
+// columnwise RHT standard NVFP4), which bring their own data movement.
+template <typename Cfg, int E4M3_MAX>
+__device__ __forceinline__ nvfp4_scale_t quantize_group_1d(
+    const float (&x0)[8], const float (&x1)[8], const float block_amax,
+    const GlobalScales &global_scales, const float global_amax,
+    uint32_t (&packed)[kPackedWordsPerGroup]) {
+  const ScalePair scale_pair = compute_scale_pair(block_amax, global_scales);
+  const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
+  const bool pick_map4 = candidates.map4.err < candidates.map6.err;
+  const uint32_t *selected = select_packed(candidates, pick_map4);
+  packed[0] = selected[0];
+  packed[1] = selected[1];
+  return select_scale(scale_pair, pick_map4);
 }
 
 __device__ __forceinline__ void cp_async_cg_16(void *dst, const void *src) {
@@ -583,7 +651,9 @@ __device__ void quantize_stage_rowwise(const IType *tile, fp4e2m1x2 *output, nvf
   }
 }
 
-template <bool USE_2D_QUANTIZATION, typename Cfg, int E4M3_MAX, typename IType>
+// COL_STANDARD: the columnwise copy is standard NVFP4 (no candidate selection, full scale range
+// of the scale type), computed with the same operations as the standard quantize kernels.
+template <bool USE_2D_QUANTIZATION, bool COL_STANDARD, typename Cfg, int E4M3_MAX, typename IType>
 __device__ void quantize_stage_colwise(const IType *tile, fp4e2m1x2 *output_t,
                                        nvfp4_scale_t *scales_t, const float *amax,
                                        const size_t rows, const size_t cols, const size_t stage_row,
@@ -595,6 +665,11 @@ __device__ void quantize_stage_colwise(const IType *tile, fp4e2m1x2 *output_t,
     global_amax = amax[0];
   }
   const GlobalScales global_scales = compute_global_scales<E4M3_MAX>(global_amax);
+  // Standard NVFP4 global scales: unit encode scale without an amax.
+  const float standard_S_enc =
+      (amax == nullptr) ? 1.0f
+                        : core::compute_global_encode_scaling_factor_FP4<nvfp4_scale_t>(amax[0]);
+  const float standard_S_dec = 1.0f / standard_S_enc;
   for (int group = threadIdx.x; group < groups; group += blockDim.x) {
     const int local_row_group = group / kTileCols;
     const int local_col = group - local_row_group * kTileCols;
@@ -615,6 +690,21 @@ __device__ void quantize_stage_colwise(const IType *tile, fp4e2m1x2 *output_t,
       block_amax = reduce_group_max_16(group_amax);
     }
 
+    const size_t global_row_group = global_row / kGroupSize;
+    if constexpr (COL_STANDARD) {
+      const nvfp4_scale_t standard_scale =
+          core::compute_decoding_scaling_factor<nvfp4_scale_t>(block_amax, standard_S_enc);
+      const float standard_scale_inverse =
+          fminf(1.0f / (static_cast<float>(standard_scale) * standard_S_dec),
+                detail::TypeExtrema<float>::max);
+      uint32_t standard_packed[kPackedWordsPerGroup];
+      standard_packed[0] = cvt_fp32_to_fp4_8x(x0, standard_scale_inverse);
+      standard_packed[1] = cvt_fp32_to_fp4_8x(x1, standard_scale_inverse);
+      scales_t[global_col * scale_stride_t + global_row_group] = standard_scale;
+      store_packed_group(standard_packed, &output_t[(global_col * rows + global_row) / 2]);
+      continue;
+    }
+
     const ScalePair scale_pair = compute_scale_pair(block_amax, global_scales);
     CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
 
@@ -629,7 +719,6 @@ __device__ void quantize_stage_colwise(const IType *tile, fp4e2m1x2 *output_t,
     const nvfp4_scale_t selected_scale = select_scale(scale_pair, pick_map4);
     const uint32_t *selected = select_packed(candidates, pick_map4);
 
-    const size_t global_row_group = global_row / kGroupSize;
     scales_t[global_col * scale_stride_t + global_row_group] = selected_scale;
     store_packed_group(selected, &output_t[(global_col * rows + global_row) / 2]);
   }
@@ -639,7 +728,8 @@ __device__ void quantize_stage_colwise(const IType *tile, fp4e2m1x2 *output_t,
 // (quantize_4over6_kernel below) and the NVRTC entry point
 // (rtc/quantize_4over6.cu).
 template <bool USE_2D_QUANTIZATION, bool RETURN_IDENTITY, bool RETURN_TRANSPOSE,
-          bool ROW_SCALED_NVFP4, typename Cfg, int E4M3_MAX, typename IType>
+          bool ROW_SCALED_NVFP4, typename Cfg, int E4M3_MAX, typename IType,
+          bool COL_STANDARD = false>
 __device__ __forceinline__ void quantize_4over6_body(
     const IType *input, fp4e2m1x2 *output, fp4e2m1x2 *output_t, nvfp4_scale_t *scales,
     nvfp4_scale_t *scales_t, const float *amax_rowwise, const float *amax_colwise,
@@ -688,7 +778,7 @@ __device__ __forceinline__ void quantize_4over6_body(
       if (columnwise_amax == nullptr) {
         columnwise_amax = amax_rowwise;
       }
-      quantize_stage_colwise<USE_2D_QUANTIZATION, Cfg, E4M3_MAX>(
+      quantize_stage_colwise<USE_2D_QUANTIZATION, COL_STANDARD, Cfg, E4M3_MAX>(
           stage_tile, output_t, scales_t, columnwise_amax, rows, cols, stage_row, tile_col,
           scale_stride_t);
     }
@@ -703,9 +793,121 @@ __device__ __forceinline__ void quantize_4over6_body(
 #endif
 }
 
+// Dequantize one stage of the rowwise NVFP4 copy into the shared memory tile as IType, with the
+// same operations as the NVFP4 dequantize kernel. Returns the largest magnitude this thread wrote.
+template <int ROW_E4M3_MAX, typename IType>
+__device__ float load_stage_from_rowwise_nvfp4(const fp4e2m1x2 *codes,
+                                               const nvfp4_scale_t *row_scales,
+                                               const float *amax_rowwise, IType *tile,
+                                               const size_t rows, const size_t cols,
+                                               const size_t stage_row, const size_t tile_col,
+                                               const size_t scale_stride) {
+  constexpr int groups = kStageRows * kTileColGroups;
+  constexpr float unit_global_scale_amax =
+      detail::TypeExtrema<fp4e2m1>::max * static_cast<float>(ROW_E4M3_MAX);
+  constexpr float factor_inv = 1.0f / unit_global_scale_amax;
+  const float global_amax = (amax_rowwise != nullptr) ? amax_rowwise[0] : unit_global_scale_amax;
+  float thread_amax = 0.0f;
+  for (int group = threadIdx.x; group < groups; group += blockDim.x) {
+    const int local_row = group / kTileColGroups;
+    const int local_col = (group % kTileColGroups) * kGroupSize;
+    const size_t global_row = stage_row + local_row;
+    const size_t global_col = tile_col + local_col;
+    IType *dst = &tile[local_row * kTileCols + local_col];
+    if (global_row >= rows || global_col >= cols) {
+#pragma unroll
+      for (int i = 0; i < kGroupSize; ++i) {
+        dst[i] = static_cast<IType>(0.0f);
+      }
+      continue;
+    }
+    const uint64_t packed =
+        *reinterpret_cast<const uint64_t *>(&codes[(global_row * cols + global_col) / 2]);
+    const nvfp4_scale_t scale = row_scales[global_row * scale_stride + global_col / kGroupSize];
+    const float final_scale =
+        __fmul_rn(__fmul_rn(static_cast<float>(scale), global_amax), factor_inv);
+#pragma unroll
+    for (int b = 0; b < kGroupSize / 2; ++b) {
+      const uint32_t code_pair = static_cast<uint32_t>(packed >> (8 * b)) & 0xFFu;
+      float v0;
+      float v1;
+      asm volatile(
+          "{\n"
+          ".reg .b8 pair;\n"
+          ".reg .b32 pair_h2;\n"
+          ".reg .b16 lo, hi;\n"
+          "cvt.u8.u32 pair, %2;\n"
+          "cvt.rn.f16x2.e2m1x2 pair_h2, pair;\n"
+          "mov.b32 {lo, hi}, pair_h2;\n"
+          "cvt.f32.f16 %0, lo;\n"
+          "cvt.f32.f16 %1, hi;\n"
+          "}"
+          : "=f"(v0), "=f"(v1)
+          : "r"(code_pair));
+      const IType d0 = static_cast<IType>(__fmul_rn(v0, final_scale));
+      const IType d1 = static_cast<IType>(__fmul_rn(v1, final_scale));
+      dst[2 * b] = d0;
+      dst[2 * b + 1] = d1;
+      thread_amax = fmaxf(thread_amax, fabsf(static_cast<float>(d0)));
+      thread_amax = fmaxf(thread_amax, fabsf(static_cast<float>(d1)));
+    }
+  }
+  return thread_amax;
+}
+
+// Columnwise copy quantized from the dequantized rowwise copy, without materializing the
+// dequantized tensor. AMAX_ONLY: only reduce the amax of the dequantized tensor into
+// amax_colwise (which must be zero-initialized); otherwise quantize the columnwise copy.
+template <bool USE_2D_QUANTIZATION, bool COL_STANDARD, bool AMAX_ONLY, typename Cfg,
+          int ROW_E4M3_MAX, int COL_E4M3_MAX, typename IType>
+__device__ __forceinline__ void quantize_4over6_colwise_from_rowwise_body(
+    const fp4e2m1x2 *codes, const nvfp4_scale_t *row_scales, const float *amax_rowwise,
+    fp4e2m1x2 *output_t, nvfp4_scale_t *scales_t, float *amax_colwise, const size_t rows,
+    const size_t cols, const size_t scale_stride, const size_t scale_stride_t) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  extern __shared__ char dynamic_shmem[];
+  auto *tile = reinterpret_cast<IType *>(dynamic_shmem);
+  const size_t tile_col = blockIdx.x * kTileCols;
+  const size_t tile_row = blockIdx.y * kTileRows;
+
+  float thread_amax = 0.0f;
+  for (int stage = 0; stage < kPipelineStages; ++stage) {
+    const size_t stage_row = tile_row + stage * kStageRows;
+    thread_amax = fmaxf(thread_amax, load_stage_from_rowwise_nvfp4<ROW_E4M3_MAX>(
+                                         codes, row_scales, amax_rowwise, tile, rows, cols,
+                                         stage_row, tile_col, scale_stride));
+    if constexpr (!AMAX_ONLY) {
+      __syncthreads();
+      quantize_stage_colwise<USE_2D_QUANTIZATION, COL_STANDARD, Cfg, COL_E4M3_MAX>(
+          tile, output_t, scales_t, amax_colwise, rows, cols, stage_row, tile_col,
+          scale_stride_t);
+      __syncthreads();
+    }
+  }
+
+  if constexpr (AMAX_ONLY) {
+    // Warp reduction, then one guarded atomic per warp. Non-negative floats order like ints.
+#pragma unroll
+    for (int offset = kWarpThreads / 2; offset > 0; offset /= 2) {
+      thread_amax = fmaxf(thread_amax, __shfl_down_sync(0xffffffffu, thread_amax, offset));
+    }
+    if ((threadIdx.x & (kWarpThreads - 1)) == 0 && amax_colwise != nullptr) {
+      int *amax_bits = reinterpret_cast<int *>(amax_colwise);
+      const int value_bits = __float_as_int(thread_amax);
+      if (value_bits > *reinterpret_cast<volatile int *>(amax_bits)) {
+        atomicMax(amax_bits, value_bits);
+      }
+    }
+  }
+#else
+  NVTE_DEVICE_ERROR("sm_100 or higher is required.");
+#endif
+}
+
 // Statically-instantiated entry point (NVTE_BUILD_LEGACY_STATIC_NVFP4 fallback).
 template <bool USE_2D_QUANTIZATION, bool RETURN_IDENTITY, bool RETURN_TRANSPOSE,
-          bool ROW_SCALED_NVFP4, typename Cfg, int E4M3_MAX, typename IType>
+          bool ROW_SCALED_NVFP4, typename Cfg, int E4M3_MAX, typename IType,
+          bool COL_STANDARD = false>
 __global__ void __launch_bounds__(kThreads)
     quantize_4over6_kernel(const IType *input, fp4e2m1x2 *output, fp4e2m1x2 *output_t,
                            nvfp4_scale_t *scales, nvfp4_scale_t *scales_t,
@@ -713,9 +915,9 @@ __global__ void __launch_bounds__(kThreads)
                            const size_t cols, const size_t scale_stride,
                            const size_t scale_stride_t, const float *noop) {
   quantize_4over6_body<USE_2D_QUANTIZATION, RETURN_IDENTITY, RETURN_TRANSPOSE, ROW_SCALED_NVFP4,
-                       Cfg, E4M3_MAX, IType>(input, output, output_t, scales, scales_t,
-                                             amax_rowwise, amax_colwise, rows, cols, scale_stride,
-                                             scale_stride_t, noop);
+                       Cfg, E4M3_MAX, IType, COL_STANDARD>(
+      input, output, output_t, scales, scales_t, amax_rowwise, amax_colwise, rows, cols,
+      scale_stride, scale_stride_t, noop);
 }
 
 }  // namespace quantize_4over6_kernel

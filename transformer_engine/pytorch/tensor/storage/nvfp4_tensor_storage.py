@@ -106,6 +106,10 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
     _nvfp4_use_4over6: bool
     # Global E4M3 scale bound used by this NVFP4 tensor
     _nvfp4_e4m3_max: int
+    # Explicit global scale bound of the columnwise copy. 0 (default): same bound
+    # as the rowwise copy. Non-zero when the rowwise copy is quantized with 4over6
+    # (e.g. bound 256) and the columnwise copy is standard NVFP4 (bound 448).
+    _nvfp4_columnwise_e4m3_max: int = 0
 
     def __new__(
         cls,
@@ -124,6 +128,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
         row_scaled_nvfp4: bool = False,
         nvfp4_use_4over6: bool = False,
         nvfp4_e4m3_max: int = 0,
+        nvfp4_columnwise_e4m3_max: int = 0,
         **kwargs,
     ):
         if cls is NVFP4TensorStorage:
@@ -145,6 +150,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
         instance._row_scaled_nvfp4 = row_scaled_nvfp4
         instance._nvfp4_use_4over6 = nvfp4_use_4over6
         instance._nvfp4_e4m3_max = nvfp4_e4m3_max
+        instance._nvfp4_columnwise_e4m3_max = nvfp4_columnwise_e4m3_max
 
         return instance
 
@@ -177,6 +183,8 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
             raise RuntimeError("NVFP4 4over6 mode mismatch in copy_from_storage")
         if self._nvfp4_e4m3_max != src._nvfp4_e4m3_max:
             raise RuntimeError("NVFP4 4over6 E4M3 scale bound mismatch in copy_from_storage")
+        if self._nvfp4_columnwise_e4m3_max != src._nvfp4_columnwise_e4m3_max:
+            raise RuntimeError("NVFP4 columnwise scale bound mismatch in copy_from_storage")
 
         def _copy_optional(dst: Optional[torch.Tensor], src_tensor: Optional[torch.Tensor]):
             if dst is not None and src_tensor is not None:
@@ -205,6 +213,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
             "row_scaled_nvfp4": self._row_scaled_nvfp4,
             "nvfp4_use_4over6": self._nvfp4_use_4over6,
             "nvfp4_e4m3_max": self._nvfp4_e4m3_max,
+            "nvfp4_columnwise_e4m3_max": self._nvfp4_columnwise_e4m3_max,
             "fake_dtype": self._dtype,
         }
 
@@ -343,6 +352,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
             row_scaled_nvfp4=self._row_scaled_nvfp4,
             nvfp4_use_4over6=self._nvfp4_use_4over6,
             nvfp4_e4m3_max=self._nvfp4_e4m3_max,
+            nvfp4_columnwise_e4m3_max=self._nvfp4_columnwise_e4m3_max,
             fake_dtype=self._dtype,
         )
 

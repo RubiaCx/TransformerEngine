@@ -17,6 +17,7 @@
 
 #include "common/cast/core/common.cuh"
 #include "common/cast/nvfp4/core_nvfp4.cuh"
+#include "common/cast/nvfp4/quantize_4over6_nvfp4.cuh"
 #include "common/cast/nvfp4/quantize_transpose_nvfp4.cuh"
 #include "common/common.h"
 #include "common/util/cuda_runtime.h"
@@ -168,7 +169,13 @@ template <class MShape, class NShape, class KShape, class ClusterShape, class Cl
           bool kEnableStochasticRounding_ = false,
           bool kEnableRHTColQuant_ = true,
           bool kEnableRowQuant_ = true,
-          bool kUseFastMath_ = true>
+          bool kUseFastMath_ = true,
+          // 4over6 candidate selection for the rowwise (un-rotated, round-to-nearest) output only.
+          // kRow4Over6Mode_ is an NVTENVFP44Over6Mode value; 0 (disabled) compiles the 4over6
+          // code out entirely. The columnwise RHT output is always standard NVFP4.
+          int kRow4Over6Mode_ = 0,
+          bool kRow4Over6ErrFastMath_ = false,
+          int kRow4Over6ScaleMax_ = 448>
 __launch_bounds__(512, 1)
 __global__ static void row_col_rht_gemm_device(
     MShape M,
@@ -224,6 +231,10 @@ __global__ static void row_col_rht_gemm_device(
   static constexpr bool kEnableRHTColQuant = kEnableRHTColQuant_;
   static constexpr bool kEnableRowQuant = kEnableRowQuant_;
   static constexpr bool kUseFastMath = kUseFastMath_;
+  static constexpr bool kEnableRow4Over6 = kRow4Over6Mode_ != 0;
+  static_assert(!kEnableRow4Over6 || (kEnableRowQuant_ && !kEnableStochasticRounding_),
+                "Rowwise 4over6 requires rowwise output and is incompatible with "
+                "stochastic rounding.");
   static int constexpr RhtTensorSize = 16;
   static int constexpr kTmaRhtTensorTransactionBytes = cutlass::bits_to_bytes(
       RhtTensorSize * RhtTensorSize * cute::sizeof_bits_v<TB>);
@@ -933,6 +944,26 @@ __global__ static void row_col_rht_gemm_device(
       // Scaling factor for fast math path
       float global_encode_scale_multiplier = global_encode_scale * fp4_max_inv;
 
+#if FP4_TYPE_SUPPORTED
+      // Rowwise 4over6: global encode/decode scales with the rowwise scale bound
+      // (kRow4Over6ScaleMax_, e.g. 256), matching the dedicated 4over6 kernel.
+      namespace fos = dispatch::nvfp4::quantize_4over6_kernel;
+      using Row4Over6Cfg =
+          fos::Config<static_cast<NVTENVFP44Over6Mode>(kRow4Over6Mode_), kRow4Over6ErrFastMath_>;
+      [[maybe_unused]] fos::GlobalScales row_4over6_global_scales{};
+      [[maybe_unused]] float row_4over6_global_amax = a_global_amax_val;
+      if constexpr (kEnableRow4Over6) {
+        static_assert(std::is_same<TSFA, fos::nvfp4_scale_t>::value,
+                      "Rowwise 4over6 requires E4M3 block scales.");
+        if (a_global_amax == nullptr) {
+          // Without an amax, the global amax defaults to scale_max * fp4_max (encode scale 1).
+          row_4over6_global_amax = static_cast<float>(kRow4Over6ScaleMax_) * fp4_max;
+        }
+        row_4over6_global_scales =
+            fos::compute_global_scales<kRow4Over6ScaleMax_>(row_4over6_global_amax);
+      }
+#endif  // FP4_TYPE_SUPPORTED
+
       auto sfa_converter = cutlass::NumericConverter<TSFA, ElementAccumulator>{};
       do {
         uint32_t skip_wait = K_TILE_MAX <= 0;
@@ -965,6 +996,37 @@ __global__ static void row_col_rht_gemm_device(
           CUTLASS_PRAGMA_UNROLL
           for (int v = 0; v < size(tQArA)/VectorSize; v++) {
             auto compute_frgs_up = cutlass::NumericArrayConverter<ElementAccumulator, TA, VectorSize>{}(compute_frgs[v]);
+            if constexpr (kEnableRow4Over6) {
+#if FP4_TYPE_SUPPORTED
+              // 4over6: quantize the 1x16 group under the map-to-6 and map-to-4 scales
+              // (round-to-nearest) and keep the candidate with the lower configured error.
+              float x0[8];
+              float x1[8];
+              float block_amax = 0.0f;
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < 8; ++i) {
+                const float v0 = compute_frgs_up[i];
+                const float v1 = compute_frgs_up[i + 8];
+                x0[i] = v0;
+                x1[i] = v1;
+                block_amax = fmaxf(block_amax, fabsf(v0));
+                block_amax = fmaxf(block_amax, fabsf(v1));
+              }
+              uint32_t packed[fos::kPackedWordsPerGroup];
+              const TSFA selected_scale =
+                  fos::quantize_group_1d<Row4Over6Cfg, kRow4Over6ScaleMax_>(
+                      x0, x1, block_amax, row_4over6_global_scales, row_4over6_global_amax,
+                      packed);
+              filter(tQArSFA)(v) = selected_scale;
+              // cutlass::Array<float_e2m1_t, 16> stores element i in bits [4i, 4i+4) of two
+              // 32-bit words, which is the packing produced by quantize_group_1d.
+              uint32_t *output_words = reinterpret_cast<uint32_t *>(&output_frgs[v]);
+              output_words[0] = packed[0];
+              output_words[1] = packed[1];
+#else
+              NVTE_DEVICE_ERROR("FP4 support requires CUDA 12.8+.");
+#endif  // FP4_TYPE_SUPPORTED
+            } else {
             auto amax = amax_reduction(ElementAccumulator(0), compute_frgs_up);
             // declare pvscales
             ElementAccumulator pvscales;
@@ -993,6 +1055,7 @@ __global__ static void row_col_rht_gemm_device(
                   compute_frgs_up,
                   acc_scale));
             }
+            }  // !kEnableRow4Over6
           }
 
           cute::Tensor pred_tQApQA = cute::lazy::transform(make_tensor(counting_iterator<int>{}, replace<0>(shape(tQAgQA_mn), _1{})), [&](auto coord){
@@ -1032,7 +1095,8 @@ __global__ static void row_col_rht_gemm_device(
 // QA: m x n: col-major
 // SFA: m/16 x n: col-major
 template <bool kEnableStochasticRounding, bool kEnableRHTColQuant, bool kEnableRowQuant, bool kEnableSwizzleSFOutput,
-class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true>
+class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true,
+int kRow4Over6Mode=0, bool kRow4Over6ErrFastMath=false, int kRow4Over6ScaleMax=448>
 void row_col_rht_gemm_ntt_w_sfc(
     int sequence_length,
     int hidden_size,
@@ -1212,7 +1276,10 @@ void row_col_rht_gemm_ntt_w_sfc(
     kEnableStochasticRounding,
     kEnableRHTColQuant,
     kEnableRowQuant,
-    kUseFastMath>;
+    kUseFastMath,
+    kRow4Over6Mode,
+    kRow4Over6ErrFastMath,
+    kRow4Over6ScaleMax>;
 
   NVTE_CHECK_CUDA(cudaFuncSetAttribute(*kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1332,10 +1399,34 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
 
   NVTE_CHECK(m % hadamard_dimension == 0, "num_rows must be divisible by hadamard_dimension");
 
+  // NVFP4 4over6 in the RHT cast-fusion kernel applies to the rowwise output only: the rowwise
+  // copy is the un-rotated, round-to-nearest operand of the fprop GEMM. The columnwise RHT
+  // output (wgrad operand) is always standard NVFP4.
+  const bool nvfp4_4over6_requested = quant_config.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
+  const bool use_row_4over6 = nvfp4_4over6_requested && has_rowwise_quant;
+  if (nvfp4_4over6_requested) {
+    NVTE_CHECK(!use_stochastic_rounding,
+               "NVFP4 4over6 quantization does not support stochastic rounding.");
+    NVTE_CHECK(scale_dtype == DType::kFloat8E4M3,
+               "NVFP4 4over6 quantization is only supported with FP8E4M3 scales.");
+    // The columnwise RHT copy is quantized with the full scale range of the scale dtype, so
+    // the tensor metadata consumed by GEMM must say the same.
+    NVTE_CHECK(!has_columnwise_quant ||
+                   static_cast<float>(output_.get_nvfp4_columnwise_scale_max()) ==
+                       typeToMax(scale_dtype),
+               "NVFP4 4over6 with RHT: the columnwise RHT output is standard NVFP4 and must use "
+               "the default scale bound (found ",
+               output_.get_nvfp4_columnwise_scale_max(),
+               "). Set the columnwise scale bound of the output tensor to the default.");
+  }
+
   // SM120/121 do not provide TMEM. Reuse the NVFP4 1D TMA pipeline and perform the
   // 16-point columnwise RHT in registers, while leaving the SM100/110 UMMA/TMEM path below intact.
   const int sm_arch = transformer_engine::cuda::sm_arch(transformer_engine::cuda::current_device());
   if (sm_arch == 120 || sm_arch == 121) {
+    NVTE_CHECK(!use_row_4over6,
+               "NVFP4 4over6 is not implemented in the SM120/SM121 RHT cast-fusion path. "
+               "Quantize the rowwise 4over6 output and the columnwise RHT output separately.");
     Tensor noop;
     if (output_.columnwise_data.dptr != nullptr) {
       dispatch::nvfp4::quantize_transpose<true, true>(input_, &noop, &output_, &quant_config,
@@ -1355,6 +1446,49 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
   // GEMM consumes, eliminating the otherwise-required
   // nvte_swizzle_scaling_factors pass between quantize and GEMM.
   const bool use_swizzle_sf_output = output_.with_gemm_swizzled_scales;
+
+  if (use_row_4over6) {
+#if FP4_TYPE_SUPPORTED
+    // Fused single pass: rowwise 4over6 cast + columnwise RHT standard cast.
+    // The rowwise half uses the tensor's rowwise scale bound (256 or 448). NVTE_USE_FAST_MATH
+    // is not applied to 4over6 quantizers, so the columnwise half uses the exact-math path.
+    using ScaleType = fp8e4m3;
+    const int rowwise_scale_max = output_.get_nvfp4_scale_max();
+    TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
+        rowwise_scale_max, kRowScaleMax,
+        TRANSFORMER_ENGINE_NVFP4_4OVER6_MODE_SWITCH(
+            quant_config.nvfp4_4over6_mode, kRowMode,
+            TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                quant_config.nvfp4_4over6_err_use_fast_math, kRowErrFastMath,
+                TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                    has_columnwise_quant, kEnableRhtColQuant,
+                    TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                        use_swizzle_sf_output, kEnableSwizzleSFOutput,
+
+                        detail::row_col_rht_gemm_ntt_w_sfc<
+                            /*kEnableStochasticRounding=*/false, kEnableRhtColQuant,
+                            /*kEnableRowQuant=*/true, kEnableSwizzleSFOutput, TA, TB, TD,
+                            ScaleType, TQA, ScaleType, /*kUseFastMath=*/false,
+                            static_cast<int>(kRowMode), kRowErrFastMath, kRowScaleMax>(
+                            /*sequence_length=*/m, /*hidden_size=*/n,
+                            /*A=*/reinterpret_cast<TA const *>(input.dptr),
+                            /*B=*/reinterpret_cast<TB const *>(hadamard_matrix.dptr),
+                            /*D=*/reinterpret_cast<TD *>(columnwise_data_ptr),
+                            /*SFD=*/reinterpret_cast<ScaleType *>(columnwise_scale_inv_ptr),
+                            /*QA=*/reinterpret_cast<TQA *>(rowwise_data_ptr),
+                            /*SFA=*/reinterpret_cast<ScaleType *>(rowwise_scale_inv_ptr),
+                            /*a_global_amax=*/reinterpret_cast<float const *>(rowwise_amax_ptr),
+                            /*d_global_amax=*/
+                            reinterpret_cast<float const *>(columnwise_amax_ptr),
+                            /*rng_state=*/nullptr, /*sm_count=*/sm_count,
+                            /*stream=*/stream, /*k_tile_size=*/k_tile_size);
+
+                    );););););
+    return;
+#else
+    NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+  }
 
   TRANSFORMER_ENGINE_NVFP4_SCALE_TYPE_SWITCH(
       scale_dtype, ScaleType,

@@ -54,6 +54,20 @@ void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t str
                               stream);
 }
 
+void nvte_nvfp4_quantize_columnwise_from_rowwise(NVTETensor output, NVTEDType dtype,
+                                                 const NVTEQuantizationConfig quant_config,
+                                                 cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_quantize_columnwise_from_rowwise);
+  using namespace transformer_engine;
+  QuantizationConfig quant_config_cpp;
+  if (quant_config != nullptr) {
+    quant_config_cpp = *reinterpret_cast<QuantizationConfig *>(quant_config);
+  }
+  dispatch::nvfp4::quantize_columnwise_from_rowwise(convertNVTETensorCheck(output),
+                                                    static_cast<DType>(dtype), &quant_config_cpp,
+                                                    stream);
+}
+
 void nvte_multi_tensor_quantize(const NVTETensor *inputs, NVTETensor *outputs,
                                 const NVTEQuantizationConfig quant_configs,
                                 const size_t num_tensors, cudaStream_t stream) {

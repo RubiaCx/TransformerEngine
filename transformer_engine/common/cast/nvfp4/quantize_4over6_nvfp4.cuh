@@ -58,7 +58,7 @@ namespace quantize_4over6_kernel {
 
 template <bool USE_2D_QUANTIZATION, typename Cfg, int E4M3_MAX, typename IType>
 void launch_quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const bool col_standard) {
   const size_t rows = input.flat_first_dim();
   const size_t cols = input.flat_last_dim();
   const bool row_scaled_nvfp4 = output->row_scaled_nvfp4;
@@ -90,19 +90,21 @@ void launch_quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *out
     rtc_nvfp4::launch_quantize_4over6_rtc<USE_2D_QUANTIZATION, Cfg, E4M3_MAX, IType>(
         input_ptr, output_ptr, output_t_ptr, scales_ptr, scales_t_ptr, amax_rowwise_ptr,
         amax_colwise_ptr, rows, cols, scale_stride, scale_stride_t, noop_ptr, return_identity,
-        return_transpose, row_scaled_nvfp4, grid, block, shmem, stream);
+        return_transpose, row_scaled_nvfp4, grid, block, shmem, stream, col_standard);
   } else {
 #if NVTE_BUILD_LEGACY_STATIC_NVFP4
     TRANSFORMER_ENGINE_SWITCH_CONDITION(return_identity, RETURN_IDENTITY, {
       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
         TRANSFORMER_ENGINE_SWITCH_CONDITION(row_scaled_nvfp4, ROW_SCALED_NVFP4, {
-          auto kernel =
-              quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_IDENTITY, RETURN_TRANSPOSE,
-                                     ROW_SCALED_NVFP4, Cfg, E4M3_MAX, IType>;
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
-          kernel<<<grid, block, shmem, stream>>>(
-              input_ptr, output_ptr, output_t_ptr, scales_ptr, scales_t_ptr, amax_rowwise_ptr,
-              amax_colwise_ptr, rows, cols, scale_stride, scale_stride_t, noop_ptr);
+          TRANSFORMER_ENGINE_SWITCH_CONDITION(col_standard, COL_STANDARD, {
+            auto kernel =
+                quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_IDENTITY, RETURN_TRANSPOSE,
+                                       ROW_SCALED_NVFP4, Cfg, E4M3_MAX, IType, COL_STANDARD>;
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+            kernel<<<grid, block, shmem, stream>>>(
+                input_ptr, output_ptr, output_t_ptr, scales_ptr, scales_t_ptr, amax_rowwise_ptr,
+                amax_colwise_ptr, rows, cols, scale_stride, scale_stride_t, noop_ptr);
+          });
         });
       });
     });
@@ -151,6 +153,20 @@ void quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
   NVTE_CHECK(!use_2d_quantization || output->has_data(),
              "NVFP4 4over6 2D quantization requires rowwise output.");
 
+  // Rowwise 4over6 + standard NVFP4 columnwise output in one launch. The columnwise output
+  // uses the full scale range of the scale type.
+  const bool col_standard =
+      quant_config->nvfp4_4over6_columnwise_standard && output->has_columnwise_data();
+  if (col_standard) {
+    NVTE_CHECK(output->has_data(),
+               "NVFP4 4over6 with a standard columnwise output requires rowwise output.");
+    NVTE_CHECK(static_cast<float>(output->get_nvfp4_columnwise_scale_max()) ==
+                   typeToMax(output->columnwise_scale_inv.dtype),
+               "The standard columnwise output of NVFP4 4over6 quantization must use the default "
+               "scale bound (found ",
+               output->get_nvfp4_columnwise_scale_max(), ").");
+  }
+
   if (output->has_data()) {
     NVTE_CHECK(output->scale_inv.dptr != nullptr, "Scaling tensor must be allocated.");
     NVTE_CHECK(is_fp4_dtype(output->data.dtype), "Output must have FP4 type.");
@@ -177,9 +193,93 @@ void quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
                     input.dtype(), IType,
                     quantize_4over6_kernel::launch_quantize_4over6<use_2d_quantization, Cfg,
                                                                    E4M3_MAX, IType>(
-                        input, noop, output, stream););
+                        input, noop, output, stream, col_standard););
               });););
 
+  NVTE_CHECK_CUDA(cudaGetLastError());
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+/*! \brief Quantize the columnwise copy of an NVFP4 tensor from its dequantized rowwise copy.
+ *
+ *  Equivalent to dequantizing the rowwise copy to `dtype`, computing its amax and quantizing the
+ *  columnwise copy from it (standard NVFP4, or 4over6 if enabled in the config), without
+ *  materializing the dequantized tensor. No RHT.
+ */
+inline void quantize_columnwise_from_rowwise(Tensor *output, const DType dtype,
+                                             const QuantizationConfig *quant_config,
+                                             cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  using namespace quantize_4over6_kernel;
+  checkCuDriverContext(stream);
+  NVTE_CHECK(quant_config != nullptr, "Quantization config is required.");
+  NVTE_CHECK(output->scaling_mode == NVTE_NVFP4_1D_SCALING, "Output must be an NVFP4 tensor.");
+  NVTE_CHECK(output->has_data() && output->has_columnwise_data(),
+             "Output must have rowwise and columnwise data.");
+  NVTE_CHECK(output->scale_inv.dtype == DType::kFloat8E4M3 &&
+                 output->columnwise_scale_inv.dtype == DType::kFloat8E4M3,
+             "Only FP8E4M3 scales are supported.");
+  NVTE_CHECK(!output->with_gemm_swizzled_scales, "Scales must be in compact format.");
+  NVTE_CHECK(!output->row_scaled_nvfp4, "Row-scaled NVFP4 is not supported.");
+  NVTE_CHECK(!quant_config->stochastic_rounding, "Stochastic rounding is not supported.");
+  NVTE_CHECK(transformer_engine::rtc::is_enabled(), "This path requires NVRTC.");
+  const size_t rows = output->flat_first_dim();
+  const size_t cols = output->flat_last_dim();
+  NVTE_CHECK(rows % kGroupSize == 0 && cols % kGroupSize == 0,
+             "Tensor dimensions must be divisible by ", kGroupSize, ".");
+
+  const bool col_standard = quant_config->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled;
+  const NVTENVFP44Over6Mode mode =
+      col_standard ? kNVTENVFP44Over6MinMAE : quant_config->nvfp4_4over6_mode;
+  const bool use_2d_quantization = quant_config->nvfp4_2d_quantization;
+  const int row_scale_max = output->get_nvfp4_scale_max();
+  const int col_scale_max = output->get_nvfp4_columnwise_scale_max();
+  NVTE_CHECK(!col_standard || col_scale_max == 448,
+             "A standard columnwise copy must use the default scale bound.");
+
+  const auto *codes = reinterpret_cast<const fp4e2m1x2 *>(output->data.dptr);
+  const auto *row_scales = reinterpret_cast<const nvfp4_scale_t *>(output->scale_inv.dptr);
+  const auto *amax_rowwise = reinterpret_cast<const float *>(output->amax.dptr);
+  auto *output_t = reinterpret_cast<fp4e2m1x2 *>(output->columnwise_data.dptr);
+  auto *scales_t = reinterpret_cast<nvfp4_scale_t *>(output->columnwise_scale_inv.dptr);
+  auto *amax_colwise = reinterpret_cast<float *>(output->columnwise_amax.dptr);
+  const size_t scale_stride = output->scale_inv.shape[1];
+  const size_t scale_stride_t = output->columnwise_scale_inv.shape[1];
+  const dim3 grid(DIVUP(cols, static_cast<size_t>(kTileCols)),
+                  DIVUP(rows, static_cast<size_t>(kTileRows)));
+  const dim3 block(kThreads);
+  if (amax_colwise != nullptr) {
+    NVTE_CHECK_CUDA(cudaMemsetAsync(amax_colwise, 0, sizeof(float), stream));
+  }
+
+  TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
+      row_scale_max, ROW_E4M3_MAX,
+      TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
+          col_scale_max, COL_E4M3_MAX,
+          TRANSFORMER_ENGINE_NVFP4_4OVER6_MODE_SWITCH(
+              mode, MODE,
+              TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                  quant_config->nvfp4_4over6_err_use_fast_math, ERR_USE_FAST_MATH,
+                  TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                      use_2d_quantization, USE_2D,
+                      TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(dtype, IType, {
+                        using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
+                        const size_t shmem = kStageRows * kTileCols * sizeof(IType);
+                        if (amax_colwise != nullptr) {
+                          rtc_nvfp4::launch_quantize_4over6_from_rowwise_rtc<
+                              USE_2D, Cfg, ROW_E4M3_MAX, COL_E4M3_MAX, IType>(
+                              codes, row_scales, amax_rowwise, output_t, scales_t, amax_colwise,
+                              rows, cols, scale_stride, scale_stride_t, col_standard,
+                              /*amax_only=*/true, grid, block, shmem, stream);
+                        }
+                        rtc_nvfp4::launch_quantize_4over6_from_rowwise_rtc<
+                            USE_2D, Cfg, ROW_E4M3_MAX, COL_E4M3_MAX, IType>(
+                            codes, row_scales, amax_rowwise, output_t, scales_t, amax_colwise,
+                            rows, cols, scale_stride, scale_stride_t, col_standard,
+                            /*amax_only=*/false, grid, block, shmem, stream);
+                      }););););););
   NVTE_CHECK_CUDA(cudaGetLastError());
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);

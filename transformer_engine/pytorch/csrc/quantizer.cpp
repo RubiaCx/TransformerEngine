@@ -1884,6 +1884,13 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   this->stochastic_rounding = quantizer.attr("stochastic_rounding").cast<bool>();
   const bool nvfp4_use_4over6 = quantizer.attr("nvfp4_use_4over6").cast<bool>();
   this->nvfp4_e4m3_max = quantizer.attr("nvfp4_e4m3_max").cast<int>();
+  // Older/custom Python quantizer objects may not define this attribute; default to the
+  // legacy behaviour (columnwise non-RHT copy also uses 4over6).
+  this->nvfp4_4over6_columnwise = py::hasattr(quantizer, "nvfp4_4over6_columnwise")
+                                      ? quantizer.attr("nvfp4_4over6_columnwise").cast<bool>()
+                                      : true;
+  this->columnwise_from_rowwise = py::hasattr(quantizer, "columnwise_from_rowwise") &&
+                                  quantizer.attr("columnwise_from_rowwise").cast<bool>();
   const auto nvfp4_4over6_err_mode = quantizer.attr("nvfp4_4over6_err_mode").cast<std::string>();
   if (!nvfp4_use_4over6) {
     this->nvfp4_4over6_mode = kNVTENVFP44Over6Disabled;
@@ -2098,6 +2105,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(
     kwargs["row_scaled_nvfp4"] = py::cast(row_scaled_nvfp4);
     kwargs["nvfp4_use_4over6"] = py::cast(nvfp4_use_4over6);
     kwargs["nvfp4_e4m3_max"] = py::cast(this->nvfp4_e4m3_max);
+    kwargs["nvfp4_columnwise_e4m3_max"] = py::cast(this->columnwise_e4m3_max());
     kwargs["fake_dtype"] = GetATenDType(dtype);
 
     py::tuple args(0);
@@ -2131,6 +2139,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(
     kwargs["row_scaled_nvfp4"] = py::cast(row_scaled_nvfp4);
     kwargs["nvfp4_use_4over6"] = py::cast(nvfp4_use_4over6);
     kwargs["nvfp4_e4m3_max"] = py::cast(this->nvfp4_e4m3_max);
+    kwargs["nvfp4_columnwise_e4m3_max"] = py::cast(this->columnwise_e4m3_max());
     py::tuple args(0);
     PyObject* result = PyObject_Call(reinterpret_cast<PyObject*>(NVFP4TensorPythonClass),
                                      args.ptr(), kwargs.ptr());
@@ -2170,6 +2179,9 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(
   out_cpp.set_row_scaled_nvfp4(row_scaled_nvfp4);
   if (this->nvfp4_e4m3_max != 0) {
     out_cpp.set_nvfp4_e4m3_max(this->nvfp4_e4m3_max);
+  }
+  if (this->columnwise_e4m3_max() != 0) {
+    out_cpp.set_nvfp4_columnwise_e4m3_max(this->columnwise_e4m3_max());
   }
   this->set_quantization_params(&out_cpp);
 
@@ -2382,6 +2394,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
   tensor.attr("_with_gemm_swizzled_scales") = with_gemm_swizzled_scales;
   tensor.attr("_nvfp4_use_4over6") = py::cast(nvfp4_use_4over6);
   tensor.attr("_nvfp4_e4m3_max") = py::cast(this->nvfp4_e4m3_max);
+  tensor.attr("_nvfp4_columnwise_e4m3_max") = py::cast(this->columnwise_e4m3_max());
   tensor.attr("_scale_dtype") = MakePythonDType(this->scale_dtype);
 
   // Coerce row-wise data
@@ -2501,6 +2514,9 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
   if (this->nvfp4_e4m3_max != 0) {
     out_cpp.set_nvfp4_e4m3_max(this->nvfp4_e4m3_max);
   }
+  if (this->columnwise_e4m3_max() != 0) {
+    out_cpp.set_nvfp4_columnwise_e4m3_max(this->columnwise_e4m3_max());
+  }
   this->set_quantization_params(&out_cpp);
 
   return {std::move(out_cpp), std::move(tensor)};
@@ -2532,6 +2548,11 @@ void NVFP4Quantizer::quantize_with_rht_unfused_helper(
                                        out_identity_scale_inv.shape);
     out_identity.set_amax(out_identity_amax.data_ptr, static_cast<DType>(out_identity_amax.dtype),
                           out_identity_amax.shape);
+    if (this->uses_4over6()) {
+      // The rowwise copy is quantized with 4over6: the view must carry the rowwise scale bound.
+      // The columnwise RHT copy below is standard NVFP4 and keeps the default bound.
+      out_identity.set_nvfp4_e4m3_max(out.get_nvfp4_e4m3_max());
+    }
 
     NVTE_SCOPED_GIL_RELEASE(
         { nvte_quantize_v2(input.data(), out_identity.data(), quant_config, stream); });
@@ -2580,9 +2601,108 @@ void NVFP4Quantizer::quantize_with_rht_unfused_helper(
   }
 }
 
+void NVFP4Quantizer::quantize_columnwise_from_rowwise(const TensorWrapper& input,
+                                                      TensorWrapper& out,
+                                                      const std::optional<TensorWrapper>& noop_flag,
+                                                      bool compute_amax) {
+  NVTE_CHECK(!this->row_scaled_nvfp4,
+             "Quantizing the columnwise copy from the forward-quantized copy is not supported "
+             "for row-scaled NVFP4.");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const bool with_gemm_swizzled_scales = out.get_with_gemm_swizzled_scales();
+
+  // Restore the usage flags on exit: each copy is quantized by a single-copy quantize_impl call.
+  struct UsageGuard {
+    NVFP4Quantizer& quantizer;
+    const bool rowwise;
+    const bool columnwise;
+    ~UsageGuard() {
+      quantizer.rowwise_usage = rowwise;
+      quantizer.columnwise_usage = columnwise;
+    }
+  } usage_guard{*this, this->rowwise_usage, this->columnwise_usage};
+
+  // 1. Rowwise (forward) copy from the high-precision input.
+  auto rowwise_data = out.get_rowwise_data();
+  auto rowwise_scale_inv = out.get_rowwise_scale_inv();
+  auto rowwise_amax = out.get_amax();
+  TensorWrapper out_rowwise(out.scaling_mode());
+  out_rowwise.set_rowwise_data(rowwise_data.data_ptr, static_cast<DType>(rowwise_data.dtype),
+                               rowwise_data.shape);
+  out_rowwise.set_rowwise_scale_inv(rowwise_scale_inv.data_ptr,
+                                    static_cast<DType>(rowwise_scale_inv.dtype),
+                                    rowwise_scale_inv.shape);
+  out_rowwise.set_amax(rowwise_amax.data_ptr, static_cast<DType>(rowwise_amax.dtype),
+                       rowwise_amax.shape);
+  out_rowwise.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
+  if (this->nvfp4_e4m3_max != 0) {
+    out_rowwise.set_nvfp4_e4m3_max(this->nvfp4_e4m3_max);
+  }
+  this->rowwise_usage = true;
+  this->columnwise_usage = false;
+  this->quantize_impl(input, out_rowwise, noop_flag, compute_amax);
+
+  // 2-3 (fused). Without RHT, quantize the columnwise copy directly from the rowwise codes:
+  // the dequantized tensor is not materialized.
+  const auto [rows, cols] = get_2d_dims(input.shape());
+  if (!this->with_rht && !with_gemm_swizzled_scales && rows % NVFP4_BLOCK_SIZE == 0 &&
+      cols % NVFP4_BLOCK_SIZE == 0 && this->scale_dtype == DType::kFloat8E4M3 &&
+      !this->stochastic_rounding && !this->with_amax_reduction && !noop_flag) {
+    QuantizationConfigWrapper columnwise_config;
+    columnwise_config.set_nvfp4_2d_quantization(this->with_2d_quantization);
+    columnwise_config.set_nvfp4_4over6_mode(this->columnwise_uses_4over6()
+                                                ? this->nvfp4_4over6_mode
+                                                : kNVTENVFP44Over6Disabled);
+    if (transformer_engine::getenv<bool>("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH")) {
+      columnwise_config.set_nvfp4_4over6_err_use_fast_math(true);
+    }
+    const auto input_dtype = static_cast<NVTEDType>(input.dtype());
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_nvfp4_quantize_columnwise_from_rowwise(out.data(), input_dtype, columnwise_config,
+                                                  stream);
+    });
+    return;
+  }
+
+  // 2. Dequantize the rowwise copy to the input dtype.
+  at::Tensor dequantized =
+      allocateTorchTensor(static_cast<int>(rows), static_cast<int>(cols), input.dtype());
+  TensorWrapper dequantized_cpp;
+  dequantized_cpp.set_rowwise_data(dequantized.data_ptr(), input.dtype(), rowwise_data.shape);
+  NVTE_SCOPED_GIL_RELEASE(
+      { nvte_dequantize(out_rowwise.data(), dequantized_cpp.data(), stream); });
+
+  // 3. Columnwise (backward) copy from the dequantized rowwise copy. Its amax is recomputed.
+  auto columnwise_data = out.get_columnwise_data();
+  auto columnwise_scale_inv = out.get_columnwise_scale_inv();
+  auto columnwise_amax = out.get_columnwise_amax();
+  TensorWrapper out_columnwise(out.scaling_mode());
+  out_columnwise.set_columnwise_data(columnwise_data.data_ptr,
+                                     static_cast<DType>(columnwise_data.dtype),
+                                     columnwise_data.shape);
+  out_columnwise.set_columnwise_scale_inv(columnwise_scale_inv.data_ptr,
+                                          static_cast<DType>(columnwise_scale_inv.dtype),
+                                          columnwise_scale_inv.shape);
+  out_columnwise.set_columnwise_amax(columnwise_amax.data_ptr,
+                                     static_cast<DType>(columnwise_amax.dtype),
+                                     columnwise_amax.shape);
+  out_columnwise.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
+  if (this->columnwise_uses_4over6() && this->nvfp4_e4m3_max != 0) {
+    out_columnwise.set_nvfp4_e4m3_max(this->nvfp4_e4m3_max);
+  }
+  this->rowwise_usage = false;
+  this->columnwise_usage = true;
+  this->quantize_impl(dequantized_cpp, out_columnwise, noop_flag, true);
+}
+
 void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                                    const std::optional<TensorWrapper>& noop_flag,
                                    bool compute_amax) {
+  if (this->requantizes_columnwise_from_rowwise() && input.numel() != 0) {
+    this->quantize_columnwise_from_rowwise(input, out, noop_flag, compute_amax);
+    return;
+  }
+
   auto reduce_amaxes = [&]() {
     if (!this->with_amax_reduction || this->disable_second_level_scale) {
       return;
@@ -2630,13 +2750,24 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   }
   quant_config.set_nvfp4_2d_quantization(this->with_2d_quantization);
   quant_config.set_stochastic_rounding(this->stochastic_rounding);
+  // 4over6 always applies to the rowwise copy (quant_config). The columnwise copy uses 4over6
+  // only when requested and when it is not an RHT copy: with RHT, the columnwise copy is the
+  // rotated wgrad operand and stays standard NVFP4.
+  const bool nvfp4_use_4over6 = this->uses_4over6();
+  const bool columnwise_use_4over6 = this->columnwise_uses_4over6();
   quant_config.set_nvfp4_4over6_mode(this->nvfp4_4over6_mode);
-  quant_config_columnwise.set_nvfp4_4over6_mode(this->nvfp4_4over6_mode);
+  quant_config_columnwise.set_nvfp4_4over6_mode(columnwise_use_4over6 ? this->nvfp4_4over6_mode
+                                                                      : kNVTENVFP44Over6Disabled);
 
-  if (this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled) {
-    NVTE_CHECK(!this->with_rht, "NVFP4 4over6 quantization does not support RHT.");
+  if (nvfp4_use_4over6) {
     NVTE_CHECK(!this->stochastic_rounding,
                "NVFP4 4over6 quantization does not support stochastic rounding.");
+    NVTE_CHECK(this->scale_dtype == DType::kFloat8E4M3,
+               "NVFP4 4over6 quantization is incompatible with UE5M3 scales.");
+    if (!columnwise_use_4over6) {
+      // quant_config_columnwise is used for the standard (non-4over6) columnwise copy.
+      quant_config_columnwise.set_nvfp4_2d_quantization(this->with_2d_quantization);
+    }
   }
 
   // We only need RHT for columnwise usage.
@@ -2774,8 +2905,18 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     quant_config_columnwise.set_nvfp4_4over6_err_use_fast_math(true);
   }
 
+  // The fused rowwise-4over6 + columnwise-RHT kernel is implemented for the TMEM-based
+  // SM100/SM110 cast-fusion kernel only. Elsewhere (SM120/SM121, unaligned shapes, non-BF16),
+  // 4over6 + RHT uses the unfused path: dedicated 4over6 kernel for the rowwise copy, then
+  // RHT + standard cast for the columnwise copy.
+  bool use_rht_cast_fusion = eligible_for_rht_cast_fusion;
+  if (nvfp4_use_4over6 && this->with_rht && use_rht_cast_fusion) {
+    const int sm_arch = transformer_engine::cuda::sm_arch();
+    use_rht_cast_fusion = sm_arch >= 100 && sm_arch <= 110;
+  }
+
   if (this->with_rht) {
-    if (eligible_for_rht_cast_fusion) {
+    if (use_rht_cast_fusion) {
       // fusion kernel requires passing in RHT matrix directly for maximum performance
       NVTE_CHECK(this->rht_matrix.defined() && this->rht_matrix.numel() > 0,
                  "RHT matrix is not available.");
@@ -2790,9 +2931,12 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     } else {
       // Use separate RNG state for columnwise to ensure different random numbers than rowwise
       // This is only necessary because it's the unfused path where rowwise and columnwise
-      // are separate kernel launches
+      // are separate kernel launches.
+      // With 4over6, the rowwise copy uses quant_config (4over6) and the columnwise RHT copy
+      // uses quant_config_columnwise (standard NVFP4).
       auto& columnwise_quant_config_to_use =
-          need_separate_columnwise_rng ? quant_config_columnwise : quant_config;
+          (need_separate_columnwise_rng || nvfp4_use_4over6) ? quant_config_columnwise
+                                                             : quant_config;
       // unfused path also needs memory allocation for intermediate buffer for RHT output
       at::Tensor rht_output_t;  // The RHT(x_t) output, in columnwise layout
       // This wrapper is going to be passed as input to the quantization kernel.
@@ -2805,6 +2949,80 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
                                         std::vector<size_t>{cols, rows});
       this->quantize_with_rht_unfused_helper(input, out, rht_output_t_cpp, quant_config,
                                              columnwise_quant_config_to_use, stream);
+    }
+  } else if (nvfp4_use_4over6 && !columnwise_use_4over6 && columnwise_usage &&
+             !row_scaled_nvfp4) {
+    // Rowwise 4over6 copy + standard NVFP4 columnwise copy (e.g. weights in the pre-training
+    // recipe: W is 4over6 for fprop, W.T is standard for dgrad). The columnwise copy is
+    // identical to the one produced without 4over6.
+    if (rowwise_usage && !this->with_2d_quantization && rows % NVFP4_BLOCK_SIZE == 0 &&
+        cols % NVFP4_BLOCK_SIZE == 0) {
+      // 1D scaling: single launch of the 4over6 kernel with one read of the input, 4over6
+      // rowwise stage and standard columnwise stage. For 2D scaling the two-launch path below
+      // is faster, because the standard kernel has a much cheaper columnwise stage.
+      quant_config.set_nvfp4_4over6_columnwise_standard(true);
+      NVTE_SCOPED_GIL_RELEASE(
+          { nvte_quantize_v2(input.data(), out.data(), quant_config, stream); });
+    } else {
+      // Shapes the 4over6 kernel cannot produce columnwise output for, or columnwise-only
+      // usage: separate launches on views of the output tensor. The standard launch is the
+      // same kernel and configuration as without 4over6.
+      auto out_columnwise_data = out.get_columnwise_data();
+      auto out_columnwise_scale_inv = out.get_columnwise_scale_inv();
+      auto out_columnwise_amax = out.get_columnwise_amax();
+
+      // View for the standard launch. It uses the default scale bound.
+      // 2D (16x16) scaling can produce the columnwise copy alone on the optimized kernel. For 1D
+      // scaling, columnwise-only output falls back to a slower generic kernel, so the standard
+      // launch also writes the rowwise copy, which is then overwritten by the 4over6 launch.
+      const bool standard_writes_rowwise = rowwise_usage && !this->with_2d_quantization;
+      TensorWrapper out_standard(out.scaling_mode());
+      out_standard.set_columnwise_data(out_columnwise_data.data_ptr,
+                                       static_cast<DType>(out_columnwise_data.dtype),
+                                       out_columnwise_data.shape);
+      out_standard.set_columnwise_scale_inv(out_columnwise_scale_inv.data_ptr,
+                                            static_cast<DType>(out_columnwise_scale_inv.dtype),
+                                            out_columnwise_scale_inv.shape);
+      out_standard.set_columnwise_amax(out_columnwise_amax.data_ptr,
+                                       static_cast<DType>(out_columnwise_amax.dtype),
+                                       out_columnwise_amax.shape);
+      if (standard_writes_rowwise) {
+        auto out_rowwise_data = out.get_rowwise_data();
+        auto out_rowwise_scale_inv = out.get_rowwise_scale_inv();
+        auto out_rowwise_amax = out.get_amax();
+        out_standard.set_rowwise_data(out_rowwise_data.data_ptr,
+                                      static_cast<DType>(out_rowwise_data.dtype),
+                                      out_rowwise_data.shape);
+        out_standard.set_rowwise_scale_inv(out_rowwise_scale_inv.data_ptr,
+                                           static_cast<DType>(out_rowwise_scale_inv.dtype),
+                                           out_rowwise_scale_inv.shape);
+        out_standard.set_amax(out_rowwise_amax.data_ptr, static_cast<DType>(out_rowwise_amax.dtype),
+                              out_rowwise_amax.shape);
+      }
+      out_standard.set_with_gemm_swizzled_scales(out.get_with_gemm_swizzled_scales());
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_quantize_v2(input.data(), out_standard.data(), quant_config_columnwise, stream);
+      });
+
+      if (rowwise_usage) {
+        // View for the rowwise 4over6 launch. It carries the rowwise scale bound.
+        auto out_rowwise_data = out.get_rowwise_data();
+        auto out_rowwise_scale_inv = out.get_rowwise_scale_inv();
+        auto out_rowwise_amax = out.get_amax();
+        TensorWrapper out_rowwise(out.scaling_mode());
+        out_rowwise.set_rowwise_data(out_rowwise_data.data_ptr,
+                                     static_cast<DType>(out_rowwise_data.dtype),
+                                     out_rowwise_data.shape);
+        out_rowwise.set_rowwise_scale_inv(out_rowwise_scale_inv.data_ptr,
+                                          static_cast<DType>(out_rowwise_scale_inv.dtype),
+                                          out_rowwise_scale_inv.shape);
+        out_rowwise.set_amax(out_rowwise_amax.data_ptr, static_cast<DType>(out_rowwise_amax.dtype),
+                             out_rowwise_amax.shape);
+        out_rowwise.set_with_gemm_swizzled_scales(out.get_with_gemm_swizzled_scales());
+        out_rowwise.set_nvfp4_e4m3_max(out.get_nvfp4_e4m3_max());
+        NVTE_SCOPED_GIL_RELEASE(
+            { nvte_quantize_v2(input.data(), out_rowwise.data(), quant_config, stream); });
+      }
     }
   } else {
     NVTE_SCOPED_GIL_RELEASE({ nvte_quantize_v2(input.data(), out.data(), quant_config, stream); });

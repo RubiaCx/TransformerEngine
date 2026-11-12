@@ -97,6 +97,16 @@ enum NVTETensorParam {
    *  E4M3). 4over6 may use 256 for map-to-4 headroom.
    */
   kNVTENVFP4E4M3Max = 9,
+  /*! Global scale bound used by the columnwise copy of an NVFP4 tensor.
+   *
+   *  When zero (default), the columnwise copy uses the same bound as
+   *  kNVTENVFP4E4M3Max. A non-zero value overrides the bound for the
+   *  columnwise copy only. This is used when the rowwise copy is
+   *  quantized with 4over6 (e.g. bound 256) while the columnwise copy
+   *  is standard NVFP4 (bound 448), e.g. the columnwise RHT copy in the
+   *  NVFP4 pre-training recipe.
+   */
+  kNVTENVFP4ColumnwiseE4M3Max = 10,
   kNVTENumTensorParams
 };
 
@@ -436,6 +446,13 @@ enum NVTEQuantizationConfigAttribute {
   kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath = 9,
   /*! Whether to use 2D block scaling for MXFP8 */
   kNVTEQuantizationConfigMXFP82DQuantization = 10,
+  /*! Whether NVFP4 4over6 quantization applies to the rowwise output only.
+   *
+   *  When set, the columnwise output of a 4over6 quantization is standard
+   *  NVFP4 (no candidate selection, full scale range), produced in the same
+   *  kernel launch as the rowwise 4over6 output.
+   */
+  kNVTEQuantizationConfigNVFP44Over6ColumnwiseStandard = 11,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -898,6 +915,11 @@ class TensorWrapper {
     nvte_set_tensor_param_v2(tensor_, kNVTENVFP4E4M3Max, &val, sizeof(val));
   }
 
+  void set_nvfp4_columnwise_e4m3_max(int nvfp4_columnwise_e4m3_max) {
+    const auto val = nvfp4_columnwise_e4m3_max;
+    nvte_set_tensor_param_v2(tensor_, kNVTENVFP4ColumnwiseE4M3Max, &val, sizeof(val));
+  }
+
   // Parameter getters
 
   NVTEBasicTensor get_parameter(const NVTETensorParam param) const noexcept {
@@ -943,6 +965,15 @@ class TensorWrapper {
   int get_nvfp4_e4m3_max() const {
     int val = 0;
     nvte_get_tensor_param_v2(tensor_, kNVTENVFP4E4M3Max, &val, sizeof(val), nullptr);
+    return val;
+  }
+
+  /*! \brief Raw columnwise scale bound override (0 when the columnwise copy
+   *         uses the same bound as the rowwise copy).
+   */
+  int get_nvfp4_columnwise_e4m3_max() const {
+    int val = 0;
+    nvte_get_tensor_param_v2(tensor_, kNVTENVFP4ColumnwiseE4M3Max, &val, sizeof(val), nullptr);
     return val;
   }
 
@@ -1506,6 +1537,13 @@ class QuantizationConfigWrapper {
   }
 
   /*! \brief Set whether to use 2D block scaling for MXFP8 */
+  /*! \brief Set whether the columnwise output of NVFP4 4over6 quantization is standard NVFP4 */
+  void set_nvfp4_4over6_columnwise_standard(bool columnwise_standard) {
+    const auto val = static_cast<uint8_t>(columnwise_standard);
+    nvte_set_quantization_config_attribute(
+        config_, kNVTEQuantizationConfigNVFP44Over6ColumnwiseStandard, &val, sizeof(val));
+  }
+
   void set_mxfp8_2d_quantization(bool mxfp8_2d_quantization) {
     const auto val = static_cast<uint8_t>(mxfp8_2d_quantization);
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigMXFP82DQuantization,

@@ -27,7 +27,8 @@ namespace rtc_nvfp4 {
 void compile_quantize_4over6_rtc(const std::string &kernel_label, const std::string &itype_name,
                                  bool use_2d, bool return_identity, bool return_transpose,
                                  bool row_scaled, const std::string &mode_name, bool err_fast_math,
-                                 int e4m3_max) {
+                                 int e4m3_max, bool col_standard, bool from_rowwise,
+                                 bool amax_only, int col_e4m3_max) {
   auto &mgr = rtc::KernelManager::instance();
   if (mgr.is_compiled(kernel_label)) {
     return;
@@ -44,6 +45,10 @@ void compile_quantize_4over6_rtc(const std::string &kernel_label, const std::str
   code = regex_replace(code, "__MODE__", mode_name);
   code = regex_replace(code, "__ERR_FAST_MATH__", bool_str(err_fast_math));
   code = regex_replace(code, "__E4M3_MAX__", std::to_string(e4m3_max));
+  code = regex_replace(code, "__COL_STANDARD__", bool_str(col_standard));
+  code = regex_replace(code, "__FROM_ROWWISE__", std::string(from_rowwise ? "1" : "0"));
+  code = regex_replace(code, "__AMAX_ONLY__", bool_str(amax_only));
+  code = regex_replace(code, "__COL_E4M3_MAX__", std::to_string(col_e4m3_max));
 
   const std::vector<rtc::Header> headers = {
       {string_code_cast_nvfp4_quantize_4over6_kernel_cuh, "quantize_4over6_kernel.cuh"},
@@ -62,7 +67,9 @@ void compile_quantize_4over6_rtc(const std::string &kernel_label, const std::str
                                             "-DCUDA_VERSION=" + std::to_string(CUDA_VERSION)};
   constexpr rtc::ArchRequirement arch_requirement{100, rtc::ArchSpecificity::ArchitectureSpecific};
 
-  mgr.compile(kernel_label, "quantize_4over6_rtc_kernel", code,
+  const char *entry_point =
+      from_rowwise ? "quantize_4over6_from_rowwise_rtc_kernel" : "quantize_4over6_rtc_kernel";
+  mgr.compile(kernel_label, entry_point, code,
               "transformer_engine/common/cast/nvfp4/rtc/quantize_4over6.cu", options, headers,
               arch_requirement);
 }

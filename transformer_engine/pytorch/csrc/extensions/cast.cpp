@@ -1406,6 +1406,9 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
   const bool nvfp4_use_4over6 =
       quantizer_cpp_list[0]->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
   const int nvfp4_e4m3_max = quantizer_cpp_list[0]->nvfp4_e4m3_max;
+  // Explicit bound of the columnwise copy (0: same as rowwise). Non-zero when the rowwise copy
+  // is 4over6 with a reduced bound and the columnwise copy is standard NVFP4.
+  const int nvfp4_columnwise_e4m3_max = quantizer_cpp_list[0]->columnwise_e4m3_max();
   const bool disable_second_level_scale = quantizer_cpp_list[0]->disable_second_level_scale;
   const auto columnwise_usage = quantizer_cpp_list[0]->columnwise_usage;
   if (row_scaled_nvfp4) {
@@ -1603,7 +1606,8 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
                          MakePythonDType(scale_dtype), quantizer_py_list[i],
                          with_gemm_swizzled_scales, py::arg("row_scaled_nvfp4") = row_scaled_nvfp4,
                          py::arg("nvfp4_use_4over6") = nvfp4_use_4over6,
-                         py::arg("nvfp4_e4m3_max") = nvfp4_e4m3_max));
+                         py::arg("nvfp4_e4m3_max") = nvfp4_e4m3_max,
+                         py::arg("nvfp4_columnwise_e4m3_max") = nvfp4_columnwise_e4m3_max));
 
     // Construct C++ tensor
     // Use a TensorWrapper variable to hold the output of makeTransformerEngineTensor,
@@ -1634,6 +1638,9 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
       tensor_wrapper.set_row_scaled_nvfp4(row_scaled_nvfp4);
       if (nvfp4_e4m3_max != 0) {
         tensor_wrapper.set_nvfp4_e4m3_max(nvfp4_e4m3_max);
+      }
+      if (nvfp4_columnwise_e4m3_max != 0) {
+        tensor_wrapper.set_nvfp4_columnwise_e4m3_max(nvfp4_columnwise_e4m3_max);
       }
 
       tensor_cpp_list.emplace_back(std::move(tensor_wrapper));
@@ -1735,9 +1742,11 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
                                                cudaStream_t stream) {
   const size_t num_tensors = split_sections.size();
   const auto &quantizer = *quantizers.front();
+  // With RHT, 4over6 applies to the rowwise (un-rotated, round-to-nearest) copies only. The
+  // columnwise RHT copies are always standard NVFP4.
   const bool nvfp4_use_4over6 = quantizer.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
-  NVTE_CHECK(!nvfp4_use_4over6,
-             "NVFP4 4over6 quantization is not supported with RHT split quantization.");
+  NVTE_CHECK(!nvfp4_use_4over6 || !quantizer.stochastic_rounding,
+             "NVFP4 4over6 quantization does not support stochastic rounding.");
 
   std::vector<NVTETensor> nvte_tensor_input_list;
   std::vector<NVTETensor> nvte_tensor_output_list;
@@ -1773,11 +1782,14 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
       num_tensors, need_stochastic_rounding, with_bulk_generate_rng_states,
       need_separate_rng_states, quant_config_list, quant_config_list_colwise);
 
+  // quant_config_list drives the rowwise copies (and the fused rowwise+columnwise kernel, where
+  // 4over6 only affects the rowwise half). quant_config_list_colwise drives the standalone
+  // columnwise RHT kernel, which is always standard NVFP4.
   for (auto &config : quant_config_list) {
     config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
   }
   for (auto &config : quant_config_list_colwise) {
-    config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
+    config.set_nvfp4_4over6_mode(kNVTENVFP44Over6Disabled);
   }
 
   // Enable NVFP4 kernels to use math operations that sacrifice
@@ -1810,8 +1822,10 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
     }
   }
 
+  // With 4over6, the standalone columnwise kernel must not see the 4over6 mode.
   auto &quant_config_list_colwise_to_use =
-      need_separate_rng_states ? quant_config_list_colwise : quant_config_list;
+      (need_separate_rng_states || nvfp4_use_4over6) ? quant_config_list_colwise
+                                                     : quant_config_list;
 
   // Compute amaxes
   if (quantizer.disable_second_level_scale) {
@@ -1867,12 +1881,28 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
                                 static_cast<DType>(out_identity_amax.dtype),
                                 out_identity_amax.shape);
         }
+        if (!is_empty_split && nvfp4_use_4over6) {
+          // The rowwise copy is quantized with 4over6: the view must carry the rowwise bound.
+          out_identity.set_nvfp4_e4m3_max(output_list[i].get_nvfp4_e4m3_max());
+        }
         out_identity_list.emplace_back(std::move(out_identity));
         nvte_tensor_out_identity_list.push_back(out_identity_list.back().data());
       }
-      nvte_group_nvfp4_quantize_with_amax(input.data(), nvte_tensor_out_identity_list.data(),
-                                          split_sections.data(), num_tensors, quant_config_list[0],
-                                          stream);
+      if (nvfp4_use_4over6) {
+        // The grouped rowwise kernel has no 4over6 variant. Quantize each split with the
+        // dedicated 4over6 kernel (rowwise-only views; amaxes were computed above).
+        for (size_t i = 0; i < num_tensors; i++) {
+          if (input_list[i].numel() == 0) {
+            continue;
+          }
+          nvte_quantize_v2(input_list[i].data(), nvte_tensor_out_identity_list[i],
+                           quant_config_list[0], stream);
+        }
+      } else {
+        nvte_group_nvfp4_quantize_with_amax(input.data(), nvte_tensor_out_identity_list.data(),
+                                            split_sections.data(), num_tensors,
+                                            quant_config_list[0], stream);
+      }
     }
 
     // Columnwise RHT quantization fusion with grouped version
@@ -2005,6 +2035,13 @@ void split_quantize_nvfp4_impl_helper(const TensorWrapper &input,
     if (input_list[i].numel() == 0) {
       continue;
     }
+    if (nvfp4_use_4over6 && quantizer.columnwise_usage && !quantizer.columnwise_uses_4over6() &&
+        !quantizer.row_scaled_nvfp4) {
+      // Rowwise 4over6 copy + standard columnwise copy: handled by the per-tensor quantizer
+      // (separate launches on views of the output). Amaxes were computed above.
+      quantizers[i]->quantize_impl(input_list[i], output_list[i], std::nullopt, false);
+      continue;
+    }
     nvte_quantize_v2(input_list[i].data(), output_list[i].data(), quant_config_list[i], stream);
   }
 }
@@ -2049,7 +2086,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
   NVTE_CHECK(!quantizer.with_amax_reduction,
              "NVFP4 split-quantize does not support amax reduction");
   if (quantizer.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled) {
-    NVTE_CHECK(!quantizer.with_rht, "NVFP4 4over6 quantization does not support RHT.");
+    // 4over6 + RHT is supported: 4over6 applies to the rowwise copies, and the columnwise RHT
+    // copies are standard NVFP4.
     NVTE_CHECK(!quantizer.stochastic_rounding,
                "NVFP4 4over6 quantization does not support stochastic rounding.");
   }
@@ -2071,7 +2109,15 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 
   // Perform multi-tensor quantization
   NVTE_SCOPED_GIL_RELEASE({
-    if (quantizer.with_rht) {  // Quantize row-wise data, RHT+quantize column-wise data
+    if (quantizer.requantizes_columnwise_from_rowwise()) {
+      // Columnwise copies come from the dequantized rowwise copies: quantize each split on its own.
+      for (size_t i = 0; i < num_tensors; ++i) {
+        if (input_list[i].numel() == 0) {
+          continue;
+        }
+        quantizers[i]->quantize(input_list[i], output_list[i], std::nullopt);
+      }
+    } else if (quantizer.with_rht) {  // Quantize row-wise data, RHT+quantize column-wise data
       // Check that config is supported
       NVTE_CHECK(input.dtype() == DType::kBFloat16, "RHT is only supported for bfloat16 input");
       if (grouped_rht_supported) {

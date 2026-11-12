@@ -1738,6 +1738,11 @@ class NVFP4BlockScalingRecipeState(RecipeState):
           ``recipe.nvfp4_4over6``. Gradient slots always use standard NVFP4,
           which lets gradient RHT and stochastic rounding follow the base
           recipe.
+        * 4over6 always applies to the rowwise copy (the un-rotated,
+          round-to-nearest fprop operand). With RHT, the columnwise RHT copy
+          stays standard NVFP4. Columnwise copies quantized without RHT use
+          4over6 only for the scopes selected by
+          ``recipe.nvfp4_4over6_columnwise``.
 
         When the owning module/op provides a role list via
         ``get_quantizer_roles``, the per-slot ``tensor_type`` drives dispatch.
@@ -1773,15 +1778,56 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     nvfp4_use_4over6 = tensor_type != "weight"
 
             # Unsupported configs
+            # Note: 4over6 + RHT is supported. 4over6 is applied to the rowwise
+            # copy and the columnwise RHT copy stays standard NVFP4.
             if nvfp4_use_4over6:
-                if qparams.random_hadamard_transform:
-                    raise ValueError("NVFP4 4over6 quantization does not support RHT.")
                 if qparams.stochastic_rounding:
                     raise ValueError(
                         "NVFP4 4over6 quantization does not support stochastic rounding."
                     )
                 if scale_dtype == DType.kFloat8UE5M3:
                     raise ValueError("NVFP4 4over6 quantization is incompatible with UE5M3 scales.")
+
+            row_scaled_nvfp4 = (
+                self.mode == "forward"
+                and tensor_type != "weight"
+                and self.recipe.row_scaled_activation
+            )
+
+            # Whether the columnwise copy also uses 4over6. Only meaningful for
+            # columnwise copies quantized without RHT.
+            nvfp4_4over6_columnwise = False
+            if nvfp4_use_4over6:
+                columnwise_scope = self.recipe.nvfp4_4over6_columnwise
+                if columnwise_scope == "auto":
+                    # Pre-training configuration (RHT enabled): only the fprop
+                    # operands use 4over6. Without RHT: previous behavior.
+                    columnwise_scope = "all" if self.recipe.disable_rht else "none"
+                if columnwise_scope == "all":
+                    nvfp4_4over6_columnwise = True
+                elif columnwise_scope == "weights":
+                    nvfp4_4over6_columnwise = tensor_type == "weight"
+                elif columnwise_scope == "activations":
+                    nvfp4_4over6_columnwise = tensor_type != "weight"
+                if row_scaled_nvfp4:
+                    # Row-scaled activations do not support a separate standard
+                    # columnwise copy; keep the single-kernel 4over6 path.
+                    nvfp4_4over6_columnwise = True
+
+            # Source of the columnwise (backward) copy of forward tensors
+            columnwise_from_rowwise = False
+            if tensor_type not in ("grad_output", "grad_input"):
+                source = (
+                    self.recipe.nvfp4_backward_weight_source
+                    if tensor_type == "weight"
+                    else self.recipe.nvfp4_backward_activation_source
+                )
+                columnwise_from_rowwise = source == "forward_quantized"
+                if columnwise_from_rowwise and row_scaled_nvfp4:
+                    raise ValueError(
+                        "nvfp4_backward_activation_source='forward_quantized' is not "
+                        "supported with row-scaled activations."
+                    )
 
             # Scale max for 4over6
             nvfp4_e4m3_max = 0
@@ -1806,14 +1852,12 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                 with_post_rht_amax=qparams.random_hadamard_transform,
                 with_2d_quantization=qparams.fp4_2d_quantization,
                 stochastic_rounding=qparams.stochastic_rounding,
-                row_scaled_nvfp4=(
-                    self.mode == "forward"
-                    and tensor_type != "weight"
-                    and self.recipe.row_scaled_activation
-                ),
+                row_scaled_nvfp4=row_scaled_nvfp4,
                 nvfp4_use_4over6=nvfp4_use_4over6,
                 nvfp4_e4m3_max=nvfp4_e4m3_max,
                 nvfp4_4over6_err_mode=self.recipe.nvfp4_4over6_err_mode,
+                nvfp4_4over6_columnwise=nvfp4_4over6_columnwise,
+                columnwise_from_rowwise=columnwise_from_rowwise,
             )
 
         if self.mode not in ("forward", "backward"):

@@ -419,6 +419,23 @@ void nvte_group_quantize_dbias_dsrelu(const NVTEGroupedTensor input,
  */
 void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
+/*! \brief Quantize the columnwise copy of an NVFP4 tensor from its dequantized rowwise copy.
+ *
+ *  Equivalent to dequantizing the rowwise copy to `dtype`, computing its amax and quantizing
+ *  the columnwise copy from it, without materializing the dequantized tensor. The columnwise
+ *  copy is standard NVFP4, or 4over6 if a 4over6 mode is set in the config. RHT, stochastic
+ *  rounding, row-scaled NVFP4 and GEMM-swizzled scales are not supported.
+ *
+ *  \param[in,out] output        NVFP4 tensor with a quantized rowwise copy and allocated
+ *                               columnwise buffers.
+ *  \param[in]     dtype         Data type the rowwise copy is dequantized to.
+ *  \param[in]     quant_config  Quantization configuration.
+ *  \param[in]     stream        CUDA stream used for the operation.
+ */
+void nvte_nvfp4_quantize_columnwise_from_rowwise(NVTETensor output, NVTEDType dtype,
+                                                 const NVTEQuantizationConfig quant_config,
+                                                 cudaStream_t stream);
+
 /*! \brief Casts input grouped tensor from reduced to higher precision.
  *         In case of the MXFP8 dequantization, the dequantized values are stored to the rowwise
  *         data of the output tensor, regardless of whether the row- or columnwise scaling is used.

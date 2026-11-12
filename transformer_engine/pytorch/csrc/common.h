@@ -356,6 +356,12 @@ class NVFP4Quantizer : public Quantizer {
   NVTENVFP44Over6Mode nvfp4_4over6_mode;
   // Global E4M3 scale bound used by emitted NVFP4 tensors (0 when inactive).
   int nvfp4_e4m3_max = 0;
+  // Whether the columnwise copy also uses 4over6 when 4over6 is enabled. Only applies to
+  // columnwise copies quantized without RHT; a columnwise RHT copy is always standard NVFP4.
+  bool nvfp4_4over6_columnwise = true;
+  // Whether the columnwise (backward) copy is quantized from the dequantized rowwise (forward)
+  // copy instead of the high-precision input.
+  bool columnwise_from_rowwise = false;
   // Dtype of scale_inv tensors (kFloat8E4M3 or kFloat8UE5M3).
   DType scale_dtype;
   // Whether tensors emitted by this quantizer use row-scaled NVFP4 metadata.
@@ -369,6 +375,41 @@ class NVFP4Quantizer : public Quantizer {
   explicit NVFP4Quantizer(const py::handle& quantizer);
 
   NVTEScalingMode get_scaling_mode() const override { return NVTE_NVFP4_1D_SCALING; }
+
+  /*! @brief Whether 4over6 block-scale selection is enabled for this quantizer. */
+  bool uses_4over6() const { return nvfp4_4over6_mode != kNVTENVFP44Over6Disabled; }
+
+  /*! @brief Whether the columnwise copy emitted by this quantizer uses 4over6.
+   *
+   *  4over6 always applies to the rowwise copy. The columnwise copy uses 4over6
+   *  only when requested and when it is not an RHT copy.
+   */
+  bool columnwise_uses_4over6() const {
+    return uses_4over6() && nvfp4_4over6_columnwise && !with_rht;
+  }
+
+  /*! @brief Whether re-quantizing the columnwise copy from the rowwise copy applies.
+   *
+   *  With 2D (16x16) block scaling and the same scheme (standard or 4over6) for both copies,
+   *  the two copies already encode the same values, so the option is a no-op.
+   */
+  bool requantizes_columnwise_from_rowwise() const {
+    return columnwise_from_rowwise && rowwise_usage && columnwise_usage &&
+           !(with_2d_quantization && columnwise_uses_4over6() == uses_4over6());
+  }
+
+  /*! @brief Explicit global scale bound of the columnwise copy of emitted tensors.
+   *
+   *  Returns 0 when the columnwise copy uses the same bound as the rowwise copy.
+   *  Returns the full range of the scale dtype when the rowwise copy is 4over6 with
+   *  a reduced bound (256) and the columnwise copy is standard NVFP4.
+   */
+  int columnwise_e4m3_max() const {
+    if (!uses_4over6() || columnwise_uses_4over6() || nvfp4_e4m3_max == 0) {
+      return 0;
+    }
+    return scale_dtype == DType::kFloat8UE5M3 ? 114688 : 448;
+  }
 
   void set_quantization_params(TensorWrapper* tensor) const override;
 
@@ -438,6 +479,11 @@ class NVFP4Quantizer : public Quantizer {
   static ShapeAlignment get_2d_swizzle_fusion_alignment(int sm_arch);
   static bool meets_alignment(const std::vector<size_t>& shape, const ShapeAlignment& alignment);
   bool emits_gemm_swizzled_scales(const std::vector<size_t>& shape) const;
+
+  // Quantize the rowwise copy, then quantize the columnwise copy from the dequantized rowwise copy.
+  void quantize_columnwise_from_rowwise(const TensorWrapper& input, TensorWrapper& out,
+                                        const std::optional<TensorWrapper>& noop_flag,
+                                        bool compute_amax);
 
   void quantize_with_rht_unfused_helper(const TensorWrapper& input, TensorWrapper& out,
                                         TensorWrapper& rht_output_t_cpp,

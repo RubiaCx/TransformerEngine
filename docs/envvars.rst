@@ -375,7 +375,25 @@ Kernel Configuration
 
    :Type: ``str`` (``none``, ``weights``, ``activations``, or ``all``)
    :Default: ``none``
-   :Description: Enable 4over6 adaptive NVFP4 block scaling for weights, activations, or both in the ``NVFP4BlockScaling`` recipe. For each selected FP4 block, quantization compares map-to-4 and map-to-6 candidates and stores the candidate with lower configured error. ``none`` keeps standard NVFP4. Current 4over6 support targets RL and post-training scenarios; pre-training paths that combine 4over6 with RHT are not yet implemented.
+   :Description: Enable 4over6 adaptive NVFP4 block scaling for weights, activations, or both in the ``NVFP4BlockScaling`` recipe. For each selected FP4 block, quantization compares map-to-4 and map-to-6 candidates and stores the candidate with lower configured error. ``none`` keeps standard NVFP4. 4over6 is applied to the row-wise copy of the selected forward tensors (the un-rotated, round-to-nearest operands of the forward GEMM). It can be combined with RHT and stochastic rounding in the pre-training configuration: the column-wise RHT copy of the input and all gradient tensors remain standard NVFP4, and 4over6 is never combined with stochastic rounding. See :envvar:`NVTE_NVFP4_4OVER6_COLUMNWISE` for column-wise copies quantized without RHT.
+
+.. envvar:: NVTE_NVFP4_4OVER6_COLUMNWISE
+
+   :Type: ``str`` (``auto``, ``none``, ``weights``, ``activations``, or ``all``)
+   :Default: ``auto``
+   :Description: Select tensor scopes whose column-wise copy also uses 4over6 in the ``NVFP4BlockScaling`` recipe. Only applies to tensors selected by :envvar:`NVTE_NVFP4_4OVER6` and only to column-wise copies quantized without RHT; a column-wise RHT copy is always standard NVFP4. ``weights`` enables 4over6 for the weight copy used by the input-gradient GEMM. ``auto`` resolves to ``none`` when RHT is enabled and to ``all`` when RHT is disabled (``NVFP4BlockScaling(disable_rht=True)``).
+
+.. envvar:: NVTE_NVFP4_BACKWARD_WEIGHT_SOURCE
+
+   :Type: ``str`` (``high_precision`` or ``forward_quantized``)
+   :Default: ``high_precision``
+   :Description: Source of the column-wise weight copy used by the input-gradient GEMM in the ``NVFP4BlockScaling`` recipe. ``high_precision`` quantizes it from the high-precision weight. ``forward_quantized`` quantizes it from the de-quantized row-wise (forward) weight copy, at the cost of a de-quantization and a second quantization pass. No-op for 2D weight scaling when both copies use the same scheme.
+
+.. envvar:: NVTE_NVFP4_BACKWARD_ACTIVATION_SOURCE
+
+   :Type: ``str`` (``high_precision`` or ``forward_quantized``)
+   :Default: ``high_precision``
+   :Description: Source of the column-wise input copy used by the weight-gradient GEMM in the ``NVFP4BlockScaling`` recipe. With ``forward_quantized``, the copy (with RHT if enabled) is quantized from the de-quantized row-wise (forward) input. Not supported for row-scaled activations.
 
 .. envvar:: NVTE_NVFP4_4OVER6_E4M3_USE_256
 

@@ -138,6 +138,10 @@ class NVFP4Quantizer(Quantizer):
     nvfp4_use_4over6: bool
     """Global E4M3 scale bound used by emitted NVFP4 tensors."""
     nvfp4_e4m3_max: int
+    """Whether the columnwise copy also uses 4over6 (only applies to non-RHT columnwise copies)."""
+    nvfp4_4over6_columnwise: bool
+    """Whether the columnwise copy is quantized from the dequantized rowwise copy."""
+    columnwise_from_rowwise: bool
     """NVFP4 4over6 candidate-selection error mode."""
     nvfp4_4over6_err_mode: str
     """Whether to disable the global (second-level) NVFP4 scale."""
@@ -164,6 +168,8 @@ class NVFP4Quantizer(Quantizer):
         nvfp4_4over6_err_mode: str = "MAE",
         with_random_sign_mask: bool = True,
         disable_second_level_scale: bool = False,
+        nvfp4_4over6_columnwise: bool = True,
+        columnwise_from_rowwise: bool = False,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.dtype = DType.cast(fp4_dtype)
@@ -191,6 +197,13 @@ class NVFP4Quantizer(Quantizer):
                 "nvfp4_use_4over6 is incompatible with scale_dtype=DType.kFloat8UE5M3."
             )
         self.nvfp4_e4m3_max = nvfp4_e4m3_max
+        # 4over6 always applies to the rowwise copy (un-rotated, round-to-nearest).
+        # The columnwise copy uses 4over6 only if this flag is set and the
+        # columnwise copy is not an RHT copy (see ``columnwise_uses_4over6``).
+        self.nvfp4_4over6_columnwise = bool(nvfp4_4over6_columnwise)
+        # Source of the columnwise (backward) copy: the high-precision input (default)
+        # or the dequantized rowwise (forward) copy.
+        self.columnwise_from_rowwise = bool(columnwise_from_rowwise)
         self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode.upper()
         if self.nvfp4_4over6_err_mode not in ("MAE", "MSE"):
             raise ValueError("nvfp4_4over6_err_mode must be 'MAE' or 'MSE'.")
@@ -199,6 +212,28 @@ class NVFP4Quantizer(Quantizer):
             with_random_sign_mask, torch.cuda.current_device()
         )
         self._rebuild_derived_state()
+
+    @property
+    def columnwise_uses_4over6(self) -> bool:
+        """Whether the columnwise copy emitted by this quantizer uses 4over6.
+
+        With RHT, the columnwise copy is the rotated wgrad operand and is
+        always standard NVFP4.
+        """
+        return self.nvfp4_use_4over6 and self.nvfp4_4over6_columnwise and not self.with_rht
+
+    @property
+    def nvfp4_columnwise_e4m3_max(self) -> int:
+        """Explicit global scale bound of the columnwise copy of emitted tensors.
+
+        ``0`` means the columnwise copy uses the same bound as the rowwise
+        copy (``nvfp4_e4m3_max``). A non-zero value is returned when the
+        rowwise copy is 4over6 with a reduced bound and the columnwise copy
+        is standard NVFP4, which uses the full range of the scale dtype.
+        """
+        if not self.nvfp4_use_4over6 or self.columnwise_uses_4over6 or self.nvfp4_e4m3_max == 0:
+            return 0
+        return 114688 if self.scale_dtype == DType.kFloat8UE5M3 else 448
 
     def __getstate__(self):
         """Exclude unpicklable process group from serialized state."""
@@ -269,6 +304,8 @@ class NVFP4Quantizer(Quantizer):
             nvfp4_4over6_err_mode=self.nvfp4_4over6_err_mode,
             with_random_sign_mask=self.rht_matrix_random_sign_mask_t != 0,
             disable_second_level_scale=self.disable_second_level_scale,
+            nvfp4_4over6_columnwise=self.nvfp4_4over6_columnwise,
+            columnwise_from_rowwise=self.columnwise_from_rowwise,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm
@@ -376,6 +413,7 @@ class NVFP4Quantizer(Quantizer):
                 "row_scaled_nvfp4": self.row_scaled_nvfp4,
                 "nvfp4_use_4over6": self.nvfp4_use_4over6,
                 "nvfp4_e4m3_max": self.nvfp4_e4m3_max,
+                "nvfp4_columnwise_e4m3_max": self.nvfp4_columnwise_e4m3_max,
                 "fake_dtype": fake_dtype,
             },
         }
@@ -474,6 +512,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         row_scaled_nvfp4: bool = False,
         nvfp4_use_4over6: bool = False,
         nvfp4_e4m3_max: int = 0,
+        nvfp4_columnwise_e4m3_max: int = 0,
         **kwargs,
     ):
         instance = super().__new__(
@@ -492,6 +531,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             row_scaled_nvfp4=row_scaled_nvfp4,
             nvfp4_use_4over6=nvfp4_use_4over6,
             nvfp4_e4m3_max=nvfp4_e4m3_max,
+            nvfp4_columnwise_e4m3_max=nvfp4_columnwise_e4m3_max,
             **kwargs,
         )
         return instance
@@ -709,6 +749,9 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             out._row_scaled_nvfp4 = row_scaled_nvfp4
             out._nvfp4_use_4over6 = nvfp4_use_4over6
             out._nvfp4_e4m3_max = nvfp4_e4m3_max
+            # The columnwise copy is derived locally from the all-gathered rowwise
+            # copy (see _create_columnwise), so it uses the rowwise scale bound.
+            out._nvfp4_columnwise_e4m3_max = 0
         else:
             # Construct new tensor (first iteration)
             out = NVFP4Tensor(
@@ -882,6 +925,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 row_scaled_nvfp4=tensor._row_scaled_nvfp4,
                 nvfp4_use_4over6=tensor._nvfp4_use_4over6,
                 nvfp4_e4m3_max=tensor._nvfp4_e4m3_max,
+                nvfp4_columnwise_e4m3_max=tensor._nvfp4_columnwise_e4m3_max,
             )
 
         # Default case
@@ -907,6 +951,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 self._nvfp4_use_4over6,
                 self._nvfp4_e4m3_max,
                 self._scale_dtype,
+                self._nvfp4_columnwise_e4m3_max,
             ),
         )
 
@@ -1002,6 +1047,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             self._row_scaled_nvfp4 = tensor._row_scaled_nvfp4
             self._nvfp4_use_4over6 = tensor._nvfp4_use_4over6
             self._nvfp4_e4m3_max = tensor._nvfp4_e4m3_max
+            self._nvfp4_columnwise_e4m3_max = tensor._nvfp4_columnwise_e4m3_max
             return
 
         # Quantize to FP8
@@ -1059,6 +1105,7 @@ def _make_nvfp4_tensor_in_reduce_ex(
     nvfp4_use_4over6: bool = False,
     nvfp4_e4m3_max: int = 0,
     scale_dtype: DType = DType.kFloat8E4M3,
+    nvfp4_columnwise_e4m3_max: int = 0,
 ) -> NVFP4Tensor:
     """Reconstruct an ``NVFP4Tensor`` from its ``__reduce_ex__`` payload."""
     # Infer device from whichever inner buffer is populated so the wrapper
@@ -1087,6 +1134,7 @@ def _make_nvfp4_tensor_in_reduce_ex(
         row_scaled_nvfp4=row_scaled_nvfp4,
         nvfp4_use_4over6=nvfp4_use_4over6,
         nvfp4_e4m3_max=nvfp4_e4m3_max,
+        nvfp4_columnwise_e4m3_max=nvfp4_columnwise_e4m3_max,
     )
 
 
@@ -1174,6 +1222,7 @@ class _ViewFunc(torch.autograd.Function):
             row_scaled_nvfp4=tensor._row_scaled_nvfp4,
             nvfp4_use_4over6=tensor._nvfp4_use_4over6,
             nvfp4_e4m3_max=tensor._nvfp4_e4m3_max,
+            nvfp4_columnwise_e4m3_max=tensor._nvfp4_columnwise_e4m3_max,
         )
 
     @staticmethod
@@ -1221,6 +1270,7 @@ class _ViewFunc(torch.autograd.Function):
                 row_scaled_nvfp4=grad._row_scaled_nvfp4,
                 nvfp4_use_4over6=grad._nvfp4_use_4over6,
                 nvfp4_e4m3_max=grad._nvfp4_e4m3_max,
+                nvfp4_columnwise_e4m3_max=grad._nvfp4_columnwise_e4m3_max,
             )
             return dgrad, None
         return grad.view(ctx.shape), None
@@ -1310,6 +1360,7 @@ class _ReshapeFunc(torch.autograd.Function):
             row_scaled_nvfp4=tensor._row_scaled_nvfp4,
             nvfp4_use_4over6=tensor._nvfp4_use_4over6,
             nvfp4_e4m3_max=tensor._nvfp4_e4m3_max,
+            nvfp4_columnwise_e4m3_max=tensor._nvfp4_columnwise_e4m3_max,
         )
 
     @staticmethod
@@ -1357,6 +1408,7 @@ class _ReshapeFunc(torch.autograd.Function):
                 row_scaled_nvfp4=grad._row_scaled_nvfp4,
                 nvfp4_use_4over6=grad._nvfp4_use_4over6,
                 nvfp4_e4m3_max=grad._nvfp4_e4m3_max,
+                nvfp4_columnwise_e4m3_max=grad._nvfp4_columnwise_e4m3_max,
             )
             return dgrad, None
         return grad.view(ctx.shape), None

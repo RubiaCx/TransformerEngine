@@ -313,6 +313,15 @@ struct Tensor {
    *  TODO: Change to a dtype-agnostic name.
    */
   int nvfp4_e4m3_max = 0;
+  /*! \brief Global scale bound used by the columnwise NVFP4 copy.
+   *
+   *  When zero, the columnwise copy uses the same bound as the rowwise
+   *  copy (see nvfp4_e4m3_max). A non-zero value is used by tensors
+   *  whose rowwise copy is quantized with 4over6 (e.g. bound 256) while
+   *  the columnwise copy is standard NVFP4 (e.g. the columnwise RHT copy
+   *  in the pre-training recipe, bound 448).
+   */
+  int nvfp4_columnwise_e4m3_max = 0;
 
   /*! Map from NVTETensorParam to parameter sizes */
   static constexpr size_t attr_sizes[] = {
@@ -325,7 +334,8 @@ struct Tensor {
       sizeof(NVTEBasicTensor),  // kNVTEColumnwiseAmax
       sizeof(uint8_t),          // kNVTEWithGEMMSwizzledScales
       sizeof(uint8_t),          // kNVTERowScaledNVFP4
-      sizeof(int)               // kNVTENVFP4E4M3Max
+      sizeof(int),              // kNVTENVFP4E4M3Max
+      sizeof(int)               // kNVTENVFP4ColumnwiseE4M3Max
   };
 
   Tensor() : scaling_mode{NVTE_DELAYED_TENSOR_SCALING}, nvte_tensor{0} {}
@@ -343,6 +353,7 @@ struct Tensor {
     with_gemm_swizzled_scales = false;
     row_scaled_nvfp4 = false;
     nvfp4_e4m3_max = 0;
+    nvfp4_columnwise_e4m3_max = 0;
   }
 
   explicit operator NVTETensor() const noexcept { return nvte_tensor; }
@@ -481,6 +492,21 @@ struct Tensor {
       default:
         NVTE_ERROR("Unsupported scale dtype for NVFP4 tensor (", to_string(dtype), ")");
     }
+  }
+
+  /*! \brief Global scale bound used by the columnwise NVFP4 copy.
+   *
+   *  Equal to get_nvfp4_scale_max() unless the tensor carries an explicit
+   *  columnwise bound (rowwise 4over6 copy + standard columnwise copy).
+   */
+  int get_nvfp4_columnwise_scale_max() const {
+    if (scaling_mode != NVTE_NVFP4_1D_SCALING) {
+      return 0;
+    }
+    if (nvfp4_columnwise_e4m3_max != 0) {
+      return nvfp4_columnwise_e4m3_max;
+    }
+    return get_nvfp4_scale_max();
   }
 };
 
@@ -648,6 +674,7 @@ struct QuantizationConfig {
   NVTENVFP44Over6Mode nvfp4_4over6_mode = kNVTENVFP44Over6Disabled;
   bool nvfp4_4over6_err_use_fast_math = false;
   bool mxfp8_2d_quantization = false;
+  bool nvfp4_4over6_columnwise_standard = false;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(uint8_t),                       // force_pow_2_scales
@@ -660,7 +687,8 @@ struct QuantizationConfig {
       sizeof(uint8_t),                       // use_fast_math
       sizeof(uint8_t),                       // nvfp4_4over6_mode
       sizeof(uint8_t),                       // nvfp4_4over6_err_use_fast_math
-      sizeof(uint8_t)                        // mxfp8_2d_quantization
+      sizeof(uint8_t),                       // mxfp8_2d_quantization
+      sizeof(uint8_t)                        // nvfp4_4over6_columnwise_standard
   };
 };
 

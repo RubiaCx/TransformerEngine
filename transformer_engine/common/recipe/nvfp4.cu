@@ -974,8 +974,13 @@ void nvte_nvfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_r
   void *amax_A_ptr = use_rowwise_amax_A ? tA->amax.dptr : tA->columnwise_amax.dptr;
   void *amax_B_ptr = use_rowwise_amax_B ? tB->amax.dptr : tB->columnwise_amax.dptr;
   void *alpha_ptr = tOut->data.dptr;
-  const float scale_max_A = tA->get_nvfp4_scale_max();
-  const float scale_max_B = tB->get_nvfp4_scale_max();
+  // The rowwise and columnwise copies of a tensor may use different global scale
+  // bounds (rowwise 4over6 copy + standard columnwise copy), so the bound must be
+  // picked for the same copy as the amax.
+  const float scale_max_A =
+      use_rowwise_amax_A ? tA->get_nvfp4_scale_max() : tA->get_nvfp4_columnwise_scale_max();
+  const float scale_max_B =
+      use_rowwise_amax_B ? tB->get_nvfp4_scale_max() : tB->get_nvfp4_columnwise_scale_max();
 
   NVTE_CHECK(alpha_ptr != nullptr, "alpha_ptr is null");
 
