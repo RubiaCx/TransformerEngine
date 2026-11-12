@@ -1918,8 +1918,31 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   this->with_amax_reduction = with_amax_reduction;
   this->amax_reduction_group = amax_reduction_group;
 
+  // Quantizers with a non-static RHT sign policy refresh their sign mask and RHT
+  // matrix for the current sign generation before these are read.
+  if (py::hasattr(quantizer, "rht_dynamic_signs") &&
+      quantizer.attr("rht_dynamic_signs").cast<bool>()) {
+    quantizer.attr("refresh_rht_signs")();
+  }
   this->rht_matrix_random_sign_mask_t = quantizer.attr("rht_matrix_random_sign_mask_t").cast<int>();
   this->rht_matrix = quantizer.attr("rht_matrix").cast<at::Tensor>();
+  if (py::hasattr(quantizer, "rht_dim")) {
+    this->rht_dim = quantizer.attr("rht_dim").cast<int>();
+  }
+  if (py::hasattr(quantizer, "ms_eden")) {
+    this->ms_eden = quantizer.attr("ms_eden").cast<bool>();
+  }
+  if (py::hasattr(quantizer, "rht_rowwise")) {
+    this->rht_rowwise = quantizer.attr("rht_rowwise").cast<bool>();
+    if (this->rht_rowwise) {
+      this->rht_matrix_rowwise = quantizer.attr("rht_matrix_rowwise").cast<at::Tensor>();
+    }
+  }
+  if (py::hasattr(quantizer, "ms_eden_grid_max")) {
+    this->ms_eden_grid_max = quantizer.attr("ms_eden_grid_max").cast<float>();
+  }
+  NVTE_CHECK(this->rht_dim == 16 || this->rht_dim == 128, "Unsupported NVFP4 RHT dimension: ",
+             this->rht_dim);
 }
 
 void NVFP4Quantizer::set_quantization_params(TensorWrapper* tensor) const {
@@ -1997,6 +2020,10 @@ bool NVFP4Quantizer::is_eligible_for_2d_swizzle_fusion(const std::vector<size_t>
 }
 
 bool NVFP4Quantizer::emits_gemm_swizzled_scales(const std::vector<size_t>& shape) const {
+  // The MS-EDEN kernels emit compact scales; the GEMM swizzles them.
+  if (requires_ms_eden_path()) {
+    return false;
+  }
   return meets_alignment(shape, gemm_swizzled_scales_alignment(
                                     optimize_for_gemm, with_rht, with_2d_quantization,
                                     row_scaled_nvfp4, nvfp4_4over6_mode != kNVTENVFP44Over6Disabled,
@@ -2695,6 +2722,148 @@ void NVFP4Quantizer::quantize_columnwise_from_rowwise(const TensorWrapper& input
   this->quantize_impl(dequantized_cpp, out_columnwise, noop_flag, true);
 }
 
+void NVFP4Quantizer::quantize_ms_eden_impl(const TensorWrapper& input, TensorWrapper& out,
+                                           const std::optional<TensorWrapper>& noop_flag,
+                                           bool compute_amax) {
+  // Tiled-RHT path: MS-EDEN, dimension-128 RHT and/or a rotated rowwise copy.
+  // Supported configuration. Everything else fails loudly instead of silently
+  // falling back to a different quantizer.
+  NVTE_CHECK(this->with_rht, "Tiled-RHT NVFP4 quantization requires with_rht=True.");
+  NVTE_CHECK(!noop_flag, "Tiled-RHT NVFP4 quantization does not support a no-op flag.");
+  NVTE_CHECK(this->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
+             "Tiled-RHT NVFP4 quantization does not support 4over6.");
+  NVTE_CHECK(!this->with_2d_quantization,
+             "Tiled-RHT NVFP4 quantization does not support 2D quantization.");
+  NVTE_CHECK(!out.get_row_scaled_nvfp4() && !this->row_scaled_nvfp4,
+             "Tiled-RHT NVFP4 quantization does not support row-scaled NVFP4.");
+  NVTE_CHECK(!this->disable_second_level_scale,
+             "Tiled-RHT NVFP4 quantization requires the global (second-level) scale.");
+  NVTE_CHECK(!this->with_amax_reduction,
+             "Tiled-RHT NVFP4 quantization does not support amax reduction.");
+  NVTE_CHECK(this->scale_dtype == DType::kFloat8E4M3,
+             "Tiled-RHT NVFP4 quantization only supports E4M3 scales.");
+  NVTE_CHECK(!out.get_with_gemm_swizzled_scales(),
+             "Tiled-RHT NVFP4 quantization emits compact (non-swizzled) scales.");
+  const auto [rows, cols] = get_2d_dims(input.shape());
+  // Plain copies for lambda capture (structured bindings cannot be captured in C++17).
+  const size_t num_rows = rows;
+  const size_t num_cols = cols;
+  const bool rotate_rowwise = rowwise_usage && this->rht_rowwise;
+  if (columnwise_usage || rotate_rowwise) {
+    // Requirements of the rotated copies only; an un-rotated rowwise-only
+    // quantization (e.g. forward pass without backward) has none of them.
+    NVTE_CHECK(input.dtype() == DType::kBFloat16,
+               "Tiled-RHT NVFP4 quantization is only supported for bfloat16 input, got dtype "
+               "enum value ",
+               static_cast<int>(input.dtype()));
+    const int sm_arch = transformer_engine::cuda::sm_arch();
+    NVTE_CHECK(sm_arch >= 100 && sm_arch <= 110,
+               "Tiled-RHT NVFP4 quantization requires the SM100 family, got SM", sm_arch, ".");
+    NVTE_CHECK(rows % 128 == 0 && cols % 128 == 0,
+               "Tiled-RHT NVFP4 quantization requires both flattened dimensions to be divisible "
+               "by 128, got rows=",
+               rows, ", cols=", cols, ".");
+  }
+  auto check_matrix = [&](const at::Tensor& matrix) {
+    NVTE_CHECK(matrix.defined() && matrix.dim() == 2 && matrix.size(0) == this->rht_dim &&
+                   matrix.size(1) == 16,
+               "RHT matrix does not match rht_dim=", this->rht_dim, ".");
+  };
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+  const auto rng_opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+  const size_t rng_elts_per_thread = 1024;
+
+  // Rotated copy (rowwise or columnwise): MS-EDEN, or range-aligned NVFP4 with
+  // round-to-nearest / element-level stochastic rounding (``stochastic_rounding``).
+  auto quantize_rotated = [&](bool rowwise, const at::Tensor& matrix) {
+    check_matrix(matrix);
+    QuantizationConfigWrapper quant_config_rotated;
+    quant_config_rotated.set_stochastic_rounding(!this->ms_eden && this->stochastic_rounding);
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    at::Tensor rng_state_rotated = torch::empty({2}, rng_opts);
+    philox_unpack(philox_args, static_cast<int64_t*>(rng_state_rotated.data_ptr()));
+    TensorWrapper te_rng_state_rotated = makeTransformerEngineTensor(rng_state_rotated);
+    quant_config_rotated.set_rng_state(te_rng_state_rotated.data());
+
+    // MS-EDEN: FP32 workspace holding one corrected (not yet range-aligned) scale per
+    // NVFP4 group.
+    at::Tensor workspace;
+    TensorWrapper workspace_nvte;
+    if (this->ms_eden) {
+      const auto workspace_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+      workspace = at::empty({static_cast<int64_t>(num_rows * num_cols / 16)}, workspace_opts);
+      workspace_nvte = makeTransformerEngineTensor(workspace);
+    }
+    auto rht_matrix_nvte = makeTransformerEngineTensor(matrix);
+    const int ms_eden_flag = this->ms_eden ? 1 : 0;
+    const float grid_max = this->ms_eden_grid_max;
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_quantize_tiled_rht(input.data(), out.data(), rht_matrix_nvte.data(),
+                              ms_eden_flag ? workspace_nvte.data() : nullptr, quant_config_rotated,
+                              rowwise ? 1 : 0, ms_eden_flag, grid_max, stream);
+    });
+  };
+
+  if (rotate_rowwise) {
+    // Rowwise copy rotated along the last dimension (inner dimension of DGRAD).
+    quantize_rotated(true, this->rht_matrix_rowwise);
+  } else if (rowwise_usage) {
+    // Rowwise copy (not rotated): plain NVFP4 quantization. ``stochastic_rounding``
+    // selects element-level stochastic rounding for this copy.
+    QuantizationConfigWrapper quant_config;
+    quant_config.set_nvfp4_2d_quantization(false);
+    quant_config.set_stochastic_rounding(this->stochastic_rounding);
+    quant_config.set_nvfp4_4over6_mode(kNVTENVFP44Over6Disabled);
+    if (use_fast_math) {
+      quant_config.set_use_fast_math(true);
+    }
+    at::Tensor rng_state;
+    TensorWrapper te_rng_state;
+    if (this->stochastic_rounding) {
+      at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+      rng_state = torch::empty({2}, rng_opts);
+      philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+      te_rng_state = makeTransformerEngineTensor(rng_state);
+      quant_config.set_rng_state(te_rng_state.data());
+    }
+
+    TensorWrapper out_identity(out.scaling_mode());
+    auto out_identity_data = out.get_rowwise_data();
+    auto out_identity_scale_inv = out.get_rowwise_scale_inv();
+    auto out_identity_amax = out.get_amax();
+    out_identity.set_rowwise_data(out_identity_data.data_ptr,
+                                  static_cast<DType>(out_identity_data.dtype),
+                                  out_identity_data.shape);
+    out_identity.set_rowwise_scale_inv(out_identity_scale_inv.data_ptr,
+                                       static_cast<DType>(out_identity_scale_inv.dtype),
+                                       out_identity_scale_inv.shape);
+    out_identity.set_amax(out_identity_amax.data_ptr, static_cast<DType>(out_identity_amax.dtype),
+                          out_identity_amax.shape);
+    if (this->nvfp4_e4m3_max != 0) {
+      out_identity.set_nvfp4_e4m3_max(this->nvfp4_e4m3_max);
+    }
+    NVTE_CHECK(out_identity_amax.data_ptr != nullptr, "Could not find rowwise amax pointer");
+    if (compute_amax) {
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_compute_amax_with_config(input.data(), out_identity.data(), quant_config, stream);
+      });
+    }
+    NVTE_SCOPED_GIL_RELEASE(
+        { nvte_quantize_v2(input.data(), out_identity.data(), quant_config, stream); });
+  }
+
+  // Columnwise copy rotated along the first dimension (inner dimension of WGRAD, and
+  // of DGRAD for a weight). The post-rotation amax is always computed by the kernels
+  // themselves, regardless of ``compute_amax``.
+  if (columnwise_usage) {
+    quantize_rotated(false, this->rht_matrix);
+  }
+}
+
 void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                                    const std::optional<TensorWrapper>& noop_flag,
                                    bool compute_amax) {
@@ -2741,6 +2910,13 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   }
 
   auto stream = at::cuda::getCurrentCUDAStream();
+
+  // MS-EDEN, dimension-128 RHT and rotated rowwise copies have a dedicated path.
+  if (this->requires_ms_eden_path()) {
+    this->quantize_ms_eden_impl(input, out, noop_flag, compute_amax);
+    reduce_amaxes();
+    return;
+  }
 
   QuantizationConfigWrapper quant_config;
   QuantizationConfigWrapper quant_config_columnwise;

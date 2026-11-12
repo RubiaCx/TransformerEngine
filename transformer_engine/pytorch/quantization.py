@@ -1843,6 +1843,36 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                 elif self.recipe.nvfp4_4over6_e4m3_use_256 == "none":
                     nvfp4_e4m3_max = 448
 
+            # RHT dimension, sign policy, MS-EDEN and DGRAD rotation. Only passed when
+            # the tensor is rotated and a non-default option is selected, so that the
+            # default recipe constructs quantizers exactly as before. Both operands of
+            # a rotated GEMM receive identical options and therefore identical signs.
+            rht_kwargs = {}
+            dgrad_rht = qparams.rht_rowwise and tensor_type == "grad_output"
+            if qparams.random_hadamard_transform and (
+                qparams.ms_eden
+                or qparams.rht_dim != 16
+                or dgrad_rht
+                or getattr(self.recipe, "rht_sign_policy", "static") != "static"
+            ):
+                if nvfp4_use_4over6:
+                    raise ValueError(
+                        "NVFP4 4over6 quantization does not support MS-EDEN or tiled RHT."
+                    )
+                rht_kwargs = {
+                    "rht_dim": qparams.rht_dim,
+                    "ms_eden": qparams.ms_eden,
+                    "rht_sign_policy": self.recipe.rht_sign_policy,
+                    "rht_sign_seed": self.recipe.rht_sign_seed,
+                    "rht_resample_interval": self.recipe.rht_resample_interval,
+                    "ms_eden_grid_max": self.recipe.ms_eden_grid_max,
+                    "dgrad_rht": dgrad_rht,
+                    "dgrad_weight_source": self.recipe.dgrad_rht_weight_source,
+                    "dgrad_weight_ms_eden": (
+                        qparams.ms_eden and self.recipe.ms_eden_scope == "all"
+                    ),
+                }
+
             return NVFP4Quantizer(
                 fp4_dtype=self.dtype,
                 scale_dtype=scale_dtype,
@@ -1858,6 +1888,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                 nvfp4_4over6_err_mode=self.recipe.nvfp4_4over6_err_mode,
                 nvfp4_4over6_columnwise=nvfp4_4over6_columnwise,
                 columnwise_from_rowwise=columnwise_from_rowwise,
+                **rht_kwargs,
             )
 
         if self.mode not in ("forward", "backward"):

@@ -159,6 +159,8 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
              "NVFP4 4over6 quantization is not supported for grouped quantization.");
   NVTE_CHECK(nvfp4_quantizer_cpp->with_rht,
              "graph safe grouped quant kernel for non-RHT path is not ready yet");
+  NVTE_CHECK(!nvfp4_quantizer_cpp->requires_ms_eden_path(),
+             "MS-EDEN and dimension-128 RHT are not implemented for grouped NVFP4 quantization.");
   NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
              "grouped NVFP4 RHT quantization expects post-RHT amax buffers.");
 
@@ -2085,6 +2087,10 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
              "NVFP4 split-quantize does not support 2D quantization");
   NVTE_CHECK(!quantizer.with_amax_reduction,
              "NVFP4 split-quantize does not support amax reduction");
+  for (const auto *split_quantizer : quantizers) {
+    NVTE_CHECK(!split_quantizer->requires_ms_eden_path(),
+               "MS-EDEN and dimension-128 RHT are not implemented for NVFP4 split-quantize.");
+  }
   if (quantizer.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled) {
     // 4over6 + RHT is supported: 4over6 applies to the rowwise copies, and the columnwise RHT
     // copies are standard NVFP4.

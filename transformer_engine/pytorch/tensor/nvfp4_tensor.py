@@ -25,7 +25,7 @@ from ..utils import (
 )
 
 from .storage.nvfp4_tensor_storage import NVFP4TensorStorage, _FromNVFP4Func
-from ..quantized_tensor import QuantizedTensor, Quantizer
+from ..quantized_tensor import QuantizedTensor, QuantizedTensorStorage, Quantizer
 from ..dynamo import register_value_opaque_quantizer
 from ._quantization_helpers import _IdentityFunc, safe_quantized_repr
 
@@ -114,6 +114,179 @@ def get_random_sign_mask_for_rht(with_random_sign_mask: bool, device: int) -> in
     return 0
 
 
+_RHT_DIMS = (16, 128)
+_RHT_SIGN_POLICIES = ("static", "resampled")
+_SPLITMIX64_MASK = (1 << 64) - 1
+
+# Global step counter that drives resampled RHT sign vectors. All quantizers with
+# ``rht_sign_policy="resampled"`` derive their sign vector from
+# ``(rht_sign_seed, step // rht_resample_interval, rht_dim)``, so the quantizers of the
+# two operands of a backward GEMM (e.g. the forward input and the output gradient for
+# WGRAD) use the same rotation as long as they share those options and the step is not
+# advanced between the forward pass and its backward pass.
+_rht_sign_step = 0  # pylint: disable=invalid-name
+_rht_auto_step_handle = None  # pylint: disable=invalid-name
+
+
+def nvfp4_rht_get_step() -> int:
+    """Current step of the resampled-RHT sign schedule."""
+    return _rht_sign_step
+
+
+def nvfp4_rht_set_step(step: int) -> None:
+    """Set the step of the resampled-RHT sign schedule (e.g. when resuming training)."""
+    global _rht_sign_step  # pylint: disable=global-statement
+    if step < 0:
+        raise ValueError("step must be non-negative.")
+    _rht_sign_step = int(step)
+
+
+def nvfp4_rht_step(num_steps: int = 1) -> int:
+    """Advance the resampled-RHT sign schedule.
+
+    Call this once per optimizer step, after the backward pass. Advancing the step
+    between a forward pass and its backward pass breaks the pairing of the rotations
+    of the two WGRAD operands.
+    """
+    nvfp4_rht_set_step(_rht_sign_step + int(num_steps))
+    return _rht_sign_step
+
+
+def nvfp4_rht_enable_auto_step(enabled: bool = True) -> None:
+    """Advance the resampled-RHT sign schedule after every ``torch.optim`` optimizer step.
+
+    Registers (or removes) a global optimizer post-step hook. With several optimizers
+    the schedule advances once per optimizer step call.
+    """
+    global _rht_auto_step_handle  # pylint: disable=global-statement
+    if _rht_auto_step_handle is not None:
+        _rht_auto_step_handle.remove()
+        _rht_auto_step_handle = None
+    if enabled:
+        from torch.optim.optimizer import (  # pylint: disable=import-outside-toplevel
+            register_optimizer_step_post_hook,
+        )
+
+        def _hook(optimizer, args, kwargs):  # pylint: disable=unused-argument
+            nvfp4_rht_step()
+
+        _rht_auto_step_handle = register_optimizer_step_post_hook(_hook)
+
+
+def _splitmix64(state: int) -> int:
+    """SplitMix64 output function (pure Python, reproducible across platforms)."""
+    z = (state + 0x9E3779B97F4A7C15) & _SPLITMIX64_MASK
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _SPLITMIX64_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _SPLITMIX64_MASK
+    return z ^ (z >> 31)
+
+
+# Sign-vector streams: the two backward GEMMs rotate along different dimensions and
+# use independent sign vectors.
+RHT_SIGN_STREAM_WGRAD = 0
+RHT_SIGN_STREAM_DGRAD = 1
+
+
+@functools.lru_cache(maxsize=64)
+def get_rht_sign_bits(
+    rht_dim: int, seed: int, generation: int, stream: int = RHT_SIGN_STREAM_WGRAD
+) -> Tuple[int, ...]:
+    """Pseudo-random sign bits (1 means -1) for a dimension-``rht_dim`` RHT.
+
+    Deterministic function of ``(rht_dim, seed, generation, stream)``.
+    """
+    state = _splitmix64((seed & _SPLITMIX64_MASK) ^ 0x4E564650345F5248)  # "NVFP4_RH"
+    state = _splitmix64(state ^ (generation & _SPLITMIX64_MASK))
+    state = _splitmix64(state ^ rht_dim)
+    if stream != RHT_SIGN_STREAM_WGRAD:
+        state = _splitmix64(state ^ (stream << 32))
+    bits = []
+    while len(bits) < rht_dim:
+        state = _splitmix64(state)
+        bits.extend((state >> i) & 1 for i in range(64))
+    return tuple(bits[:rht_dim])
+
+
+@functools.lru_cache(maxsize=16)
+def get_rht_matrix_from_sign_bits(sign_bits: Tuple[int, ...], device: int) -> torch.Tensor:
+    """Sign-folded Hadamard blocks used by the RHT kernels.
+
+    Returns a BF16 tensor of shape ``[rht_dim, 16]`` whose row ``k`` is
+    ``sign[k] * H16[k % 16, :] / 4``. For ``rht_dim == 16`` this is the same matrix as
+    :func:`get_rht_matrix`. For ``rht_dim == 128`` the kernels complete the rotation
+    with an 8-point Hadamard butterfly across the eight 16-element blocks (scaled by
+    ``1 / sqrt(8)``), i.e. ``H128 = H8 (x) H16`` in Sylvester ordering.
+    """
+    rht_dim = len(sign_bits)
+    signs = torch.tensor(
+        [-1.0 if bit else 1.0 for bit in sign_bits], dtype=torch.float32, device=device
+    )
+    hadamard_16 = get_hadamard_matrix(16, device=device)
+    blocks = hadamard_16.repeat(rht_dim // 16, 1)
+    return (signs.unsqueeze(1) * blocks).to(dtype=torch.bfloat16)
+
+
+def rht_rotate_high_precision(
+    tensor: torch.Tensor, rht_matrix: torch.Tensor, dim: int
+) -> torch.Tensor:
+    """Rotate a high-precision tensor with the tiled RHT described by ``rht_matrix``.
+
+    Debug/validation helper (not a quantization path): applies the same rotation as
+    the tiled-RHT kernels, computed in FP64, without quantizing. ``dim=0`` rotates
+    along the flattened leading dimensions (as the columnwise copies), ``dim=-1``
+    along the last dimension (as the rotated rowwise copy). ``rht_matrix`` is the
+    ``[rht_dim, 16]`` matrix handed to the kernels.
+    """
+    rht_dim = rht_matrix.shape[0]
+    blocks_per_chunk = rht_dim // 16
+    work = tensor.detach().reshape(-1, tensor.shape[-1]).to(torch.float64)
+    if dim == 0:
+        work = work.t()
+    rows, length = work.shape
+    if length % rht_dim != 0:
+        raise ValueError(f"Rotated dimension ({length}) must be divisible by {rht_dim}.")
+    matrix = rht_matrix.to(device=work.device, dtype=torch.float64)
+    matrix = matrix.reshape(blocks_per_chunk, 16, 16)
+    chunks = work.reshape(rows, length // rht_dim, blocks_per_chunk, 16)
+    rotated = torch.einsum("rcjk,jkn->rcjn", chunks, matrix)
+    if blocks_per_chunk > 1:
+        idx = torch.arange(blocks_per_chunk, device=work.device)
+        anded = idx.unsqueeze(1) & idx.unsqueeze(0)
+        parity = torch.zeros_like(anded)
+        for bit in range(blocks_per_chunk.bit_length()):
+            parity ^= (anded >> bit) & 1
+        hadamard = (1 - 2 * parity).to(torch.float64) / math.sqrt(blocks_per_chunk)
+        rotated = torch.einsum("ij,rcjn->rcin", hadamard, rotated)
+    rotated = rotated.reshape(rows, length)
+    if dim == 0:
+        rotated = rotated.t()
+    return rotated.reshape(tensor.shape).to(tensor.dtype).contiguous()
+
+
+def nvfp4_dgrad_rotated_weight(
+    grad_output_quantizer: "NVFP4Quantizer", weight_quantized, weight_high_precision
+):
+    """Rotated columnwise weight copy for a rotated DGRAD GEMM.
+
+    The source is the high-precision weight or the de-quantized forward weight,
+    depending on ``grad_output_quantizer.dgrad_weight_source``. The copy is rotated
+    along the output-channel dimension with the sign vector of the rotated rowwise
+    grad-output copy.
+    """
+    if grad_output_quantizer.dgrad_weight_source == "dequantized":
+        if not isinstance(weight_quantized, QuantizedTensorStorage):
+            raise RuntimeError(
+                "dgrad_rht_weight_source='dequantized' requires the quantized forward weight."
+            )
+        weight = weight_quantized.dequantize(dtype=torch.bfloat16)
+    else:
+        weight = weight_high_precision
+        if isinstance(weight, QuantizedTensorStorage):
+            weight = weight.dequantize(dtype=torch.bfloat16)
+    weight = weight.detach().to(dtype=torch.bfloat16)
+    return grad_output_quantizer.dgrad_weight_quantizer()(weight)
+
+
 class NVFP4Quantizer(Quantizer):
     """Builder class for NVFP4 tensors with NV block scaling"""
 
@@ -150,6 +323,40 @@ class NVFP4Quantizer(Quantizer):
     """RHT sign mask (0 when sign randomization is disabled)"""
     rht_matrix_random_sign_mask_t: int
 
+    """RHT dimension along the rotated (inner) dimension: 16 or 128."""
+    rht_dim: int
+    """MS-EDEN for the columnwise (rotated) copy: round-to-nearest FP4 codes plus
+    EDEN-corrected, stochastically rounded micro-scales (arXiv:2601.22813). When
+    set, ``stochastic_rounding`` only applies to the rowwise (un-rotated) copy."""
+    ms_eden: bool
+    """RHT sign-vector policy: 'static' or 'resampled'."""
+    rht_sign_policy: str
+    """Seed of the RHT sign vector (ignored for the static dimension-16 vector)."""
+    rht_sign_seed: int
+    """Number of steps (see ``nvfp4_rht_step``) between sign-vector resamplings."""
+    rht_resample_interval: int
+    """Grid parameter ``s`` of the MS-EDEN round-to-nearest quantizer: the micro-scale
+    of a group is ``group_amax / s`` before rounding. 6 uses the full E2M1 range;
+    larger values clip elements above ``6 / s`` of the group amax."""
+    ms_eden_grid_max: float
+    """Sign stream of the columnwise (rotated) copy: 0 for WGRAD operands, 1 for the
+    rotated weight copy consumed by DGRAD."""
+    rht_sign_stream: int
+    """Also rotate the rowwise copy along the last dimension (inner dimension of DGRAD)
+    with the DGRAD sign stream. Used for the output gradient when DGRAD is rotated.
+    Toggled with ``set_rowwise_rht`` by modules that also rotate the weight operand."""
+    rht_rowwise: bool
+    """Whether the recipe requests a rotated DGRAD for the tensor of this quantizer.
+    Modules that implement it (``Linear``) enable ``rht_rowwise``; elsewhere the
+    rowwise copy stays un-rotated."""
+    dgrad_rht: bool
+    """Source of the rotated weight copy for DGRAD: 'high_precision' or 'dequantized'
+    (only meaningful when ``rht_rowwise`` is set)."""
+    dgrad_weight_source: str
+    """Whether the rotated DGRAD weight copy uses MS-EDEN (MS-EDEN operand scope
+    'all'); otherwise it is a range-aligned round-to-nearest copy."""
+    dgrad_weight_ms_eden: bool
+
     def __init__(
         self,
         fp4_dtype: Union[DType, tex.DType] = DType.kFloat4E2M1,
@@ -170,8 +377,76 @@ class NVFP4Quantizer(Quantizer):
         disable_second_level_scale: bool = False,
         nvfp4_4over6_columnwise: bool = True,
         columnwise_from_rowwise: bool = False,
+        rht_dim: int = 16,
+        ms_eden: bool = False,
+        rht_sign_policy: str = "static",
+        rht_sign_seed: int = 0,
+        rht_resample_interval: int = 1,
+        ms_eden_grid_max: float = 6.0,
+        rht_sign_stream: int = RHT_SIGN_STREAM_WGRAD,
+        rht_rowwise: bool = False,
+        dgrad_weight_source: str = "high_precision",
+        dgrad_weight_ms_eden: bool = False,
+        dgrad_rht: bool = False,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
+        if ms_eden_grid_max <= 0:
+            raise ValueError("ms_eden_grid_max must be positive.")
+        if dgrad_weight_source not in ("high_precision", "dequantized"):
+            raise ValueError("dgrad_weight_source must be 'high_precision' or 'dequantized'.")
+        if rht_rowwise and not with_rht:
+            raise ValueError("rht_rowwise=True requires with_rht=True.")
+        if (rht_dim != 16 or rht_rowwise) and (
+            nvfp4_use_4over6
+            or with_2d_quantization
+            or row_scaled_nvfp4
+            or disable_second_level_scale
+        ):
+            raise ValueError(
+                "rht_dim=128 and rht_rowwise=True are incompatible with 4over6, 2D quantization, "
+                "row-scaled NVFP4 and disable_second_level_scale."
+            )
+        self.dgrad_weight_ms_eden = dgrad_weight_ms_eden
+        self.dgrad_rht = dgrad_rht
+        self.ms_eden_grid_max = float(ms_eden_grid_max)
+        self.rht_sign_stream = int(rht_sign_stream)
+        self.rht_rowwise = rht_rowwise
+        self.dgrad_weight_source = dgrad_weight_source
+        if rht_dim not in _RHT_DIMS:
+            raise ValueError(f"rht_dim must be one of {_RHT_DIMS}, got {rht_dim}.")
+        if rht_sign_policy not in _RHT_SIGN_POLICIES:
+            raise ValueError(
+                f"rht_sign_policy must be one of {_RHT_SIGN_POLICIES}, got {rht_sign_policy!r}."
+            )
+        if rht_resample_interval < 1:
+            raise ValueError("rht_resample_interval must be a positive integer.")
+        if (
+            rht_dim != 16
+            or rht_sign_policy != "static"
+            or rht_rowwise
+            or rht_sign_stream != RHT_SIGN_STREAM_WGRAD
+        ) and not with_random_sign_mask:
+            raise ValueError(
+                "with_random_sign_mask=False is only supported with rht_dim=16, "
+                "rht_sign_policy='static' and the default sign stream."
+            )
+        if ms_eden:
+            if not with_rht:
+                raise ValueError("ms_eden=True requires with_rht=True.")
+            if nvfp4_use_4over6:
+                raise ValueError("ms_eden=True is incompatible with nvfp4_use_4over6.")
+            if with_2d_quantization or row_scaled_nvfp4 or disable_second_level_scale:
+                raise ValueError(
+                    "ms_eden=True is incompatible with 2D quantization, row-scaled NVFP4 "
+                    "and disable_second_level_scale."
+                )
+            if DType.cast(scale_dtype) != DType.kFloat8E4M3:
+                raise ValueError("ms_eden=True requires E4M3 scales.")
+        self.rht_dim = rht_dim
+        self.ms_eden = ms_eden
+        self.rht_sign_policy = rht_sign_policy
+        self.rht_sign_seed = int(rht_sign_seed)
+        self.rht_resample_interval = int(rht_resample_interval)
         self.dtype = DType.cast(fp4_dtype)
         self.scale_dtype = DType.cast(scale_dtype)
         if self.scale_dtype not in (DType.kFloat8E4M3, DType.kFloat8UE5M3):
@@ -250,9 +525,133 @@ class NVFP4Quantizer(Quantizer):
         :func:`get_rht_matrix` makes an already-seen (flag, device) pair a
         cheap hit.
         """
-        self.rht_matrix = get_rht_matrix(
-            self.rht_matrix_random_sign_mask_t != 0, torch.cuda.current_device()
+        # Fields added after the first value-key format: default them when absent.
+        self.rht_dim = getattr(self, "rht_dim", 16)
+        self.ms_eden = getattr(self, "ms_eden", False)
+        self.rht_sign_policy = getattr(self, "rht_sign_policy", "static")
+        self.rht_sign_seed = getattr(self, "rht_sign_seed", 0)
+        self.rht_resample_interval = getattr(self, "rht_resample_interval", 1)
+        self.ms_eden_grid_max = getattr(self, "ms_eden_grid_max", 6.0)
+        self.rht_sign_stream = getattr(self, "rht_sign_stream", RHT_SIGN_STREAM_WGRAD)
+        self.rht_rowwise = getattr(self, "rht_rowwise", False)
+        self.dgrad_weight_source = getattr(self, "dgrad_weight_source", "high_precision")
+        self.dgrad_weight_ms_eden = getattr(self, "dgrad_weight_ms_eden", False)
+        self.dgrad_rht = getattr(self, "dgrad_rht", False)
+        self.rht_matrix_rowwise = None
+        self._dgrad_weight_quantizer = None
+
+        if self._rht_uses_legacy_signs() and not self.rht_rowwise:
+            # Default: hard-coded sign vector, nothing to refresh.
+            self.rht_dynamic_signs = False
+            self._rht_sign_generation = 0
+            self.rht_matrix = get_rht_matrix(
+                self.rht_matrix_random_sign_mask_t != 0, torch.cuda.current_device()
+            )
+            return
+
+        # Seeded sign vectors. The C++ quantizer calls ``refresh_rht_signs`` before each
+        # quantization when ``rht_dynamic_signs`` is set.
+        self.rht_dynamic_signs = self.rht_sign_policy == "resampled"
+        self._rht_sign_generation = None
+        self.refresh_rht_signs()
+
+    def _rht_uses_legacy_signs(self) -> bool:
+        """Whether the columnwise copy uses the hard-coded dimension-16 sign vector."""
+        return (
+            self.rht_dim == 16
+            and self.rht_sign_policy == "static"
+            and self.rht_sign_stream == RHT_SIGN_STREAM_WGRAD
         )
+
+    def rht_sign_generation(self) -> int:
+        """Index of the sign vector in use for the current step."""
+        if self.rht_sign_policy == "resampled":
+            return nvfp4_rht_get_step() // self.rht_resample_interval
+        return 0
+
+    def rht_sign_bits(self, rowwise: bool = False) -> Tuple[int, ...]:
+        """Sign bits (1 means -1) of the RHT sign vector for the current step.
+
+        ``rowwise=False``: sign vector of the columnwise copy. ``rowwise=True``: sign
+        vector of the rotated rowwise copy (DGRAD stream). Two tensors rotate
+        identically (and their rotations cancel in a GEMM over the rotated dimension)
+        iff this tuple is identical.
+        """
+        if rowwise:
+            return get_rht_sign_bits(
+                self.rht_dim, self.rht_sign_seed, self.rht_sign_generation(), RHT_SIGN_STREAM_DGRAD
+            )
+        if self._rht_uses_legacy_signs():
+            mask = self.rht_matrix_random_sign_mask_t
+            return tuple((mask >> i) & 1 for i in range(16))
+        return get_rht_sign_bits(
+            self.rht_dim, self.rht_sign_seed, self.rht_sign_generation(), self.rht_sign_stream
+        )
+
+    def refresh_rht_signs(self) -> None:
+        """Rebuild the RHT matrices (and dimension-16 sign mask) if the generation changed."""
+        legacy = self._rht_uses_legacy_signs()
+        if legacy and not self.rht_rowwise:
+            return
+        generation = self.rht_sign_generation()
+        if generation == self._rht_sign_generation:
+            return
+        device = torch.cuda.current_device()
+        if legacy:
+            self.rht_matrix = get_rht_matrix(self.rht_matrix_random_sign_mask_t != 0, device)
+        else:
+            sign_bits = self.rht_sign_bits()
+            self.rht_matrix = get_rht_matrix_from_sign_bits(sign_bits, device)
+            if self.rht_dim == 16:
+                # The dimension-16 kernels that do not take the matrix use this mask.
+                self.rht_matrix_random_sign_mask_t = sum(
+                    bit << i for i, bit in enumerate(sign_bits)
+                )
+        if self.rht_rowwise:
+            self.rht_matrix_rowwise = get_rht_matrix_from_sign_bits(
+                self.rht_sign_bits(rowwise=True), device
+            )
+        self._rht_sign_generation = generation
+
+    def set_rowwise_rht(self, enabled: bool) -> None:
+        """Enable/disable the rotation of the rowwise copy (rotated DGRAD operand)."""
+        if enabled == self.rht_rowwise:
+            return
+        if enabled and not self.with_rht:
+            raise ValueError("A rotated rowwise copy requires with_rht=True.")
+        self.rht_rowwise = enabled
+        self._rebuild_derived_state()
+
+    def dgrad_weight_quantizer(self) -> "NVFP4Quantizer":
+        """Quantizer of the rotated columnwise weight copy consumed by a rotated DGRAD.
+
+        Rotates along the output-channel dimension with the DGRAD sign stream, i.e.
+        with the same sign vector as the rotated rowwise copy of the output gradient
+        produced by this quantizer.
+        """
+        if not self.rht_rowwise:
+            raise RuntimeError("dgrad_weight_quantizer requires rht_rowwise=True.")
+        if self._dgrad_weight_quantizer is None:
+            quantizer = NVFP4Quantizer(
+                fp4_dtype=self.dtype,
+                scale_dtype=self.scale_dtype,
+                rowwise=False,
+                columnwise=True,
+                with_rht=True,
+                with_post_rht_amax=True,
+                stochastic_rounding=False,
+                rht_dim=self.rht_dim,
+                ms_eden=self.dgrad_weight_ms_eden,
+                rht_sign_policy=self.rht_sign_policy,
+                rht_sign_seed=self.rht_sign_seed,
+                rht_resample_interval=self.rht_resample_interval,
+                ms_eden_grid_max=self.ms_eden_grid_max,
+                rht_sign_stream=RHT_SIGN_STREAM_DGRAD,
+            )
+            quantizer.internal = True
+            quantizer.optimize_for_gemm = self.optimize_for_gemm
+            self._dgrad_weight_quantizer = quantizer
+        return self._dgrad_weight_quantizer
 
     def update_quantized(
         self,
@@ -302,10 +701,27 @@ class NVFP4Quantizer(Quantizer):
             nvfp4_use_4over6=self.nvfp4_use_4over6,
             nvfp4_e4m3_max=self.nvfp4_e4m3_max,
             nvfp4_4over6_err_mode=self.nvfp4_4over6_err_mode,
-            with_random_sign_mask=self.rht_matrix_random_sign_mask_t != 0,
+            with_random_sign_mask=(
+                self.rht_matrix_random_sign_mask_t != 0
+                or self.rht_dim != 16
+                or self.rht_sign_policy != "static"
+                or self.rht_rowwise
+                or self.rht_sign_stream != RHT_SIGN_STREAM_WGRAD
+            ),
             disable_second_level_scale=self.disable_second_level_scale,
             nvfp4_4over6_columnwise=self.nvfp4_4over6_columnwise,
             columnwise_from_rowwise=self.columnwise_from_rowwise,
+            rht_dim=self.rht_dim,
+            ms_eden=self.ms_eden,
+            rht_sign_policy=self.rht_sign_policy,
+            rht_sign_seed=self.rht_sign_seed,
+            rht_resample_interval=self.rht_resample_interval,
+            ms_eden_grid_max=self.ms_eden_grid_max,
+            rht_sign_stream=self.rht_sign_stream,
+            rht_rowwise=self.rht_rowwise,
+            dgrad_weight_source=self.dgrad_weight_source,
+            dgrad_weight_ms_eden=self.dgrad_weight_ms_eden,
+            dgrad_rht=self.dgrad_rht,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm
@@ -317,8 +733,12 @@ class NVFP4Quantizer(Quantizer):
         return tex.quantize(tensor, self)
 
     def is_requantization_safe(self) -> bool:
-        """NVFP4 quantization is replay-safe unless stochastic rounding is enabled."""
-        return not self.stochastic_rounding
+        """NVFP4 quantization is replay-safe unless stochastic rounding is enabled.
+
+        MS-EDEN stochastically rounds the micro-scales and resampled RHT signs change
+        between steps, so neither is replay-safe.
+        """
+        return not (self.stochastic_rounding or self.ms_eden or self.rht_sign_policy == "resampled")
 
     def supports_quantized_allgather(self, inp: torch.Tensor) -> bool:
         """Whether tensor shape supports quantized all-gather.

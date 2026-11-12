@@ -371,6 +371,17 @@ class NVFP4Quantizer : public Quantizer {
 
   int rht_matrix_random_sign_mask_t;
   at::Tensor rht_matrix;
+  // RHT dimension along the rotated (inner) dimension: 16 (default) or 128.
+  int rht_dim = 16;
+  // MS-EDEN (RTN FP4 codes + EDEN-corrected, stochastically rounded micro-scales)
+  // for the rotated copies instead of element-level rounding.
+  bool ms_eden = false;
+  // Grid parameter s of the MS-EDEN round-to-nearest quantizer.
+  float ms_eden_grid_max = 6.0f;
+  // Also rotate the rowwise copy (along the last dimension, the inner dimension of
+  // DGRAD) with the sign vector of rht_matrix_rowwise.
+  bool rht_rowwise = false;
+  at::Tensor rht_matrix_rowwise;
 
   explicit NVFP4Quantizer(const py::handle& quantizer);
 
@@ -438,6 +449,15 @@ class NVFP4Quantizer : public Quantizer {
                 const std::optional<TensorWrapper>& noop_flag = std::nullopt) override;
   void quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                      const std::optional<TensorWrapper>& noop_flag, bool compute_amax);
+  void quantize_ms_eden_impl(const TensorWrapper& input, TensorWrapper& out,
+                             const std::optional<TensorWrapper>& noop_flag, bool compute_amax);
+
+  /*! @brief Whether this quantizer only works through the single-tensor tiled-RHT path
+   *
+   * True for MS-EDEN, for RHT dimensions other than 16 and for rotated rowwise
+   * copies. The grouped, split and 16-point RHT kernels do not implement these modes.
+   */
+  bool requires_ms_eden_path() const { return ms_eden || rht_dim != 16 || rht_rowwise; }
 
   /*! @brief Quantize to NVFP4, skipping local amax computation
    *

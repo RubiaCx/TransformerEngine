@@ -122,6 +122,10 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import (
 )
 from transformer_engine.pytorch.tensor.nvfp4_tensor import (
     _make_nvfp4_tensor_in_reduce_ex,
+    nvfp4_rht_enable_auto_step,
+    nvfp4_rht_get_step,
+    nvfp4_rht_set_step,
+    nvfp4_rht_step,
 )
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
     _make_float8_blockwise_tensor_in_reduce_ex,
