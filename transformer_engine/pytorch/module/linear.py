@@ -627,9 +627,58 @@ def _linear_forward_impl(
     # Note: y = x * w^T
     # ------------------------------------------------------
     nvtx_range_push(f"{nvtx_label}.gemm")
+    gemm_weight, gemm_input = weightmat, inputmat_total
+    # Diagnostic only (NVTE_DIAG_FORWARD_HIGH_PRECISION=1): run the forward GEMM on the
+    # unquantized operands while the backward pass keeps its default quantized operands.
+    if fp8 and os.environ.get("NVTE_DIAG_FORWARD_HIGH_PRECISION", "0") == "1":
+        if (
+            backward_override is not None
+            or isinstance(inp, QuantizedTensorStorage)
+            or isinstance(weight, QuantizedTensorStorage)
+            or with_input_all_gather_nccl
+            or ub_obj is not None
+            or output_quantizer is not None
+        ):
+            raise ValueError("NVTE_DIAG_FORWARD_HIGH_PRECISION: unsupported configuration")
+        gemm_weight = cast_if_needed(weight, activation_dtype)
+        gemm_input = cast_if_needed(inp, activation_dtype)
+        bias = cast_if_needed(bias, activation_dtype) if bias is not None else bias
+    # Diagnostic only (NVTE_DIAG_FORWARD_QUANTIZE=weight|input|both, requires
+    # backward_override="dequantized"): run the forward GEMM in high precision on the
+    # dequantized copy of the selected operand(s) and the unquantized other operand.
+    # The backward pass uses the same operands as this forward GEMM.
+    diag_fq = os.environ.get("NVTE_DIAG_FORWARD_QUANTIZE", "") if fp8 else ""
+    if diag_fq:
+        if (
+            diag_fq not in ("weight", "input", "both")
+            or backward_override != "dequantized"
+            or isinstance(inp, QuantizedTensorStorage)
+            or isinstance(weight, QuantizedTensorStorage)
+            or not isinstance(weightmat, QuantizedTensorStorage)
+            or not isinstance(inputmat_total, QuantizedTensorStorage)
+            or with_input_all_gather_nccl
+            or ub_obj is not None
+            or output_quantizer is not None
+            or is_fsdp2
+            or is_dist_weight
+            or fsdp_group is not None
+            or os.environ.get("NVTE_DIAG_FORWARD_HIGH_PRECISION", "0") == "1"
+        ):
+            raise ValueError("NVTE_DIAG_FORWARD_QUANTIZE: unsupported configuration")
+        if diag_fq in ("weight", "both"):
+            gemm_weight = weightmat.dequantize(dtype=activation_dtype)
+        else:
+            gemm_weight = cast_if_needed(weight, activation_dtype)
+            weightmat = gemm_weight  # operand of the backward dgrad GEMM
+        if diag_fq in ("input", "both"):
+            gemm_input = inputmat_total.dequantize(dtype=activation_dtype)
+        else:
+            gemm_input = cast_if_needed(inp, activation_dtype)
+            inputmat = gemm_input  # operand of the backward wgrad GEMM
+        bias = cast_if_needed(bias, activation_dtype) if bias is not None else bias
     gemm_out, *_, reduce_scatter_out = general_gemm(
-        weightmat,
-        inputmat_total,
+        gemm_weight,
+        gemm_input,
         quantization_params=output_quantizer,
         out_dtype=activation_dtype,
         bias=bias,
