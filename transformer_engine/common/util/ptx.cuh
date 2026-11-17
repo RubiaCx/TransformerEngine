@@ -591,6 +591,50 @@ __device__ __forceinline__ uint16_t stochastic_round_fp4_e2m1x4(const float x0, 
 
 #endif  // FP4_TYPE_SUPPORTED
 
+// Software stochastic rounding onto the e4m3 grid. Returns the e4m3 encoding of
+// x rounded to one of its two neighbouring representable values, up (away from
+// zero) with probability (|x| - low) / (high - low); representable values are
+// returned unchanged. Follows satfinite for the edges, like the e2m1 helper
+// above: NaN becomes positive MAX_NORM (448) and larger magnitudes, infinities
+// included, clamp to MAX_NORM with the sign kept, so the result is always finite.
+//
+// The grid step at |x| is ulp = 2^(max(exponent(|x|), -6) - 3): the three
+// mantissa bits of e4m3 for normals and the fixed 2^-9 spacing of its
+// subnormals below 2^-6. y = |x| / ulp is exact, lies in [0, 16) for finite
+// in-range x, and floor(y) + round_up indexes the grid linearly, so the
+// encoding is ((exponent + 6) << 3) + floor(y) + round_up: a carry out of the
+// mantissa runs into the exponent field as in any IEEE-style encoding.
+//
+// Takes the top 24 bits of rbits as the uniform u = r / 2^24 and rounds up when
+// u >= 1 - frac(y). 1 - frac(y) is rounded to FP32, which makes the round-up
+// probability 1 - RN(1 - frac(y)). That equals frac(y) exactly whenever
+// frac(y) is a multiple of 2^-24, which holds for every |x| >= 2^-10 (FP32
+// keeps 24 significant bits and y >= 0.5 there); smaller magnitudes see an
+// absolute probability error of at most 2^-25, i.e. a bias below 2^-34.
+__device__ __forceinline__ uint32_t stochastic_round_fp8_e4m3(const float x,
+                                                              const uint32_t rbits) {
+  constexpr uint32_t min_exponent = FP32_EXPONENT_BIAS - 6;  // biased exponent of 2^-6
+  constexpr uint32_t max_norm = 0x7Eu;                        // encoding of 448
+  const uint32_t x_bits = __float_as_uint(x);
+  const uint32_t a_bits = x_bits & 0x7FFFFFFFu;
+  const uint32_t x_exponent = a_bits >> FP32_MANTISSA_BITS;
+  const uint32_t exponent = (x_exponent > min_exponent) ? x_exponent : min_exponent;
+  // 1 / ulp = 2^(3 - (exponent - bias)); its exponent field is at least 2.
+  const float ulp_rcp =
+      __uint_as_float((2 * FP32_EXPONENT_BIAS + 3 - exponent) << FP32_MANTISSA_BITS);
+  const float y = __uint_as_float(a_bits) * ulp_rcp;
+  const float y_floor = floorf(y);
+  const float u = static_cast<float>(rbits >> 8) * (1.0f / 16777216.0f);
+  const uint32_t round_up = (u >= 1.0f - (y - y_floor)) ? 1u : 0u;
+  // Inf/NaN: exponent is 255, so the sum stays far above max_norm for any value
+  // of the (saturated or zero) integer conversion, even after wrapping by one.
+  const uint32_t code =
+      ((exponent - min_exponent) << 3) + static_cast<uint32_t>(__float2uint_rz(y)) + round_up;
+  const uint32_t magnitude = (code < max_norm) ? code : max_norm;
+  const uint32_t sign = (a_bits > 0x7F800000u) ? 0u : ((x_bits >> 24) & 0x80u);
+  return magnitude | sign;
+}
+
 // SIMD like "Fused" cast + multiplication (x2)
 __device__ __forceinline__ void mul_cvt_2x(fp8e4m3x2 &out, const floatx2 &in,
                                            const floatx2 &scale) {

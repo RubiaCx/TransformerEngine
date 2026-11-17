@@ -27,6 +27,7 @@
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/group_scaled_swiglu_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
+#include "../mxfp8/quantize_sr_mxfp8.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
@@ -61,8 +62,9 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                   output_tensor->scaling_mode == NVTE_MXFP8_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4 and MXFP8 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -92,6 +94,14 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       break;
     }
     case NVTE_MXFP8_1D_SCALING: {
+      if (quant_config_cpp.stochastic_rounding) {
+        // Dedicated kernels; the round-to-nearest kernels below are left untouched.
+        NVTE_CHECK(!IS_ACT,
+                   "MXFP8 stochastic rounding is only supported for a plain cast, not with a "
+                   "fused activation.");
+        mxfp8::quantize_sr(*input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+        break;
+      }
       const Tensor *dummy_input_tensor = nullptr;
       Tensor *dummy_dbias_tensor = nullptr;
       Tensor *dummy_workspace_tensor = nullptr;
@@ -257,8 +267,9 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                   output_tensor->scaling_mode == NVTE_MXFP8_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4 and MXFP8 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -284,6 +295,14 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
       break;
     }
     case NVTE_MXFP8_1D_SCALING: {
+      if (quant_config_cpp.stochastic_rounding) {
+        // Dedicated kernels; the round-to-nearest kernels below are left untouched.
+        NVTE_CHECK(!IS_DBIAS && !IS_DACT,
+                   "MXFP8 stochastic rounding is only supported for a plain cast, not with "
+                   "fused dbias or activation gradients.");
+        mxfp8::quantize_sr(*grad_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+        break;
+      }
       bool quantized_with_cutedsl = false;
 #ifdef NVTE_WITH_CUTEDSL
       quantized_with_cutedsl =
@@ -541,6 +560,8 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
       break;
     }
     case NVTE_MXFP8_1D_SCALING: {
+      NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                 "Grouped MXFP8 quantization does not support stochastic rounding.");
       mxfp8::group_quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
           input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
           workspace_tensor, &quant_config_cpp, stream);
@@ -618,6 +639,8 @@ void group_scaled_swiglu_fwd_helper(const NVTEGroupedTensor input, const NVTETen
 
   switch (scaling_mode) {
     case NVTE_MXFP8_1D_SCALING: {
+      NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                 "Grouped MXFP8 quantization does not support stochastic rounding.");
       mxfp8::group_scaled_swiglu<ParamOP, OP>(input_tensor, prob_tensor, noop_tensor, output_tensor,
                                               p, &quant_config_cpp, stream);
       break;
@@ -659,6 +682,8 @@ void group_quantize_bwd_helper(const NVTEGroupedTensor grad, const NVTEGroupedTe
   // Dispatch to quantization kernel depending on data format
   switch (scaling_mode) {
     case NVTE_MXFP8_1D_SCALING: {
+      NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                 "Grouped MXFP8 quantization does not support stochastic rounding.");
       mxfp8::group_quantize<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
           grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
           &quant_config_cpp, stream);

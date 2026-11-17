@@ -18,6 +18,7 @@ template <FuncType* act_func, auto act_func_with_args, typename... Args>
 py::object activation_helper(const at::Tensor& input, py::handle quantizer, int shape_divisor = 1,
                              Args&&... args) {
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "Fused activation + quantization");
 
   // Input tensor
   auto input_tensor = input.contiguous();
@@ -132,6 +133,7 @@ template <DFuncType* dact_func, auto dact_func_with_args, typename... Args>
 py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& input,
                               py::handle quantizer, Args&&... args) {
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "Fused activation gradient + quantization");
 
   // Grad output and input tensors
   auto grad_output_tensor = grad_output.contiguous();

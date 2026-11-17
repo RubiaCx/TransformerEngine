@@ -313,6 +313,7 @@ py::object group_quantize(const at::Tensor &input, py::handle quantizer, const s
                           std::optional<at::Tensor> noop_flag, const py::object &output) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "group_quantize");
 
   NVTE_CHECK(input.dim() == 2, "Tensor must be 2D");
   const at::Tensor tensor = input.contiguous();
@@ -510,6 +511,7 @@ py::object group_scaled_swiglu_impl(const char *api_name, const at::Tensor &inpu
                                     std::optional<ClampedSwigluArgs> clamp) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, api_name);
 
   // Grouped scaled SwiGLU recompute of the MoE FC2 input:
   //   input_2h : [N, 2H] ([act|gate]) in model dtype (bf16).
@@ -703,6 +705,7 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
                                 std::optional<at::Tensor> tensor_offsets) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "bgrad_group_quantize");
 
   NVTE_CHECK(tensor.dim() == 2, "Tensor must be 2D");
   NVTE_CHECK(!last_dims.has_value(),
@@ -890,6 +893,7 @@ py::object group_requantize_inplace(py::handle grouped_x, py::handle quantizer,
                                     DType otype, std::optional<at::Tensor> tensor_offsets,
                                     bool return_dequantized) {
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "group_requantize_inplace");
 
   // Python attribute access is CPU-heavy; read each attribute once and reuse across
   // both the fused and unfused paths.

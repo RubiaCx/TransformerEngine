@@ -1497,6 +1497,8 @@ std::vector<size_t> Float8BlockQuantizer::get_scale_shape(const std::vector<size
 MXFP8Quantizer::MXFP8Quantizer(const py::handle& quantizer) : Quantizer(quantizer) {
   this->dtype = quantizer.attr("dtype").cast<DType>();
   this->with_2d_quantization = quantizer.attr("with_2d_quantization").cast<bool>();
+  this->stochastic_rounding = py::hasattr(quantizer, "stochastic_rounding") &&
+                              quantizer.attr("stochastic_rounding").cast<bool>();
 }
 
 void MXFP8Quantizer::set_quantization_params(TensorWrapper* tensor) const {}
@@ -1844,6 +1846,25 @@ void MXFP8Quantizer::quantize(const TensorWrapper& input, TensorWrapper& out,
   if (this->with_2d_quantization) {
     quant_config.set_mxfp8_2d_quantization(true);
   }
+
+  // Stochastic rounding: hand over the Philox seed and offset of the default CUDA
+  // generator, as the NVFP4 quantizer does.
+  // TensorWrapper does not own storage; retain the RNG buffer through dispatch.
+  at::Tensor rng_state;
+  TensorWrapper te_rng_state;
+  if (this->stochastic_rounding) {
+    const size_t rng_elts_per_thread = 1024;  // Same increment as the NVFP4 quantizer
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    rng_state = torch::empty({2}, opts);
+    philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+    te_rng_state = makeTransformerEngineTensor(rng_state);
+    quant_config.set_rng_state(te_rng_state.data());
+    quant_config.set_stochastic_rounding(true);
+  }
+
   NVTE_SCOPED_GIL_RELEASE({
     nvte_quantize_v2(input.data(), out.data(), quant_config, at::cuda::getCurrentCUDAStream());
   });

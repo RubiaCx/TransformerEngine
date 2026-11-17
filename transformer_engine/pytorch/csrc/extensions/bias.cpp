@@ -38,6 +38,7 @@ void sum_bias_grad(at::Tensor &bias, const at::Tensor &input) {
 std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle quantizer) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer, "bgrad_quantize");
 
   // Grad output tensor
   auto grad_output_torch = grad_output.contiguous();
@@ -128,6 +129,7 @@ std::vector<py::object> dact_dbias(
     at::Tensor grad_output_torch, at::Tensor act_input_torch, py::handle quantizer_py) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
+  check_no_mxfp8_stochastic_rounding(quantizer_py, "Fused dbias + activation gradient");
 
   // Grad output and activation input tensors
   grad_output_torch = grad_output_torch.contiguous();

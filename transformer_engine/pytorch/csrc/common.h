@@ -313,6 +313,8 @@ class Float8BlockQuantizer : public Quantizer {
 class MXFP8Quantizer : public Quantizer {
  public:
   bool with_2d_quantization = false;
+  // Stochastic rounding of the elements (plain casts only)
+  bool stochastic_rounding = false;
 
   explicit MXFP8Quantizer(const py::handle& quantizer);
 
@@ -694,6 +696,10 @@ void philox_unpack(at::PhiloxCudaState arg, int64_t* rng_state_ptr);
 
 // extract PhiloxCudaState from CUDA random number generator
 at::PhiloxCudaState init_philox_state(at::CUDAGeneratorImpl* gen, size_t elts_per_thread);
+
+// MXFP8 stochastic rounding is only implemented for the plain cast. Fused and grouped
+// kernels round to nearest, so they reject quantizers that request stochastic rounding.
+void check_no_mxfp8_stochastic_rounding(const py::handle& quantizer, const char* api_name);
 
 }  // namespace transformer_engine::pytorch
 

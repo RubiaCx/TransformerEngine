@@ -364,4 +364,15 @@ at::PhiloxCudaState init_philox_state(at::CUDAGeneratorImpl* gen, size_t elts_pe
   return philox_args;
 }
 
+void check_no_mxfp8_stochastic_rounding(const py::handle& quantizer, const char* api_name) {
+  if (quantizer.is_none() || !detail::IsMXFP8Quantizers(quantizer.ptr())) {
+    return;
+  }
+  NVTE_CHECK(!py::hasattr(quantizer, "stochastic_rounding") ||
+                 !quantizer.attr("stochastic_rounding").cast<bool>(),
+             api_name,
+             " does not support MXFP8 stochastic rounding. It is only implemented for the "
+             "plain quantize call.");
+}
+
 }  // namespace transformer_engine::pytorch

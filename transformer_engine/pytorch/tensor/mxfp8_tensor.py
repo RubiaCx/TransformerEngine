@@ -33,10 +33,22 @@ class MXFP8Quantizer(Quantizer):
     dividing them into groups of 32 elements, each scaled and cast
     separately using current data.
 
+    Parameters
+    ----------
+    stochastic_rounding : bool, default = False
+        Round each scaled element stochastically to one of its two
+        neighbouring FP8 values, with probabilities that make the
+        result unbiased, instead of rounding to nearest. The block
+        scales are unchanged. Random numbers are drawn from the default
+        PyTorch CUDA generator. Only supported for the plain quantize
+        call with 1D block scaling, E4M3 output and FP32 or BF16 input;
+        fused and grouped quantization paths raise an error.
+
     """
 
     dtype: DType
     with_2d_quantization: bool
+    stochastic_rounding: bool = False
 
     def __init__(
         self,
@@ -45,10 +57,12 @@ class MXFP8Quantizer(Quantizer):
         rowwise: bool = True,
         columnwise: bool = True,
         with_2d_quantization: bool = False,
+        stochastic_rounding: bool = False,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.dtype = DType.cast(fp8_dtype)
         self.with_2d_quantization = with_2d_quantization
+        self.stochastic_rounding = stochastic_rounding
 
     def copy(self) -> MXFP8Quantizer:
         """Create shallow copy"""
@@ -58,6 +72,7 @@ class MXFP8Quantizer(Quantizer):
             rowwise=self.rowwise_usage,
             columnwise=self.columnwise_usage,
             with_2d_quantization=self.with_2d_quantization,
+            stochastic_rounding=self.stochastic_rounding,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm
@@ -226,8 +241,8 @@ class MXFP8Quantizer(Quantizer):
         return MXFP8BlockScaling
 
     def is_requantization_safe(self) -> bool:
-        """MXFP8 block scales are derived deterministically from each input."""
-        return True
+        """MXFP8 quantization is replay-safe unless stochastic rounding is enabled."""
+        return not self.stochastic_rounding
 
 
 register_value_opaque_quantizer(MXFP8Quantizer)
